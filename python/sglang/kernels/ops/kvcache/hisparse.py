@@ -96,6 +96,51 @@ def _jit_dsv4_transfer_module(block_size: int) -> Module:
     )
 
 
+@functools.cache
+def _jit_prefetch_module(
+    item_size_bytes: int,
+    block_size: int,
+    num_entries: int,
+    is_dsv4_layout: bool,
+) -> Module:
+    template_args = make_cpp_args(block_size, num_entries, is_dsv4_layout)
+    return load_jit(
+        "sparse_cache_prefetch",
+        item_size_bytes,
+        block_size,
+        num_entries,
+        is_dsv4_layout,
+        cuda_files=["hisparse.cuh"],
+        cuda_wrappers=[("prefetch_cache_mla", f"prefetch_cache_mla<{template_args}>")],
+    )
+
+
+def prefetch_cache_mla(
+    *,
+    candidates: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    host_cache: torch.Tensor,
+    staging_cache: torch.Tensor,
+    item_size_bytes: int,
+    block_size: int,
+    num_blocks: int = 4,
+    is_dsv4_layout: bool = False,
+) -> None:
+    module = _jit_prefetch_module(
+        item_size_bytes, block_size, candidates.shape[1], is_dsv4_layout
+    )
+    module.prefetch_cache_mla(
+        candidates,
+        req_pool_indices,
+        host_cache_locs,
+        host_cache,
+        staging_cache,
+        item_size_bytes,
+        num_blocks,
+    )
+
+
 def transfer_cache_dsv4_mla(
     src_ptrs: torch.Tensor,
     dst_ptrs: torch.Tensor,
@@ -136,10 +181,13 @@ def _load_cache_to_device_buffer_mla(
     miss_dst: torch.Tensor | None,
     miss_count: torch.Tensor | None,
     skip_io: bool,
+    prefetch_tokens: torch.Tensor | None,
+    prefetch_cache: torch.Tensor | None,
+    prefetch_hits: torch.Tensor | None,
 ) -> None:
-    assert (
-        hot_buffer_size >= num_top_k
-    ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    assert hot_buffer_size >= num_top_k, (
+        f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    )
 
     record_miss_plan = miss_src is not None
     module = _jit_sparse_module(
@@ -154,6 +202,9 @@ def _load_cache_to_device_buffer_mla(
     )
 
     empty = torch.empty(0)
+    prefetch_tokens_arg = prefetch_tokens if prefetch_tokens is not None else empty
+    prefetch_cache_arg = prefetch_cache if prefetch_cache is not None else empty
+    prefetch_hits_arg = prefetch_hits if prefetch_hits is not None else empty
 
     if num_real_reqs is None:
         num_real_reqs = torch.tensor(
@@ -189,6 +240,10 @@ def _load_cache_to_device_buffer_mla(
         miss_src,
         miss_dst,
         miss_count,
+        prefetch_tokens_arg,
+        prefetch_cache_arg,
+        item_size_bytes,
+        prefetch_hits_arg,
     )
 
 
@@ -213,6 +268,9 @@ def load_cache_to_device_buffer_mla(
     miss_dst: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
     skip_io: bool = False,
+    prefetch_tokens: torch.Tensor | None = None,
+    prefetch_cache: torch.Tensor | None = None,
+    prefetch_hits: torch.Tensor | None = None,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes).
 
@@ -241,6 +299,9 @@ def load_cache_to_device_buffer_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+        prefetch_tokens=prefetch_tokens,
+        prefetch_cache=prefetch_cache,
+        prefetch_hits=prefetch_hits,
     )
 
 
@@ -302,6 +363,9 @@ def load_cache_to_device_buffer_dsv4_mla(
     miss_dst: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
     skip_io: bool = False,
+    prefetch_tokens: torch.Tensor | None = None,
+    prefetch_cache: torch.Tensor | None = None,
+    prefetch_hits: torch.Tensor | None = None,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
@@ -326,4 +390,7 @@ def load_cache_to_device_buffer_dsv4_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+        prefetch_tokens=prefetch_tokens,
+        prefetch_cache=prefetch_cache,
+        prefetch_hits=prefetch_hits,
     )

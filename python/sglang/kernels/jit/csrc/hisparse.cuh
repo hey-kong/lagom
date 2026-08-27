@@ -279,6 +279,58 @@ void transfer_cache_dsv4_mla(
       num_layers);
 }
 
+// Copy random logical candidates into an isolated staging cache.  This kernel
+// intentionally does not touch the resident table or LRU, so it can overlap
+// the preceding layer's compute safely.
+template <int BLOCK_SIZE, int NUM_ENTRIES, bool IsDsv4Layout>
+__global__ __launch_bounds__(BLOCK_SIZE, 1) void prefetch_cache_mla_kernel(
+    const int32_t* candidates,
+    const int64_t* req_pool_indices,
+    const int64_t* host_cache_locs,
+    const void* host_cache,
+    void* staging_cache,
+    int64_t candidate_stride,
+    int64_t host_stride,
+    int64_t item_size_bytes,
+    int32_t num_reqs) {
+  constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+  const int warp = (blockIdx.x * BLOCK_SIZE + threadIdx.x) / WARP_SIZE;
+  const int lane = threadIdx.x % WARP_SIZE;
+  const int total_warps = gridDim.x * NUM_WARPS;
+  const int total = num_reqs * NUM_ENTRIES;
+  for (int i = warp; i < total; i += total_warps) {
+    const int req = i / NUM_ENTRIES;
+    const int entry = i % NUM_ENTRIES;
+    const int32_t token = candidates[req * candidate_stride + entry];
+    if (token >= 0) {
+      const int64_t src = host_cache_locs[req_pool_indices[req] * host_stride + token];
+      copy_miss_item<true, IsDsv4Layout>(
+          lane, host_cache, nullptr, staging_cache, nullptr, src, i, item_size_bytes);
+    }
+  }
+}
+
+template <int BLOCK_SIZE, int NUM_ENTRIES, bool IsDsv4Layout>
+void prefetch_cache_mla(
+    tvm::ffi::TensorView candidates,
+    tvm::ffi::TensorView req_pool_indices,
+    tvm::ffi::TensorView host_cache_locs,
+    tvm::ffi::TensorView host_cache,
+    tvm::ffi::TensorView staging_cache,
+    int64_t item_size_bytes,
+    int64_t num_blocks) {
+  using namespace host;
+  const auto device = LaunchKernel::resolve_device(candidates.device());
+  LaunchKernel(num_blocks, BLOCK_SIZE, device)(
+      prefetch_cache_mla_kernel<BLOCK_SIZE, NUM_ENTRIES, IsDsv4Layout>,
+      static_cast<const int32_t*>(candidates.data_ptr()),
+      static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+      static_cast<const int64_t*>(host_cache_locs.data_ptr()),
+      host_cache.data_ptr(), staging_cache.data_ptr(), candidates.strides()[0],
+      host_cache_locs.strides()[0], item_size_bytes,
+      static_cast<int32_t>(candidates.shape()[0]));
+}
+
 __device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int offset, int count, int accumulator) {
   int idx = lane_id + offset;
   int val = (idx < count) ? s_data[idx] : 0;
@@ -357,7 +409,13 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t* __restrict__ miss_src_out,
     int32_t* __restrict__ miss_dst_out,
     int32_t* __restrict__ miss_count_out,
-    int64_t plan_stride) {
+    int64_t plan_stride,
+    const int32_t* __restrict__ prefetch_tokens,
+    const void* __restrict__ prefetch_cache,
+    int64_t prefetch_stride,
+    int32_t prefetch_num_entries,
+    int64_t prefetch_item_size_bytes,
+    int64_t* __restrict__ prefetch_hits) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
@@ -681,9 +739,27 @@ __global__ void load_cache_to_device_buffer_kernel(
 
       const int64_t src_loc = req_host_cache_locs[miss_token];
       const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
-
-      copy_miss_item<IsMLA, IsDsv4Layout>(
-          lane_id, host_cache_k, host_cache_v, device_buffer_k, device_buffer_v, src_loc, dst_loc, item_size_bytes);
+      int32_t prefetched_idx = -1;
+      if (prefetch_tokens != nullptr) {
+        const int32_t* req_prefetch = prefetch_tokens + bid * prefetch_stride;
+        for (int32_t j = 0; j < prefetch_num_entries; ++j) {
+          if (req_prefetch[j] == miss_token) {
+            prefetched_idx = bid * prefetch_num_entries + j;
+            break;
+          }
+        }
+      }
+      if (prefetched_idx >= 0) {
+        copy_miss_item<true, IsDsv4Layout>(
+            lane_id, prefetch_cache, nullptr, device_buffer_k, nullptr,
+            prefetched_idx, dst_loc, prefetch_item_size_bytes);
+        if (lane_id == 0 && prefetch_hits != nullptr) {
+          atomicAdd(reinterpret_cast<unsigned long long*>(prefetch_hits), 1ULL);
+        }
+      } else {
+        copy_miss_item<IsMLA, IsDsv4Layout>(
+            lane_id, host_cache_k, host_cache_v, device_buffer_k, device_buffer_v, src_loc, dst_loc, item_size_bytes);
+      }
     }
   }
 }
@@ -714,7 +790,11 @@ void load_cache_to_device_buffer(
     int64_t item_size_bytes,
     tvm::ffi::TensorView miss_src_out,
     tvm::ffi::TensorView miss_dst_out,
-    tvm::ffi::TensorView miss_count_out) {
+    tvm::ffi::TensorView miss_count_out,
+    tvm::ffi::TensorView prefetch_tokens,
+    tvm::ffi::TensorView prefetch_cache,
+    int64_t prefetch_item_size_bytes,
+    tvm::ffi::TensorView prefetch_hits) {
   using namespace host;
 
   const int64_t bs = top_k_tokens.shape()[0];
@@ -767,7 +847,13 @@ void load_cache_to_device_buffer(
         miss_src_ptr,
         miss_dst_ptr,
         miss_count_ptr,
-        plan_stride);
+        plan_stride,
+        prefetch_tokens.ndim() == 0 ? nullptr : static_cast<const int32_t*>(prefetch_tokens.data_ptr()),
+        prefetch_cache.ndim() == 0 ? nullptr : prefetch_cache.data_ptr(),
+        prefetch_tokens.ndim() == 0 ? 0 : prefetch_tokens.strides()[0],
+        prefetch_tokens.ndim() == 0 ? 0 : static_cast<int32_t>(prefetch_tokens.shape()[1]),
+        prefetch_item_size_bytes,
+        prefetch_hits.ndim() == 0 ? nullptr : static_cast<int64_t*>(prefetch_hits.data_ptr()));
   };
 
   const auto seq_dtype = seq_lens.dtype();

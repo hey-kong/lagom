@@ -113,6 +113,16 @@ Pass as a JSON string via `--hisparse-config`:
       <td>int / 960</td>
       <td>CUDA thread-block size for the HiSparse swap-in kernel</td>
     </tr>
+    <tr>
+      <td><code>prefetcher</code></td>
+      <td>string / unset</td>
+      <td>Optional HiSparse prefetch algorithm. When unset, preserves the existing model-specific automatic behavior. Currently supports <code>random</code>.</td>
+    </tr>
+    <tr>
+      <td><code>prefetcher_config</code></td>
+      <td>object / <code>{"{}"}</code></td>
+      <td>Optional algorithm-specific configuration. For <code>random</code>, supports token-coverage <code>size</code> and <code>seed</code>.</td>
+    </tr>
   </tbody>
 </table>
 
@@ -123,6 +133,28 @@ Example: `--hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_t
 When a model reuses one anchor layer's top-k selection across a run of subsequent "skip" layers (DSA `index_topk_freq` / `index_topk_pattern`; native in GLM-5.2 as IndexShare), the working set of every skip layer is known the moment the anchor's index is computed. HiSparse exploits this automatically: the anchor's swap-in kernel records its miss plan (which host slots go to which device-buffer slots), and each skip layer replays that plan with a copy-only kernel issued ahead on a side stream, so the skip layers' host→device IO overlaps the intervening layers' compute instead of sitting on the decode critical path. The replay kernel uses a small fixed grid to keep its SM footprint low while overlapped.
 
 The prefetch is enabled automatically for eligible models (no pipeline parallelism, no speculative decoding) and can be turned off for A/B comparison with `SGLANG_DISABLE_HISPARSE_PREFETCH=1`.
+
+### Random prefetcher (experimental)
+
+Use the Random Prefetcher with its defaults:
+
+```bash
+--hisparse-config='{"top_k":2048,"device_buffer_size":6144,"host_to_device_ratio":10,"swap_in_block_size":960,"prefetcher":"random"}'
+```
+
+Or set the original-token coverage and an independent seed:
+
+```bash
+--hisparse-config='{"top_k":2048,"device_buffer_size":6144,"host_to_device_ratio":10,"swap_in_block_size":960,"prefetcher":"random","prefetcher_config":{"size":2048,"seed":0}}'
+```
+
+Random prefetch only warms the existing HiSparse GPU cache. The model Indexer still produces the real top-k, RESOLVE still loads any misses, and sparse attention still consumes only that real top-k. `size` specifies **original-token coverage**, not the number of compressed KV records. If it is omitted, the default covers the same number of original tokens as the runtime `effective_top_k`, including a model's `index_topk` override.
+
+For ordinary DSA, one logical KV entry covers one token. For DeepSeek-V4-Flash C4, one compressed KV entry covers four original tokens: the model's top-512 compressed-entry selection therefore covers 2048 tokens. Accordingly, `size=2048` selects 512 C4 entries; values not divisible by four round up so the requested token coverage is not reduced. The conversion happens once before allocating candidate/staging buffers, while selection and RESOLVE continue to use the Indexer's compressed logical index space.
+
+When no `prefetcher` is specified, existing behavior is unchanged: eligible GLM-5.2 shared-index layers use automatic cross-layer prefetch, while DeepSeek-V4 does not prefetch. Legacy shared-index prefetch has priority over an explicitly configured Random Prefetcher; the two modes never operate on the same device buffer concurrently. `SGLANG_DISABLE_HISPARSE_PREFETCH=1` disables both modes.
+
+The initial Random Prefetcher implementation is disabled with pipeline parallelism or speculative decoding and uses eager decode rather than CUDA graphs. It allocates one reusable staging buffer outside the configured resident `device_buffer_size`; its per-request physical capacity is the converted logical-entry count (512 C4 entries for 2048-token coverage). After the current sparse layer resolves, the next sparse layer's candidates are copied from host memory into staging on a low-footprint side stream while the current layer computes. Staging does not modify the resident table or LRU. Before the next layer resolves, its stream waits for staging; real top-k entries found there are promoted device-to-device through the normal resident-slot/LRU decision, and all other misses retain the normal host-to-device path. The staging candidates never become the attention page table and cannot replace the real Indexer top-k.
 
 ## Deployment
 
