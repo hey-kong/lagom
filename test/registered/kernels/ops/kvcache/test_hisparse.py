@@ -4,9 +4,9 @@ import pytest
 import torch
 
 from sglang.kernels.ops.kvcache.hisparse import (
+    copy_cache_planned_mla,
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
-    prefetch_cache_mla,
     transfer_cache_dsv4_mla,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
@@ -36,64 +36,63 @@ DSV4_VALUE_BYTES = 576
 DSV4_SCALE_BYTES = 8
 
 
-def test_random_staging_promotes_prefetched_miss_device_to_device() -> None:
-    """Resolver must promote a real top-k hit from isolated staging, not host."""
+def test_plan_only_then_copy_replays_into_existing_device_buffer() -> None:
+    """Random prefetch uses the resident cache directly, without KV staging."""
     host_cache = (
         torch.arange(HOST_CACHE_SIZE * KV_DIM, dtype=DTYPE)
         .view(HOST_CACHE_SIZE, 1, KV_DIM)
         .pin_memory()
     )
-    staging = torch.empty((1, 1, KV_DIM), dtype=DTYPE, device=DEVICE)
+    device_buffer = torch.full(
+        (DEVICE_CACHE_SIZE, 1, KV_DIM), -1, dtype=DTYPE, device=DEVICE
+    )
     candidates = torch.tensor([[7]], dtype=torch.int32, device=DEVICE)
-    req_indices = torch.tensor([0], dtype=torch.int64, device=DEVICE)
-    host_locs = torch.arange(HOST_CACHE_SIZE, dtype=torch.int64, device=DEVICE).view(
-        1, -1
-    )
-    prefetch_cache_mla(
-        candidates=candidates,
-        req_pool_indices=req_indices,
-        host_cache_locs=host_locs,
-        host_cache=host_cache,
-        staging_cache=staging,
-        item_size_bytes=ITEM_SIZE_BYTES,
-        block_size=256,
-    )
-    torch.cuda.synchronize()
-    expected = staging.clone()
-    host_cache[7].fill_(-1234)  # Promotion must no longer read this host slot.
-
-    device_buffer = torch.zeros(
-        (DEVICE_CACHE_SIZE, 1, KV_DIM), dtype=DTYPE, device=DEVICE
-    )
-    out = torch.full((1, 1), -1, dtype=torch.int32, device=DEVICE)
-    prefetch_hits = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+    miss_src = torch.zeros((1, 1), dtype=torch.int64, device=DEVICE)
+    miss_dst = torch.zeros((1, 1), dtype=torch.int32, device=DEVICE)
+    miss_count = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+    num_real_reqs = torch.tensor([1], dtype=torch.int32, device=DEVICE)
     load_cache_to_device_buffer_mla(
         top_k_tokens=candidates,
         device_buffer_tokens=torch.tensor(
             [[0, 1, 2, 3, -1]], dtype=torch.int32, device=DEVICE
         ),
-        host_cache_locs=host_locs,
+        host_cache_locs=torch.arange(
+            HOST_CACHE_SIZE, dtype=torch.int64, device=DEVICE
+        ).view(1, -1),
         device_buffer_locs=torch.tensor(
             [[0, 1, 2, 3, 4]], dtype=torch.int32, device=DEVICE
         ),
         host_cache=host_cache,
         device_buffer=device_buffer,
-        top_k_device_locs=out,
-        req_pool_indices=req_indices,
+        top_k_device_locs=torch.full_like(candidates, -1),
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
         seq_lens=torch.tensor([8], dtype=torch.int32, device=DEVICE),
         lru_slots=torch.arange(4, dtype=torch.int16, device=DEVICE).view(1, -1),
         item_size_bytes=ITEM_SIZE_BYTES,
         num_top_k=1,
         hot_buffer_size=4,
         block_size=256,
-        num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
-        prefetch_tokens=candidates,
-        prefetch_cache=staging,
-        prefetch_hits=prefetch_hits,
+        num_real_reqs=num_real_reqs,
+        miss_src=miss_src,
+        miss_dst=miss_dst,
+        miss_count=miss_count,
+        skip_io=True,
     )
     torch.cuda.synchronize()
-    assert prefetch_hits.item() == 1
-    assert torch.equal(device_buffer[out.item()], expected[0])
+    assert torch.all(device_buffer == -1), "plan-only RESOLVE must not move KV"
+    assert miss_count.item() == 1
+
+    copy_cache_planned_mla(
+        miss_src=miss_src,
+        miss_dst=miss_dst,
+        miss_count=miss_count,
+        num_real_reqs=num_real_reqs,
+        host_cache=host_cache,
+        device_buffer=device_buffer,
+        item_size_bytes=ITEM_SIZE_BYTES,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(device_buffer[miss_dst.item()].cpu(), host_cache[7])
 
 
 DSV4_ITEM_BYTES = DSV4_VALUE_BYTES + DSV4_SCALE_BYTES
