@@ -146,7 +146,7 @@ class HiSparseCoordinator:
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
-        # Public Random size is measured in original-token coverage.
+        # Public Previous-layer Top-k size is measured in original-token coverage.
         # DSV4 C4 RESOLVE positions each address one compress_ratio-token entry.
         self.prefetch_entry_token_span = (
             self.compress_ratio if self.is_dsv4_hisparse else 1
@@ -268,7 +268,6 @@ class HiSparseCoordinator:
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
-        self._prefetch_decode_steps = [0] * max_num_req_slots
 
         self._init_shared_index_prefetch(
             shared_index_layers=shared_index_layers,
@@ -320,29 +319,29 @@ class HiSparseCoordinator:
                 dtype=torch.int32,
                 device=device,
             )
-            self._random_prefetch_device_locs = torch.full_like(
+            self._previous_topk_prefetch_device_locs = torch.full_like(
                 self._prefetch_candidate_buffer, -1
             )
-            self._random_miss_src = torch.zeros(
+            self._previous_topk_miss_src = torch.zeros(
                 (max_num_req_slots, self.prefetcher.logical_entries),
                 dtype=torch.int64,
                 device=device,
             )
-            self._random_miss_dst = torch.zeros(
+            self._previous_topk_miss_dst = torch.zeros(
                 (max_num_req_slots, self.prefetcher.logical_entries),
                 dtype=torch.int32,
                 device=device,
             )
-            self._random_miss_count = torch.zeros(
+            self._previous_topk_miss_count = torch.zeros(
                 max_num_req_slots, dtype=torch.int32, device=device
             )
-            self._random_prefetch_stream = device_module.Stream()
-            self._random_prefetch_event = device_module.Event()
-            self._random_prefetch_target_layer = None
-            self._random_prefetch_num_reqs = 0
-            self._random_prefetch_pending_entries = 0
+            self._previous_topk_prefetch_stream = device_module.Stream()
+            self._previous_topk_prefetch_event = device_module.Event()
+            self._previous_topk_prefetch_target_layer = None
+            self._previous_topk_prefetch_num_reqs = 0
+            self._previous_topk_prefetch_pending_entries = 0
             logger.info(
-                "HiSparse Random Prefetcher: %d-token coverage maps to %d "
+                "HiSparse Previous-layer Top-k Prefetcher: %d-token coverage maps to %d "
                 "logical KV entries per request (entry span=%d tokens).",
                 self.prefetcher.size,
                 self.prefetcher.logical_entries,
@@ -414,7 +413,7 @@ class HiSparseCoordinator:
             # Skip-layer copies read the pinned host pool on the prefetch stream.
             self.prefetch_stream.synchronize()
         if self.prefetcher is not None:
-            self._random_prefetch_stream.synchronize()
+            self._previous_topk_prefetch_stream.synchronize()
         self.mem_pool_host.destroy()
 
     def get_token_stats(self) -> HiSparseTokenStats:
@@ -967,7 +966,6 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self._skip_first_backup[req.req_pool_idx] = False
-        self._prefetch_decode_steps[req.req_pool_idx] = 0
         req.hisparse_staging = False
 
     def retract_req(self, req: Req) -> None:
@@ -1023,7 +1021,6 @@ class HiSparseCoordinator:
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
-        self._prefetch_decode_steps[req.req_pool_idx] = 0
 
     def _run_swap_in_kernel(
         self,
@@ -1088,27 +1085,28 @@ class HiSparseCoordinator:
         )
         return top_k_indices
 
-    def _consume_random_prefetch(
+    def _consume_previous_topk_prefetch(
         self,
         req_pool_indices: torch.Tensor,
         layer_id: int,
     ) -> None:
         if (
             self.prefetcher is None
-            or self._random_prefetch_target_layer != layer_id
-            or self._random_prefetch_num_reqs != req_pool_indices.size(0)
+            or self._previous_topk_prefetch_target_layer != layer_id
+            or self._previous_topk_prefetch_num_reqs != req_pool_indices.size(0)
         ):
             return
-        self._random_prefetch_event.wait(device_module.current_stream())
+        self._previous_topk_prefetch_event.wait(device_module.current_stream())
         self.prefetcher.stats.completed_h2d_entries += (
-            self._random_prefetch_pending_entries
+            self._previous_topk_prefetch_pending_entries
         )
-        self._random_prefetch_pending_entries = 0
+        self._previous_topk_prefetch_pending_entries = 0
 
-    def _submit_random_prefetch(
+    def _submit_previous_topk_prefetch(
         self,
         req_pool_indices: torch.Tensor,
         compressed_seq_lens: torch.Tensor,
+        previous_topk: torch.Tensor,
         source_layer_id: int,
     ) -> None:
         """Stage the next sparse layer while the current layer computes."""
@@ -1116,58 +1114,35 @@ class HiSparseCoordinator:
             self.prefetcher is None
             or source_layer_id + 1 >= self.mem_pool_device.layer_num
         ):
-            self._random_prefetch_target_layer = None
+            self._previous_topk_prefetch_target_layer = None
             return
-        req_ids = req_pool_indices.detach().cpu().tolist()
-        seq_lens = compressed_seq_lens.detach().cpu().tolist()
-        rows = []
-        selected_count = 0
-        for req_id, seq_len in zip(req_ids, seq_lens):
-            # The newest entry may still be in host write-through.  Restrict the
-            # candidates to completed historical logical entries.
-            history_size = max(0, int(seq_len) - 1)
-            step = self._prefetch_decode_steps[req_id]
-            selected = self.prefetcher.select(
-                request_id=req_id,
-                layer_id=source_layer_id + 1,
-                decode_step=step,
-                history_size=history_size,
-            )
-            self._prefetch_decode_steps[req_id] = step + 1
-            if not selected:
-                # No completed host entry is safe for this request yet.  Batch
-                # kernels share one launch, so defer all rows until next layer.
-                return
-            selected_count += len(selected)
-            rows.append(
-                selected + [-1] * (self.prefetcher.logical_entries - len(selected))
-            )
-        candidates = torch.tensor(rows, dtype=torch.int32, device=self.device)
-        self._prefetch_candidate_buffer[: len(rows)].copy_(candidates)
+        candidates = self.prefetcher.select(previous_topk)
+        num_reqs = candidates.size(0)
+        self._prefetch_candidate_buffer[:num_reqs].copy_(candidates)
         target_layer = source_layer_id + 1
         # Plan-only RESOLVE updates the target layer's existing resident/LRU
         # metadata and records host->resident-slot copies, but moves no KV bytes.
         self._run_swap_in_kernel(
             req_pool_indices,
             compressed_seq_lens,
-            self._prefetch_candidate_buffer[: len(rows)],
+            self._prefetch_candidate_buffer[:num_reqs],
             target_layer,
             record_plan=True,
             num_top_k=self.prefetcher.logical_entries,
-            output_buffer=self._random_prefetch_device_locs,
+            output_buffer=self._previous_topk_prefetch_device_locs,
             miss_plan=(
-                self._random_miss_src,
-                self._random_miss_dst,
-                self._random_miss_count,
+                self._previous_topk_miss_src,
+                self._previous_topk_miss_dst,
+                self._previous_topk_miss_count,
             ),
             skip_io=True,
         )
-        self._random_prefetch_stream.wait_stream(device_module.current_stream())
-        with device_module.stream(self._random_prefetch_stream):
+        self._previous_topk_prefetch_stream.wait_stream(device_module.current_stream())
+        with device_module.stream(self._previous_topk_prefetch_stream):
             copy_cache_planned_mla(
-                miss_src=self._random_miss_src[: len(rows)],
-                miss_dst=self._random_miss_dst[: len(rows)],
-                miss_count=self._random_miss_count[: len(rows)],
+                miss_src=self._previous_topk_miss_src[:num_reqs],
+                miss_dst=self._previous_topk_miss_dst[:num_reqs],
+                miss_count=self._previous_topk_miss_count[:num_reqs],
                 num_real_reqs=self.num_real_reqs,
                 host_cache=self.mem_pool_host.kv_buffer[target_layer],
                 device_buffer=self.mem_pool_device.kv_buffer[target_layer],
@@ -1176,11 +1151,14 @@ class HiSparseCoordinator:
                 is_dsv4_layout=self.is_dsv4_hisparse,
                 skip_io=self.skip_io,
             )
-            self._random_prefetch_event.record(self._random_prefetch_stream)
-        self._random_prefetch_target_layer = target_layer
-        self._random_prefetch_num_reqs = len(rows)
-        self._random_prefetch_pending_entries = selected_count
-        self.prefetcher.stats.submitted_entries += selected_count
+            self._previous_topk_prefetch_event.record(
+                self._previous_topk_prefetch_stream
+            )
+        self._previous_topk_prefetch_target_layer = target_layer
+        self._previous_topk_prefetch_num_reqs = num_reqs
+        submitted_entries = num_reqs * self.prefetcher.logical_entries
+        self._previous_topk_prefetch_pending_entries = submitted_entries
+        self.prefetcher.stats.submitted_entries += submitted_entries
 
     def _run_copy_only_kernel(self, num_reqs: int, skip_layer: int) -> None:
         """Replay the anchor's recorded miss plan into a skip layer's buffers
@@ -1210,7 +1188,7 @@ class HiSparseCoordinator:
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
         """
-        self._consume_random_prefetch(req_pool_indices, layer_id)
+        self._consume_previous_topk_prefetch(req_pool_indices, layer_id)
         if not self.enable_prefetch:
             result = self._run_swap_in_kernel(
                 req_pool_indices,
@@ -1218,8 +1196,8 @@ class HiSparseCoordinator:
                 top_k_result,
                 layer_id,
             )
-            self._submit_random_prefetch(
-                req_pool_indices, compressed_seq_lens, layer_id
+            self._submit_previous_topk_prefetch(
+                req_pool_indices, compressed_seq_lens, top_k_result, layer_id
             )
             return result
 

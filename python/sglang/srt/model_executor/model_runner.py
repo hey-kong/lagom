@@ -878,11 +878,11 @@ class ModelRunner:
             ),
         )
         if self.hisparse_coordinator.prefetcher is not None:
-            # Host-side selection changes every decode step; capturing one
-            # selection would replay stale candidates.
+            # The candidate tensor and side-stream miss plan change every decode
+            # step; capturing one would replay stale preceding-layer positions.
             self.server_args.disable_cuda_graph = True
             logger.warning(
-                "HiSparse Random Prefetcher currently requires eager decode; "
+                "HiSparse previous-layer Top-k prefetch currently requires eager decode; "
                 "CUDA graph capture has been disabled."
             )
 
