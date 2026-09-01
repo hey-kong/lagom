@@ -11,6 +11,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def validate_deepseek_v4_speculative(server_args: ServerArgs, model_arch: str) -> None:
+    """Validate combinations supported by the DeepSeek-V4 target model."""
+    algorithm = server_args.speculative_algorithm
+    if algorithm is None:
+        return
+    if algorithm not in ("EAGLE", "EAGLE3", "DSPARK"):
+        raise ValueError(
+            f"Only EAGLE, EAGLE3, and DSPARK speculative algorithms are "
+            f"supported for {model_arch}; got {algorithm}."
+        )
+    if algorithm in ("EAGLE", "EAGLE3") and server_args.speculative_eagle_topk != 1:
+        raise ValueError(
+            f"Only EAGLE/EAGLE3 with --speculative-eagle-topk 1 is supported "
+            f"for {model_arch}; got {server_args.speculative_eagle_topk}."
+        )
+    if algorithm == "EAGLE3" and server_args.pp_size != 1:
+        raise ValueError(
+            "DeepSeek-V4 EAGLE3 auxiliary hidden-state capture requires "
+            f"--pp-size 1; cross-stage capture is not implemented (got {server_args.pp_size})."
+        )
+
+
 def validate_deepseek_v4_mega_moe_token_budget(
     server_args: ServerArgs,
 ) -> None:
@@ -141,16 +163,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             f"Setting max_running_requests to {server_args.max_running_requests} for {model_arch}."
         )
 
-    if server_args.speculative_algorithm is not None:
-        assert server_args.speculative_algorithm in (
-            "EAGLE",
-            "EAGLE3",
-            "DSPARK",
-        ), f"Only EAGLE, EAGLE3, and DSPARK speculative algorithms are supported for {model_arch}"
-        if server_args.speculative_algorithm in ("EAGLE", "EAGLE3"):
-            assert (
-                server_args.speculative_eagle_topk == 1
-            ), f"Only EAGLE/EAGLE3 with --speculative-eagle-topk 1 is supported for {model_arch}"
+    validate_deepseek_v4_speculative(server_args, model_arch)
 
 
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:

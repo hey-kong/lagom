@@ -2,6 +2,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from sglang.srt.arg_groups.deepseek_v4_hook import (
+    validate_deepseek_v4_speculative,
+)
 from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
     configure_aux_hidden_state_capture,
 )
@@ -63,3 +66,30 @@ def test_capture_setup_rejects_eagle3_and_dspark_together():
             dflash_target_layer_ids=[1, 5, 8],
             is_dspark=True,
         )
+
+
+@pytest.mark.parametrize("algorithm", [None, "EAGLE", "EAGLE3", "DSPARK"])
+def test_deepseek_v4_supported_speculative_algorithms(algorithm):
+    args = SimpleNamespace(
+        speculative_algorithm=algorithm, speculative_eagle_topk=1, pp_size=1
+    )
+
+    validate_deepseek_v4_speculative(args, "DeepseekV4ForCausalLM")
+
+
+def test_deepseek_v4_eagle3_rejects_topk_greater_than_one():
+    args = SimpleNamespace(
+        speculative_algorithm="EAGLE3", speculative_eagle_topk=2, pp_size=1
+    )
+
+    with pytest.raises(ValueError, match="speculative-eagle-topk 1"):
+        validate_deepseek_v4_speculative(args, "DeepseekV4ForCausalLM")
+
+
+def test_deepseek_v4_eagle3_rejects_pipeline_parallelism():
+    args = SimpleNamespace(
+        speculative_algorithm="EAGLE3", speculative_eagle_topk=1, pp_size=2
+    )
+
+    with pytest.raises(ValueError, match="cross-stage capture is not implemented"):
+        validate_deepseek_v4_speculative(args, "DeepseekV4ForCausalLM")
