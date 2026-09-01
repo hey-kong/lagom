@@ -261,6 +261,8 @@ class HiSparseCoordinator:
         self.raw_indices_buffer = torch.full(
             (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
         )
+        self.indexer_selection_k = self.top_k
+        self.ranked_page_indices_buffer = None
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
@@ -313,6 +315,27 @@ class HiSparseCoordinator:
                 prefetcher_name.lower() if prefetcher_name is not None else "disabled",
             )
         if self.prefetcher is not None:
+            if (
+                not self.is_dsv4_hisparse
+                and self.prefetcher.logical_entries > self.top_k
+            ):
+                raise ValueError(
+                    "prefetcher_config.size may exceed attention Top-k only for "
+                    "DeepSeek-V4 C4 HiSparse; generic DSA Indexers do not yet "
+                    "expose a score-ordered extended Top-M"
+                )
+            self.indexer_selection_k = self.prefetcher.selection_k
+            if self.indexer_selection_k > self.top_k:
+                # The Indexer writes Top-M here. Attention still consumes K.
+                self.raw_indices_buffer = torch.full(
+                    (max_num_req_slots, self.indexer_selection_k),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                self.ranked_page_indices_buffer = torch.full_like(
+                    self.raw_indices_buffer, -1
+                )
             self._prefetch_candidate_buffer = torch.full(
                 (max_num_req_slots, self.prefetcher.logical_entries),
                 -1,
@@ -342,10 +365,13 @@ class HiSparseCoordinator:
             self._previous_prefetch_pending_entries = 0
             logger.info(
                 "HiSparse Previous Prefetcher: %d-token coverage maps to %d "
-                "logical KV entries per request (entry span=%d tokens).",
+                "logical KV entries per request (entry span=%d tokens); Indexer "
+                "selection is Top-%d and attention remains Top-%d.",
                 self.prefetcher.size,
                 self.prefetcher.logical_entries,
                 self.prefetch_entry_token_span,
+                self.indexer_selection_k,
+                self.top_k,
             )
 
     def _init_shared_index_prefetch(
@@ -1180,6 +1206,7 @@ class HiSparseCoordinator:
         compressed_seq_lens: torch.Tensor,
         top_k_result: torch.Tensor,
         layer_id: int,
+        prefetch_candidates: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices.
 
@@ -1191,11 +1218,14 @@ class HiSparseCoordinator:
             result = self._run_swap_in_kernel(
                 req_pool_indices,
                 compressed_seq_lens,
-                top_k_result,
+                top_k_result[:, : self.top_k],
                 layer_id,
             )
             self._submit_previous_prefetch(
-                req_pool_indices, compressed_seq_lens, top_k_result, layer_id
+                req_pool_indices,
+                compressed_seq_lens,
+                top_k_result if prefetch_candidates is None else prefetch_candidates,
+                layer_id,
             )
             return result
 

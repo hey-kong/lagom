@@ -17,9 +17,15 @@ class HiSparsePrefetchStats:
 class HiSparsePrefetcher(ABC):
     """Select logical KV entries; cache ownership remains in the coordinator."""
 
-    def __init__(self, logical_entries: int, size: Optional[int] = None):
+    def __init__(
+        self,
+        logical_entries: int,
+        size: Optional[int] = None,
+        selection_k: Optional[int] = None,
+    ):
         self.logical_entries = logical_entries
         self.size = logical_entries if size is None else size
+        self.selection_k = logical_entries if selection_k is None else selection_k
         self.stats = HiSparsePrefetchStats()
 
     @abstractmethod
@@ -67,7 +73,11 @@ def create_hisparse_prefetcher(
     if resolved is None:
         return None
     factory, logical_entries, size = resolved
-    return factory(logical_entries=logical_entries, size=size)
+    return factory(
+        logical_entries=logical_entries,
+        size=size,
+        selection_k=max(effective_top_k, logical_entries),
+    )
 
 
 def validate_hisparse_prefetcher(
@@ -100,12 +110,6 @@ def validate_hisparse_prefetcher(
     if size <= 0:
         raise ValueError("prefetcher_config.size must be positive")
     logical_entries = (size + entry_token_span - 1) // entry_token_span
-    if logical_entries > effective_top_k:
-        raise ValueError(
-            f"prefetcher_config.size ({size} tokens, {logical_entries} logical "
-            f"entries) exceeds the preceding layer top-k ({effective_top_k} "
-            "logical entries)"
-        )
     if logical_entries > device_buffer_size:
         raise ValueError(
             f"prefetcher_config.size ({size} tokens, {logical_entries} logical "

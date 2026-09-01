@@ -37,7 +37,7 @@ DSV4_SCALE_BYTES = 8
 
 
 def test_plan_only_then_copy_replays_into_existing_device_buffer() -> None:
-    """Random prefetch uses the resident cache directly, without KV staging."""
+    """Previous prefetch uses the resident cache directly, without KV staging."""
     host_cache = (
         torch.arange(HOST_CACHE_SIZE * KV_DIM, dtype=DTYPE)
         .view(HOST_CACHE_SIZE, 1, KV_DIM)
