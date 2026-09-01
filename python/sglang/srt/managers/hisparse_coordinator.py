@@ -261,8 +261,7 @@ class HiSparseCoordinator:
         self.raw_indices_buffer = torch.full(
             (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
         )
-        self.indexer_selection_k = self.top_k
-        self.ranked_page_indices_buffer = None
+        self.indexer_prefetch_candidates_buffer = None
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
@@ -315,27 +314,22 @@ class HiSparseCoordinator:
                 prefetcher_name.lower() if prefetcher_name is not None else "disabled",
             )
         if self.prefetcher is not None:
-            if (
-                not self.is_dsv4_hisparse
-                and self.prefetcher.logical_entries > self.top_k
+            if not self.is_dsv4_hisparse and (
+                self.prefetcher.logical_entries != self.top_k
             ):
                 raise ValueError(
-                    "prefetcher_config.size may exceed attention Top-k only for "
-                    "DeepSeek-V4 C4 HiSparse; generic DSA Indexers do not yet "
-                    "expose a score-ordered extended Top-M"
+                    "generic DSA currently supports prefetcher_config.size only "
+                    "when it equals attention Top-k; selecting a smaller or "
+                    "larger highest-score candidate set requires score-aware "
+                    "Indexer output, which is currently implemented only for "
+                    "DeepSeek-V4 C4 HiSparse"
                 )
-            self.indexer_selection_k = self.prefetcher.selection_k
-            if self.indexer_selection_k > self.top_k:
-                # The Indexer writes Top-M here. Attention still consumes K.
-                self.raw_indices_buffer = torch.full(
-                    (max_num_req_slots, self.indexer_selection_k),
-                    -1,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                self.ranked_page_indices_buffer = torch.full_like(
-                    self.raw_indices_buffer, -1
-                )
+            self.indexer_prefetch_candidates_buffer = torch.full(
+                (max_num_req_slots, self.prefetcher.logical_entries),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
             self._prefetch_candidate_buffer = torch.full(
                 (max_num_req_slots, self.prefetcher.logical_entries),
                 -1,
@@ -370,7 +364,7 @@ class HiSparseCoordinator:
                 self.prefetcher.size,
                 self.prefetcher.logical_entries,
                 self.prefetch_entry_token_span,
-                self.indexer_selection_k,
+                self.prefetcher.logical_entries,
                 self.top_k,
             )
 

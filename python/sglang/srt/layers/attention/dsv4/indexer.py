@@ -267,7 +267,6 @@ def _topk_transform_512_vectorized(
     topk_op: Callable[..., Tuple[torch.Tensor, torch.Tensor]] = torch.topk,
     topk_op_kwargs: Optional[Dict[str, object]] = None,
     contiguous_topk_input: bool = False,
-    select_all_k: Optional[int] = None,
 ) -> None:
     TOPK = out_page_indices.shape[1]
     batch_size = scores.shape[0]
@@ -317,7 +316,7 @@ def _topk_transform_512_vectorized(
         pad_mask = cache[key_topk].unsqueeze(0) >= actual_k
         valid_topk = valid_topk & ~pad_mask
 
-    needs_sequential = seq_lens <= (TOPK if select_all_k is None else select_all_k)
+    needs_sequential = seq_lens <= TOPK
     sequential_indices = cache[key_topk].unsqueeze(0).expand(batch_size, -1)
     sequential_valid = sequential_indices < seq_lens.unsqueeze(1)
 
@@ -370,32 +369,44 @@ def topk_transform_512_pytorch_vectorized(
     )
 
 
-def topk_transform_ranked_pytorch_vectorized(
+def select_prefetch_candidates_pytorch(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
-    page_tables: torch.Tensor,
-    out_page_indices: torch.Tensor,
-    page_size: int,
-    attention_top_k: int,
-    out_raw_indices: Optional[torch.Tensor] = None,
+    out_indices: torch.Tensor,
 ) -> None:
-    """Produce a score-ordered Top-M for Previous prefetching.
+    """Select score-ordered candidates without changing formal attention Top-k.
 
-    Unlike the optimized attention Top-k kernels, this path deliberately sorts
-    the selected prefix: attention consumes its first K columns while the
-    prefetcher may consume all M columns.
+    This reuses Indexer logits but has a separate output and tie-break behavior.
+    Its result is consumed only by the next-layer prefetch path.
     """
-    _topk_transform_512_vectorized(
-        scores,
-        seq_lens,
-        page_tables,
-        out_page_indices,
-        page_size,
-        out_raw_indices,
-        topk_op=torch.topk,
-        topk_op_kwargs={"dim": 1, "largest": True, "sorted": True},
-        select_all_k=attention_top_k,
+    candidate_k = out_indices.shape[1]
+    max_seq_len = scores.shape[1]
+    positions_key = f"arange_{max_seq_len}_{scores.device}"
+    if positions_key not in _arange_cache:
+        _arange_cache[positions_key] = torch.arange(max_seq_len, device=scores.device)
+    valid = _arange_cache[positions_key].unsqueeze(0) < seq_lens.unsqueeze(1)
+    masked_scores = scores.masked_fill(~valid, float("-inf"))
+    actual_k = min(candidate_k, max_seq_len)
+    values, indices = torch.topk(
+        masked_scores, actual_k, dim=1, largest=True, sorted=True
     )
+    indices = indices.to(torch.int32)
+    indices.masked_fill_(values == float("-inf"), -1)
+    out_indices.fill_(-1)
+    out_indices[:, :actual_k].copy_(indices)
+
+
+def get_prefetch_candidates(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    formal_top_k: torch.Tensor,
+    out_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Return a prefetch-only candidate tensor without mutating formal Top-k."""
+    if out_indices.shape[1] == formal_top_k.shape[1]:
+        return formal_top_k
+    select_prefetch_candidates_pytorch(scores, seq_lens, out_indices)
+    return out_indices
 
 
 def topk_transform_512_flashinfer_unfused(
@@ -837,29 +848,7 @@ class C4IndexerBackendMixin:
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
-        extended_top_m = (
-            hisparse_decode
-            and hisparse_coordinator.indexer_selection_k
-            > c4_sparse_page_indices.shape[1]
-        )
-        if extended_top_m:
-            assert hisparse_coordinator.ranked_page_indices_buffer is not None
-            ranked_page_indices = hisparse_coordinator.ranked_page_indices_buffer[
-                : c4_sparse_page_indices.size(0)
-            ]
-            topk_transform_ranked_pytorch_vectorized(
-                logits,
-                c4_seq_lens,
-                page_table,
-                ranked_page_indices,
-                indexer_metadata.c4_page_size,
-                hisparse_coordinator.top_k,
-                raw_indices,
-            )
-            c4_sparse_page_indices.copy_(
-                ranked_page_indices[:, : c4_sparse_page_indices.shape[1]]
-            )
-        elif self.dsa_topk_backend.is_torch():
+        if self.dsa_topk_backend.is_torch():
             topk_transform_512_pytorch_vectorized(
                 logits,
                 c4_seq_lens,
@@ -895,6 +884,18 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
+        prefetch_candidates = None
+        if hisparse_decode and hisparse_coordinator.prefetcher is not None:
+            assert hisparse_coordinator.indexer_prefetch_candidates_buffer is not None
+            candidate_output = hisparse_coordinator.indexer_prefetch_candidates_buffer[
+                : c4_sparse_page_indices.size(0)
+            ]
+            prefetch_candidates = get_prefetch_candidates(
+                logits,
+                c4_seq_lens,
+                raw_indices,
+                candidate_output,
+            )
         if hisparse_coordinator is not None:
             if hisparse_decode:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
@@ -904,9 +905,9 @@ class C4IndexerBackendMixin:
                     hisparse_coordinator.swap_in_selected_pages(
                         req_pool_indices=forward_batch.req_pool_indices,
                         compressed_seq_lens=indexer_metadata.c4_seq_lens,
-                        top_k_result=raw_indices[:, : c4_sparse_page_indices.shape[1]],
+                        top_k_result=raw_indices,
                         layer_id=compress_layer_id,
-                        prefetch_candidates=raw_indices,
+                        prefetch_candidates=prefetch_candidates,
                     )
                 )
             else:
@@ -921,10 +922,7 @@ class C4IndexerBackendMixin:
             compress_layer_id = token_to_kv_pool.layer_mapping[
                 c4_indexer.layer_id
             ].compress_layer_id
-            indexer_capturer.capture(
-                compress_layer_id,
-                raw_indices[:, : c4_sparse_page_indices.shape[1]],
-            )
+            indexer_capturer.capture(compress_layer_id, raw_indices)
 
 
 class C4Indexer(nn.Module):

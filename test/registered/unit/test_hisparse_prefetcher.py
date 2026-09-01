@@ -35,7 +35,6 @@ def test_previous_default_size():
     assert isinstance(prefetcher, PreviousPrefetcher)
     assert prefetcher.logical_entries == 37
     assert prefetcher.size == 37
-    assert prefetcher.selection_k == 37
 
 
 def test_dsv4_size_is_token_coverage():
@@ -72,7 +71,7 @@ def test_invalid_size(value):
         )
 
 
-def test_size_can_expand_previous_selection_to_top_m():
+def test_size_can_exceed_attention_top_k():
     prefetcher = create_hisparse_prefetcher(
         "previous",
         {"size": 9},
@@ -80,10 +79,9 @@ def test_size_can_expand_previous_selection_to_top_m():
         device_buffer_size=16,
     )
     assert prefetcher.logical_entries == 9
-    assert prefetcher.selection_k == 9
 
 
-def test_dsv4_size_can_expand_previous_selection_to_top_m():
+def test_dsv4_size_can_exceed_attention_top_k():
     prefetcher = create_hisparse_prefetcher(
         "previous",
         {"size": 4096},
@@ -92,7 +90,6 @@ def test_dsv4_size_can_expand_previous_selection_to_top_m():
         entry_token_span=4,
     )
     assert prefetcher.logical_entries == 1024
-    assert prefetcher.selection_k == 1024
 
 
 def test_size_cannot_exceed_device_buffer():
