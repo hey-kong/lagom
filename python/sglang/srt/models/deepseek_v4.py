@@ -2513,6 +2513,7 @@ class DeepseekV4Model(nn.Module):
             self.cp_size = get_parallel().attn_cp_size
 
         self.dspark_layers_to_capture: Optional[List[int]] = None
+        self.eagle3_layers_to_capture: Optional[List[int]] = None
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -2823,11 +2824,19 @@ class DeepseekV4Model(nn.Module):
             input_ids_global = input_ids
 
         capture_dspark = self.dspark_layers_to_capture is not None
+        capture_eagle3 = self.eagle3_layers_to_capture is not None
+        if capture_dspark and capture_eagle3:
+            raise ValueError(
+                "DeepSeek-V4 cannot capture EAGLE3 and DSPARK auxiliary hidden "
+                "states at the same time."
+            )
+        capture_aux = capture_dspark or capture_eagle3
         dspark_aux_hidden_states: List[torch.Tensor] = []
-        # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
+        eagle3_aux_hidden_states: List[torch.Tensor] = []
+        # Auxiliary capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
-        run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
+        run_tbo = self._can_run_tbo(forward_batch) and not capture_aux
         if use_prefill_cp and not run_tbo:
             if cp_v2_active:
                 input_ids = cp_round_robin_input_ids_v2(input_ids, forward_batch)
@@ -2883,6 +2892,25 @@ class DeepseekV4Model(nn.Module):
                     else:
                         completed = hidden_states
                     dspark_aux_hidden_states.append(completed.mean(dim=1))
+                if capture_eagle3 and i in self.eagle3_layers_to_capture:
+                    # A fused layer defers its FFN hc_post until the following
+                    # layer.  Complete it here before reducing the mHC streams;
+                    # a pre-hc_post tensor is not the target state used to train
+                    # the EAGLE-3 draft checkpoint.
+                    if use_fused:
+                        completed = layer.hc_post(
+                            hidden_states, prev_residual, prev_post, prev_comb
+                        )
+                    else:
+                        completed = hidden_states
+                    eagle3_aux_hidden_states.append(
+                        self.hc_head(
+                            completed,
+                            self.hc_head_fn,
+                            self.hc_head_scale,
+                            self.hc_head_base,
+                        )
+                    )
             if use_fused and last_layer is not None:
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
@@ -2910,6 +2938,13 @@ class DeepseekV4Model(nn.Module):
                     )
                     for aux in dspark_aux_hidden_states
                 ]
+            if capture_eagle3:
+                eagle3_aux_hidden_states = [
+                    cp_all_gather_rerange_output(
+                        aux, self.cp_size, forward_batch, stream
+                    )
+                    for aux in eagle3_aux_hidden_states
+                ]
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
@@ -2924,6 +2959,9 @@ class DeepseekV4Model(nn.Module):
 
         if capture_dspark:
             return (hidden_states, pre_hc_head), dspark_aux_hidden_states
+
+        if capture_eagle3:
+            return (hidden_states, pre_hc_head), eagle3_aux_hidden_states
 
         return hidden_states, pre_hc_head
 
@@ -3008,8 +3046,46 @@ class DeepseekV4ForCausalLM(nn.Module):
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
+        if self.model.eagle3_layers_to_capture is not None:
+            raise ValueError(
+                "EAGLE3 and DSPARK auxiliary hidden-state capture cannot be enabled together."
+            )
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
+
+    def set_eagle3_layers_to_capture(
+        self, layer_ids: Optional[List[int]] = None
+    ) -> None:
+        """Capture completed decoder-layer outputs for an EAGLE-3 draft.
+
+        Layer IDs name decoder outputs directly.  Unlike models whose hook runs
+        before a layer, DeepSeek-V4 captures immediately after the layer, so no
+        ``+1`` translation is applied.
+        """
+        if not self.pp_group.is_last_rank:
+            return
+        if self.model.dspark_layers_to_capture is not None:
+            raise ValueError(
+                "EAGLE3 and DSPARK auxiliary hidden-state capture cannot be enabled together."
+            )
+        num_layers = self.config.num_hidden_layers
+        if layer_ids is None:
+            # Equivalent to the conventional pre-layer hook positions
+            # [2, N // 2, N - 3], expressed as completed layer output IDs.
+            layer_ids = [1, num_layers // 2 - 1, num_layers - 4]
+        layer_ids = list(layer_ids)
+        if not layer_ids or any(
+            left >= right for left, right in zip(layer_ids, layer_ids[1:])
+        ):
+            raise ValueError(
+                "EAGLE3 layer IDs must be a non-empty, strictly increasing list."
+            )
+        if any(layer_id < 0 or layer_id >= num_layers for layer_id in layer_ids):
+            raise ValueError(
+                f"EAGLE3 layer IDs {layer_ids} must be in [0, {num_layers - 1}]."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.eagle3_layers_to_capture = layer_ids
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
