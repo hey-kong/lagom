@@ -882,7 +882,7 @@ class ModelRunner:
             # step; capturing one would replay stale preceding-layer positions.
             self.server_args.disable_cuda_graph = True
             logger.warning(
-                "HiSparse previous-layer Top-k prefetch currently requires eager decode; "
+                "HiSparse previous prefetch currently requires eager decode; "
                 "CUDA graph capture has been disabled."
             )
 

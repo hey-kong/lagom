@@ -146,7 +146,7 @@ class HiSparseCoordinator:
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
-        # Public Previous-layer Top-k size is measured in original-token coverage.
+        # Public Previous size is measured in original-token coverage.
         # DSV4 C4 RESOLVE positions each address one compress_ratio-token entry.
         self.prefetch_entry_token_span = (
             self.compress_ratio if self.is_dsv4_hisparse else 1
@@ -319,29 +319,29 @@ class HiSparseCoordinator:
                 dtype=torch.int32,
                 device=device,
             )
-            self._previous_topk_prefetch_device_locs = torch.full_like(
+            self._previous_prefetch_device_locs = torch.full_like(
                 self._prefetch_candidate_buffer, -1
             )
-            self._previous_topk_miss_src = torch.zeros(
+            self._previous_miss_src = torch.zeros(
                 (max_num_req_slots, self.prefetcher.logical_entries),
                 dtype=torch.int64,
                 device=device,
             )
-            self._previous_topk_miss_dst = torch.zeros(
+            self._previous_miss_dst = torch.zeros(
                 (max_num_req_slots, self.prefetcher.logical_entries),
                 dtype=torch.int32,
                 device=device,
             )
-            self._previous_topk_miss_count = torch.zeros(
+            self._previous_miss_count = torch.zeros(
                 max_num_req_slots, dtype=torch.int32, device=device
             )
-            self._previous_topk_prefetch_stream = device_module.Stream()
-            self._previous_topk_prefetch_event = device_module.Event()
-            self._previous_topk_prefetch_target_layer = None
-            self._previous_topk_prefetch_num_reqs = 0
-            self._previous_topk_prefetch_pending_entries = 0
+            self._previous_prefetch_stream = device_module.Stream()
+            self._previous_prefetch_event = device_module.Event()
+            self._previous_prefetch_target_layer = None
+            self._previous_prefetch_num_reqs = 0
+            self._previous_prefetch_pending_entries = 0
             logger.info(
-                "HiSparse Previous-layer Top-k Prefetcher: %d-token coverage maps to %d "
+                "HiSparse Previous Prefetcher: %d-token coverage maps to %d "
                 "logical KV entries per request (entry span=%d tokens).",
                 self.prefetcher.size,
                 self.prefetcher.logical_entries,
@@ -413,7 +413,7 @@ class HiSparseCoordinator:
             # Skip-layer copies read the pinned host pool on the prefetch stream.
             self.prefetch_stream.synchronize()
         if self.prefetcher is not None:
-            self._previous_topk_prefetch_stream.synchronize()
+            self._previous_prefetch_stream.synchronize()
         self.mem_pool_host.destroy()
 
     def get_token_stats(self) -> HiSparseTokenStats:
@@ -1085,28 +1085,28 @@ class HiSparseCoordinator:
         )
         return top_k_indices
 
-    def _consume_previous_topk_prefetch(
+    def _consume_previous_prefetch(
         self,
         req_pool_indices: torch.Tensor,
         layer_id: int,
     ) -> None:
         if (
             self.prefetcher is None
-            or self._previous_topk_prefetch_target_layer != layer_id
-            or self._previous_topk_prefetch_num_reqs != req_pool_indices.size(0)
+            or self._previous_prefetch_target_layer != layer_id
+            or self._previous_prefetch_num_reqs != req_pool_indices.size(0)
         ):
             return
-        self._previous_topk_prefetch_event.wait(device_module.current_stream())
+        self._previous_prefetch_event.wait(device_module.current_stream())
         self.prefetcher.stats.completed_h2d_entries += (
-            self._previous_topk_prefetch_pending_entries
+            self._previous_prefetch_pending_entries
         )
-        self._previous_topk_prefetch_pending_entries = 0
+        self._previous_prefetch_pending_entries = 0
 
-    def _submit_previous_topk_prefetch(
+    def _submit_previous_prefetch(
         self,
         req_pool_indices: torch.Tensor,
         compressed_seq_lens: torch.Tensor,
-        previous_topk: torch.Tensor,
+        previous: torch.Tensor,
         source_layer_id: int,
     ) -> None:
         """Stage the next sparse layer while the current layer computes."""
@@ -1114,9 +1114,9 @@ class HiSparseCoordinator:
             self.prefetcher is None
             or source_layer_id + 1 >= self.mem_pool_device.layer_num
         ):
-            self._previous_topk_prefetch_target_layer = None
+            self._previous_prefetch_target_layer = None
             return
-        candidates = self.prefetcher.select(previous_topk)
+        candidates = self.prefetcher.select(previous)
         num_reqs = candidates.size(0)
         self._prefetch_candidate_buffer[:num_reqs].copy_(candidates)
         target_layer = source_layer_id + 1
@@ -1129,20 +1129,20 @@ class HiSparseCoordinator:
             target_layer,
             record_plan=True,
             num_top_k=self.prefetcher.logical_entries,
-            output_buffer=self._previous_topk_prefetch_device_locs,
+            output_buffer=self._previous_prefetch_device_locs,
             miss_plan=(
-                self._previous_topk_miss_src,
-                self._previous_topk_miss_dst,
-                self._previous_topk_miss_count,
+                self._previous_miss_src,
+                self._previous_miss_dst,
+                self._previous_miss_count,
             ),
             skip_io=True,
         )
-        self._previous_topk_prefetch_stream.wait_stream(device_module.current_stream())
-        with device_module.stream(self._previous_topk_prefetch_stream):
+        self._previous_prefetch_stream.wait_stream(device_module.current_stream())
+        with device_module.stream(self._previous_prefetch_stream):
             copy_cache_planned_mla(
-                miss_src=self._previous_topk_miss_src[:num_reqs],
-                miss_dst=self._previous_topk_miss_dst[:num_reqs],
-                miss_count=self._previous_topk_miss_count[:num_reqs],
+                miss_src=self._previous_miss_src[:num_reqs],
+                miss_dst=self._previous_miss_dst[:num_reqs],
+                miss_count=self._previous_miss_count[:num_reqs],
                 num_real_reqs=self.num_real_reqs,
                 host_cache=self.mem_pool_host.kv_buffer[target_layer],
                 device_buffer=self.mem_pool_device.kv_buffer[target_layer],
@@ -1151,13 +1151,11 @@ class HiSparseCoordinator:
                 is_dsv4_layout=self.is_dsv4_hisparse,
                 skip_io=self.skip_io,
             )
-            self._previous_topk_prefetch_event.record(
-                self._previous_topk_prefetch_stream
-            )
-        self._previous_topk_prefetch_target_layer = target_layer
-        self._previous_topk_prefetch_num_reqs = num_reqs
+            self._previous_prefetch_event.record(self._previous_prefetch_stream)
+        self._previous_prefetch_target_layer = target_layer
+        self._previous_prefetch_num_reqs = num_reqs
         submitted_entries = num_reqs * self.prefetcher.logical_entries
-        self._previous_topk_prefetch_pending_entries = submitted_entries
+        self._previous_prefetch_pending_entries = submitted_entries
         self.prefetcher.stats.submitted_entries += submitted_entries
 
     def _run_copy_only_kernel(self, num_reqs: int, skip_layer: int) -> None:
@@ -1188,7 +1186,7 @@ class HiSparseCoordinator:
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
         """
-        self._consume_previous_topk_prefetch(req_pool_indices, layer_id)
+        self._consume_previous_prefetch(req_pool_indices, layer_id)
         if not self.enable_prefetch:
             result = self._run_swap_in_kernel(
                 req_pool_indices,
@@ -1196,7 +1194,7 @@ class HiSparseCoordinator:
                 top_k_result,
                 layer_id,
             )
-            self._submit_previous_topk_prefetch(
+            self._submit_previous_prefetch(
                 req_pool_indices, compressed_seq_lens, top_k_result, layer_id
             )
             return result

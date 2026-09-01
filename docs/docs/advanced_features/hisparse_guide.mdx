@@ -116,12 +116,12 @@ Pass as a JSON string via `--hisparse-config`:
     <tr>
       <td><code>prefetcher</code></td>
       <td>string / unset</td>
-      <td>Optional HiSparse prefetch algorithm. When unset, preserves the existing model-specific automatic behavior. Currently supports <code>previous_layer_topk</code>.</td>
+      <td>Optional HiSparse prefetch algorithm. When unset, preserves the existing model-specific automatic behavior. Currently supports <code>previous</code>.</td>
     </tr>
     <tr>
       <td><code>prefetcher_config</code></td>
       <td>object / <code>{"{}"}</code></td>
-      <td>Optional algorithm-specific configuration. For <code>previous_layer_topk</code>, supports token-coverage <code>size</code>.</td>
+      <td>Optional algorithm-specific configuration. For <code>previous</code>, supports token-coverage <code>size</code>.</td>
     </tr>
   </tbody>
 </table>
@@ -139,20 +139,20 @@ The prefetch is enabled automatically for eligible models (no pipeline paralleli
 Use the previous sparse layer's highest-score positions to prefetch the next sparse layer:
 
 ```bash
---hisparse-config='{"top_k":2048,"device_buffer_size":6144,"host_to_device_ratio":10,"swap_in_block_size":960,"prefetcher":"previous_layer_topk"}'
+--hisparse-config='{"top_k":2048,"device_buffer_size":6144,"host_to_device_ratio":10,"swap_in_block_size":960,"prefetcher":"previous"}'
 ```
 
 Or set the original-token coverage explicitly:
 
 ```bash
---hisparse-config='{"top_k":2048,"device_buffer_size":6144,"host_to_device_ratio":10,"swap_in_block_size":960,"prefetcher":"previous_layer_topk","prefetcher_config":{"size":2048}}'
+--hisparse-config='{"top_k":2048,"device_buffer_size":6144,"host_to_device_ratio":10,"swap_in_block_size":960,"prefetcher":"previous","prefetcher_config":{"size":2048}}'
 ```
 
 After a sparse layer's Indexer produces its score-ordered real top-k, this prefetcher takes the first `size` token coverage worth of positions and warms those same logical positions in the next sparse layer. It never substitutes those positions for the next layer's own real top-k: the next Indexer still runs normally, matching positions become resident hits, and all other real misses retain the normal host-to-device path. If `size` is omitted, it defaults to the runtime `effective_top_k` coverage.
 
 For ordinary DSA, one logical KV entry covers one token. For DeepSeek-V4-Flash C4, one compressed KV entry covers four original tokens, so `size=2048` takes the preceding layer's first 512 compressed top-score positions. Values not divisible by four round up so the requested token coverage is not reduced. `size` cannot exceed the preceding layer's available top-k coverage.
 
-When no `prefetcher` is specified, existing behavior is unchanged: eligible GLM-5.2 shared-index layers use automatic cross-layer prefetch, while DeepSeek-V4 does not prefetch. Legacy shared-index prefetch has priority over `previous_layer_topk`; the two modes never operate on the same device buffer concurrently. `SGLANG_DISABLE_HISPARSE_PREFETCH=1` disables both modes.
+When no `prefetcher` is specified, existing behavior is unchanged: eligible GLM-5.2 shared-index layers use automatic cross-layer prefetch, while DeepSeek-V4 does not prefetch. Legacy shared-index prefetch has priority over `previous`; the two modes never operate on the same device buffer concurrently. `SGLANG_DISABLE_HISPARSE_PREFETCH=1` disables both modes.
 
 The initial implementation is disabled with pipeline parallelism or speculative decoding and uses eager decode rather than CUDA graphs. It allocates no additional KV staging buffer. A plan-only RESOLVE applies the preceding layer's positions to the next layer's existing resident table and LRU, then a low-footprint copy-only kernel replays the miss plan directly into that layer's device buffer on a side stream while the current layer computes.
 

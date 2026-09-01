@@ -23,7 +23,7 @@ class HiSparsePrefetcher(ABC):
         self.stats = HiSparsePrefetchStats()
 
     @abstractmethod
-    def select(self, previous_topk):
+    def select(self, previous):
         """Select candidates from the preceding sparse layer's scored top-k."""
 
 
@@ -115,18 +115,18 @@ def validate_hisparse_prefetcher(
     return factory, logical_entries, size
 
 
-@register_hisparse_prefetcher("previous_layer_topk")
-class PreviousLayerTopKPrefetcher(HiSparsePrefetcher):
+@register_hisparse_prefetcher("previous")
+class PreviousPrefetcher(HiSparsePrefetcher):
     """Use the highest-score positions selected by the preceding sparse layer."""
 
-    def select(self, previous_topk):
-        if previous_topk is None or previous_topk.ndim != 2:
-            raise ValueError("previous_topk must be a two-dimensional tensor")
-        if previous_topk.shape[1] < self.logical_entries:
+    def select(self, previous):
+        if previous is None or previous.ndim != 2:
+            raise ValueError("previous must be a two-dimensional tensor")
+        if previous.shape[1] < self.logical_entries:
             raise ValueError(
-                f"previous_topk has {previous_topk.shape[1]} entries, but "
+                f"previous has {previous.shape[1]} entries, but "
                 f"{self.logical_entries} are required"
             )
-        result = previous_topk[:, : self.logical_entries]
+        result = previous[:, : self.logical_entries]
         self.stats.selected_entries += result.numel()
         return result
