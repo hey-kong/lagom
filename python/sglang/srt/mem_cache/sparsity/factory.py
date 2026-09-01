@@ -79,6 +79,8 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     device_buffer_size = extra_config.pop("device_buffer_size", 2 * top_k)
     host_to_device_ratio = extra_config.pop("host_to_device_ratio", 2)
     swap_in_block_size = extra_config.pop("swap_in_block_size", 960)
+    prefetcher = extra_config.pop("prefetcher", None)
+    prefetcher_config = extra_config.pop("prefetcher_config", {})
 
     if device_buffer_size < top_k:
         raise ValueError(
@@ -91,6 +93,12 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     if swap_in_block_size <= 0 or swap_in_block_size > 1024:
         raise ValueError(
             f"swap_in_block_size ({swap_in_block_size}) must be in the range [1, 1024]"
+        )
+    if prefetcher is not None and not isinstance(prefetcher, str):
+        raise ValueError(f"prefetcher must be a string, got {prefetcher!r}")
+    if not isinstance(prefetcher_config, dict):
+        raise ValueError(
+            f"prefetcher_config must be an object, got {prefetcher_config!r}"
         )
 
     algorithm = extra_config.pop("algorithm", None)
@@ -107,6 +115,8 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         backend=backend,
         page_size=page_size,
         min_sparse_prompt_len=min_sparse_prompt_len,
+        prefetcher=prefetcher,
+        prefetcher_config=prefetcher_config,
         sparse_extra_config=extra_config,
     )
 

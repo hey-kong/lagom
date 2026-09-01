@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.kvcache.hisparse import (
+    copy_cache_planned_mla,
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
     transfer_cache_dsv4_mla,
@@ -33,6 +34,67 @@ ITEM_SIZE_BYTES = KV_DIM * torch.empty((), dtype=DTYPE).element_size()
 DSV4_PAGE_SIZE = 64
 DSV4_VALUE_BYTES = 576
 DSV4_SCALE_BYTES = 8
+
+
+def test_plan_only_then_copy_replays_into_existing_device_buffer() -> None:
+    """Previous prefetch uses the resident cache directly, without KV staging."""
+    host_cache = (
+        torch.arange(HOST_CACHE_SIZE * KV_DIM, dtype=DTYPE)
+        .view(HOST_CACHE_SIZE, 1, KV_DIM)
+        .pin_memory()
+    )
+    device_buffer = torch.full(
+        (DEVICE_CACHE_SIZE, 1, KV_DIM), -1, dtype=DTYPE, device=DEVICE
+    )
+    candidates = torch.tensor([[7]], dtype=torch.int32, device=DEVICE)
+    miss_src = torch.zeros((1, 1), dtype=torch.int64, device=DEVICE)
+    miss_dst = torch.zeros((1, 1), dtype=torch.int32, device=DEVICE)
+    miss_count = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+    num_real_reqs = torch.tensor([1], dtype=torch.int32, device=DEVICE)
+    load_cache_to_device_buffer_mla(
+        top_k_tokens=candidates,
+        device_buffer_tokens=torch.tensor(
+            [[0, 1, 2, 3, -1]], dtype=torch.int32, device=DEVICE
+        ),
+        host_cache_locs=torch.arange(
+            HOST_CACHE_SIZE, dtype=torch.int64, device=DEVICE
+        ).view(1, -1),
+        device_buffer_locs=torch.tensor(
+            [[0, 1, 2, 3, 4]], dtype=torch.int32, device=DEVICE
+        ),
+        host_cache=host_cache,
+        device_buffer=device_buffer,
+        top_k_device_locs=torch.full_like(candidates, -1),
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([8], dtype=torch.int32, device=DEVICE),
+        lru_slots=torch.arange(4, dtype=torch.int16, device=DEVICE).view(1, -1),
+        item_size_bytes=ITEM_SIZE_BYTES,
+        num_top_k=1,
+        hot_buffer_size=4,
+        block_size=256,
+        num_real_reqs=num_real_reqs,
+        miss_src=miss_src,
+        miss_dst=miss_dst,
+        miss_count=miss_count,
+        skip_io=True,
+    )
+    torch.cuda.synchronize()
+    assert torch.all(device_buffer == -1), "plan-only RESOLVE must not move KV"
+    assert miss_count.item() == 1
+
+    copy_cache_planned_mla(
+        miss_src=miss_src,
+        miss_dst=miss_dst,
+        miss_count=miss_count,
+        num_real_reqs=num_real_reqs,
+        host_cache=host_cache,
+        device_buffer=device_buffer,
+        item_size_bytes=ITEM_SIZE_BYTES,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(device_buffer[miss_dst.item()].cpu(), host_cache[7])
+
+
 DSV4_ITEM_BYTES = DSV4_VALUE_BYTES + DSV4_SCALE_BYTES
 DSV4_PAGE_BYTES = ((DSV4_ITEM_BYTES * DSV4_PAGE_SIZE + 575) // 576) * 576
 DSV4_SCALE_OFFSET = DSV4_VALUE_BYTES * DSV4_PAGE_SIZE

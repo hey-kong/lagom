@@ -1,7 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Dict, List, Mapping, NamedTuple, Optional, Tuple, Union
 
 import torch
 
@@ -12,6 +12,10 @@ from sglang.kernels.ops.kvcache.hisparse import (
 )
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
+from sglang.srt.managers.hisparse_prefetcher import (
+    create_hisparse_prefetcher,
+    validate_hisparse_prefetcher,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -123,6 +127,10 @@ class HiSparseCoordinator:
         host_to_device_ratio: int = 2,
         swap_in_block_size: int = 960,
         shared_index_layers: Optional[List[bool]] = None,
+        prefetcher_name: Optional[str] = None,
+        prefetcher_config: Optional[Mapping] = None,
+        pp_size: int = 1,
+        is_speculative: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -137,6 +145,11 @@ class HiSparseCoordinator:
 
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
+        )
+        # Public Previous size is measured in original-token coverage.
+        # DSV4 C4 RESOLVE positions each address one compress_ratio-token entry.
+        self.prefetch_entry_token_span = (
+            self.compress_ratio if self.is_dsv4_hisparse else 1
         )
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
@@ -248,6 +261,7 @@ class HiSparseCoordinator:
         self.raw_indices_buffer = torch.full(
             (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
         )
+        self.indexer_prefetch_candidates_buffer = None
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
@@ -261,6 +275,98 @@ class HiSparseCoordinator:
             layer_num=layer_num,
             max_num_req_slots=max_num_req_slots,
         )
+        self.prefetcher = None
+        # Validate even when a higher-priority mode wins, so misspellings never
+        # become silently dormant configuration.
+        validate_hisparse_prefetcher(
+            prefetcher_name,
+            prefetcher_config or {},
+            effective_top_k=self.top_k,
+            device_buffer_size=self.device_buffer_size,
+            entry_token_span=self.prefetch_entry_token_span,
+        )
+        if envs.SGLANG_DISABLE_HISPARSE_PREFETCH.get():
+            logger.info("HiSparse prefetch mode: disabled")
+        elif self.enable_prefetch:
+            logger.info("HiSparse prefetch mode: legacy shared-index")
+            if prefetcher_name is not None:
+                logger.info(
+                    'HiSparse prefetcher "%s" is not activated because legacy '
+                    "shared-index prefetch has higher priority for this model.",
+                    prefetcher_name,
+                )
+        elif prefetcher_name is not None and (pp_size != 1 or is_speculative):
+            logger.warning(
+                'HiSparse prefetcher "%s" is disabled under pipeline parallelism '
+                "or speculative decoding; HiSparse prefetch mode: disabled",
+                prefetcher_name,
+            )
+        else:
+            self.prefetcher = create_hisparse_prefetcher(
+                prefetcher_name,
+                prefetcher_config or {},
+                effective_top_k=self.top_k,
+                device_buffer_size=self.device_buffer_size,
+                entry_token_span=self.prefetch_entry_token_span,
+            )
+            logger.info(
+                "HiSparse prefetch mode: %s",
+                prefetcher_name.lower() if prefetcher_name is not None else "disabled",
+            )
+        if self.prefetcher is not None:
+            if not self.is_dsv4_hisparse and (
+                self.prefetcher.logical_entries != self.top_k
+            ):
+                raise ValueError(
+                    "generic DSA currently supports prefetcher_config.size only "
+                    "when it equals attention Top-k; selecting a smaller or "
+                    "larger highest-score candidate set requires score-aware "
+                    "Indexer output, which is currently implemented only for "
+                    "DeepSeek-V4 C4 HiSparse"
+                )
+            self.indexer_prefetch_candidates_buffer = torch.full(
+                (max_num_req_slots, self.prefetcher.logical_entries),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            self._prefetch_candidate_buffer = torch.full(
+                (max_num_req_slots, self.prefetcher.logical_entries),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            self._previous_prefetch_device_locs = torch.full_like(
+                self._prefetch_candidate_buffer, -1
+            )
+            self._previous_miss_src = torch.zeros(
+                (max_num_req_slots, self.prefetcher.logical_entries),
+                dtype=torch.int64,
+                device=device,
+            )
+            self._previous_miss_dst = torch.zeros(
+                (max_num_req_slots, self.prefetcher.logical_entries),
+                dtype=torch.int32,
+                device=device,
+            )
+            self._previous_miss_count = torch.zeros(
+                max_num_req_slots, dtype=torch.int32, device=device
+            )
+            self._previous_prefetch_stream = device_module.Stream()
+            self._previous_prefetch_event = device_module.Event()
+            self._previous_prefetch_target_layer = None
+            self._previous_prefetch_num_reqs = 0
+            self._previous_prefetch_pending_entries = 0
+            logger.info(
+                "HiSparse Previous Prefetcher: %d-token coverage maps to %d "
+                "logical KV entries per request (entry span=%d tokens); Indexer "
+                "selection is Top-%d and attention remains Top-%d.",
+                self.prefetcher.size,
+                self.prefetcher.logical_entries,
+                self.prefetch_entry_token_span,
+                self.prefetcher.logical_entries,
+                self.top_k,
+            )
 
     def _init_shared_index_prefetch(
         self,
@@ -326,6 +432,8 @@ class HiSparseCoordinator:
         if self.enable_prefetch:
             # Skip-layer copies read the pinned host pool on the prefetch stream.
             self.prefetch_stream.synchronize()
+        if self.prefetcher is not None:
+            self._previous_prefetch_stream.synchronize()
         self.mem_pool_host.destroy()
 
     def get_token_stats(self) -> HiSparseTokenStats:
@@ -781,9 +889,9 @@ class HiSparseCoordinator:
         Returns:
             Device KV cache indices for the selected tokens.  Shape: (num_reqs, top_k)
         """
-        assert (
-            not self.is_dsv4_hisparse
-        ), "naive_load_topk is not implemented for dsv4 hisparse"
+        assert not self.is_dsv4_hisparse, (
+            "naive_load_topk is not implemented for dsv4 hisparse"
+        )
         num_reqs = req_pool_indices.size(0)
         top_k_indices = torch.full(
             (num_reqs, self.top_k), -1, dtype=torch.int32, device=self.device
@@ -798,9 +906,9 @@ class HiSparseCoordinator:
             req_idx = int(req_pool_indices[i].item())
             selected_tokens = top_k_tokens[i, :top_n].to(dtype=torch.int64)
 
-            assert torch.all(
-                selected_tokens >= 0
-            ), f"Req {req_idx}: selected tokens contain negative positions"
+            assert torch.all(selected_tokens >= 0), (
+                f"Req {req_idx}: selected tokens contain negative positions"
+            )
             assert torch.all(selected_tokens < seq_len), (
                 f"Req {req_idx}: selected tokens {selected_tokens.tolist()} "
                 f"out of range for seq_len={seq_len}"
@@ -941,6 +1049,10 @@ class HiSparseCoordinator:
         top_k_result: torch.Tensor,
         layer_id: int,
         record_plan: bool = False,
+        num_top_k: Optional[int] = None,
+        output_buffer: Optional[torch.Tensor] = None,
+        miss_plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        skip_io: Optional[bool] = None,
     ) -> torch.Tensor:
         """Run the full plan+IO swap-in kernel for one layer; return its slot table.
 
@@ -948,22 +1060,29 @@ class HiSparseCoordinator:
         miss plan into self._miss_{src,dst,count} for the skip layers to replay.
         """
         num_reqs = req_pool_indices.size(0)
-        top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
+        num_top_k = num_top_k or self.top_k
+        top_k_indices = (
+            self.top_k_device_locs_buffer if output_buffer is None else output_buffer
+        )[:num_reqs]
 
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla
             if self.is_dsv4_hisparse
             else load_cache_to_device_buffer_mla
         )
-        plan = (
-            dict(
-                miss_src=self._miss_src[:num_reqs],
-                miss_dst=self._miss_dst[:num_reqs],
-                miss_count=self._miss_count[:num_reqs],
+        if record_plan:
+            miss_src, miss_dst, miss_count = miss_plan or (
+                self._miss_src,
+                self._miss_dst,
+                self._miss_count,
             )
-            if record_plan
-            else {}
-        )
+            plan = dict(
+                miss_src=miss_src[:num_reqs],
+                miss_dst=miss_dst[:num_reqs],
+                miss_count=miss_count[:num_reqs],
+            )
+        else:
+            plan = {}
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -976,15 +1095,88 @@ class HiSparseCoordinator:
             seq_lens=compressed_seq_lens,
             lru_slots=self.lru_slots[layer_id],
             item_size_bytes=self.item_size_bytes,
-            num_top_k=self.top_k,
+            num_top_k=num_top_k,
             hot_buffer_size=self.device_buffer_size,
             page_size=1,
             block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
-            skip_io=self.skip_io,
+            skip_io=self.skip_io if skip_io is None else skip_io,
             **plan,
         )
         return top_k_indices
+
+    def _consume_previous_prefetch(
+        self,
+        req_pool_indices: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        if (
+            self.prefetcher is None
+            or self._previous_prefetch_target_layer != layer_id
+            or self._previous_prefetch_num_reqs != req_pool_indices.size(0)
+        ):
+            return
+        self._previous_prefetch_event.wait(device_module.current_stream())
+        self.prefetcher.stats.completed_h2d_entries += (
+            self._previous_prefetch_pending_entries
+        )
+        self._previous_prefetch_pending_entries = 0
+
+    def _submit_previous_prefetch(
+        self,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        previous: torch.Tensor,
+        source_layer_id: int,
+    ) -> None:
+        """Stage the next sparse layer while the current layer computes."""
+        if (
+            self.prefetcher is None
+            or source_layer_id + 1 >= self.mem_pool_device.layer_num
+        ):
+            self._previous_prefetch_target_layer = None
+            return
+        candidates = self.prefetcher.select(previous)
+        num_reqs = candidates.size(0)
+        self._prefetch_candidate_buffer[:num_reqs].copy_(candidates)
+        target_layer = source_layer_id + 1
+        # Plan-only RESOLVE updates the target layer's existing resident/LRU
+        # metadata and records host->resident-slot copies, but moves no KV bytes.
+        self._run_swap_in_kernel(
+            req_pool_indices,
+            compressed_seq_lens,
+            self._prefetch_candidate_buffer[:num_reqs],
+            target_layer,
+            record_plan=True,
+            num_top_k=self.prefetcher.logical_entries,
+            output_buffer=self._previous_prefetch_device_locs,
+            miss_plan=(
+                self._previous_miss_src,
+                self._previous_miss_dst,
+                self._previous_miss_count,
+            ),
+            skip_io=True,
+        )
+        self._previous_prefetch_stream.wait_stream(device_module.current_stream())
+        with device_module.stream(self._previous_prefetch_stream):
+            copy_cache_planned_mla(
+                miss_src=self._previous_miss_src[:num_reqs],
+                miss_dst=self._previous_miss_dst[:num_reqs],
+                miss_count=self._previous_miss_count[:num_reqs],
+                num_real_reqs=self.num_real_reqs,
+                host_cache=self.mem_pool_host.kv_buffer[target_layer],
+                device_buffer=self.mem_pool_device.kv_buffer[target_layer],
+                item_size_bytes=self.item_size_bytes,
+                num_blocks=4,
+                is_dsv4_layout=self.is_dsv4_hisparse,
+                skip_io=self.skip_io,
+            )
+            self._previous_prefetch_event.record(self._previous_prefetch_stream)
+        self._previous_prefetch_target_layer = target_layer
+        self._previous_prefetch_num_reqs = num_reqs
+        submitted_entries = num_reqs * self.prefetcher.logical_entries
+        self._previous_prefetch_pending_entries = submitted_entries
+        self.prefetcher.stats.submitted_entries += submitted_entries
 
     def _run_copy_only_kernel(self, num_reqs: int, skip_layer: int) -> None:
         """Replay the anchor's recorded miss plan into a skip layer's buffers
@@ -1008,16 +1200,28 @@ class HiSparseCoordinator:
         compressed_seq_lens: torch.Tensor,
         top_k_result: torch.Tensor,
         layer_id: int,
+        prefetch_candidates: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices.
 
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
         """
+        self._consume_previous_prefetch(req_pool_indices, layer_id)
         if not self.enable_prefetch:
-            return self._run_swap_in_kernel(
-                req_pool_indices, compressed_seq_lens, top_k_result, layer_id
+            result = self._run_swap_in_kernel(
+                req_pool_indices,
+                compressed_seq_lens,
+                top_k_result[:, : self.top_k],
+                layer_id,
             )
+            self._submit_previous_prefetch(
+                req_pool_indices,
+                compressed_seq_lens,
+                top_k_result if prefetch_candidates is None else prefetch_candidates,
+                layer_id,
+            )
+            return result
 
         num_reqs = req_pool_indices.size(0)
         if self._is_shared_index_layer[layer_id]:

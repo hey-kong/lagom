@@ -206,9 +206,9 @@ def fp8_paged_mqa_logits_torch_sm120(
         )
 
     assert head_dim == 128, "Vectorized torch impl hardcodes DSV4 indexer head_dim=128"
-    assert (
-        block_size == 64
-    ), "Vectorized torch impl hardcodes block_size=64 cache layout"
+    assert block_size == 64, (
+        "Vectorized torch impl hardcodes block_size=64 cache layout"
+    )
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
     assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
     assert weight.shape == (batch_size, num_heads)
@@ -367,6 +367,46 @@ def topk_transform_512_pytorch_vectorized(
         topk_op=torch.topk,
         topk_op_kwargs={"dim": 1, "largest": True, "sorted": False},
     )
+
+
+def select_prefetch_candidates_pytorch(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out_indices: torch.Tensor,
+) -> None:
+    """Select score-ordered candidates without changing formal attention Top-k.
+
+    This reuses Indexer logits but has a separate output and tie-break behavior.
+    Its result is consumed only by the next-layer prefetch path.
+    """
+    candidate_k = out_indices.shape[1]
+    max_seq_len = scores.shape[1]
+    positions_key = f"arange_{max_seq_len}_{scores.device}"
+    if positions_key not in _arange_cache:
+        _arange_cache[positions_key] = torch.arange(max_seq_len, device=scores.device)
+    valid = _arange_cache[positions_key].unsqueeze(0) < seq_lens.unsqueeze(1)
+    masked_scores = scores.masked_fill(~valid, float("-inf"))
+    actual_k = min(candidate_k, max_seq_len)
+    values, indices = torch.topk(
+        masked_scores, actual_k, dim=1, largest=True, sorted=True
+    )
+    indices = indices.to(torch.int32)
+    indices.masked_fill_(values == float("-inf"), -1)
+    out_indices.fill_(-1)
+    out_indices[:, :actual_k].copy_(indices)
+
+
+def get_prefetch_candidates(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    formal_top_k: torch.Tensor,
+    out_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Return a prefetch-only candidate tensor without mutating formal Top-k."""
+    if out_indices.shape[1] == formal_top_k.shape[1]:
+        return formal_top_k
+    select_prefetch_candidates_pytorch(scores, seq_lens, out_indices)
+    return out_indices
 
 
 def topk_transform_512_flashinfer_unfused(
@@ -844,6 +884,18 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
+        prefetch_candidates = None
+        if hisparse_decode and hisparse_coordinator.prefetcher is not None:
+            assert hisparse_coordinator.indexer_prefetch_candidates_buffer is not None
+            candidate_output = hisparse_coordinator.indexer_prefetch_candidates_buffer[
+                : c4_sparse_page_indices.size(0)
+            ]
+            prefetch_candidates = get_prefetch_candidates(
+                logits,
+                c4_seq_lens,
+                raw_indices,
+                candidate_output,
+            )
         if hisparse_coordinator is not None:
             if hisparse_decode:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
@@ -855,6 +907,7 @@ class C4IndexerBackendMixin:
                         compressed_seq_lens=indexer_metadata.c4_seq_lens,
                         top_k_result=raw_indices,
                         layer_id=compress_layer_id,
+                        prefetch_candidates=prefetch_candidates,
                     )
                 )
             else:

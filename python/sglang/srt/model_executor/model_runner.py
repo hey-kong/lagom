@@ -447,9 +447,9 @@ class ModelRunner:
         )
 
         if self.ps.pp_size > 1:
-            assert (
-                self.support_pp
-            ), "Pipeline Parallel is not compatible with this model."
+            assert self.support_pp, (
+                "Pipeline Parallel is not compatible with this model."
+            )
 
         # For weight updates
         self.init_weight_updater()
@@ -867,12 +867,24 @@ class ModelRunner:
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
+            prefetcher_name=hisparse_cfg.prefetcher,
+            prefetcher_config=hisparse_cfg.prefetcher_config,
+            pp_size=self.ps.pp_size,
+            is_speculative=self.spec_algorithm.is_speculative(),
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,
                 pp_size=self.ps.pp_size,
                 is_speculative=self.spec_algorithm.is_speculative(),
             ),
         )
+        if self.hisparse_coordinator.prefetcher is not None:
+            # The candidate tensor and side-stream miss plan change every decode
+            # step; capturing one would replay stale preceding-layer positions.
+            self.server_args.disable_cuda_graph = True
+            logger.warning(
+                "HiSparse previous prefetch currently requires eager decode; "
+                "CUDA graph capture has been disabled."
+            )
 
     def post_capture_resize_kv_pool(self):
         resize = compute_post_capture_kv_resize(self)

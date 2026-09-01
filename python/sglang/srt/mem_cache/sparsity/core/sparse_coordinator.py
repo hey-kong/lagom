@@ -63,6 +63,8 @@ class SparseConfig:
     backend: Optional[str] = None
     page_size: Optional[int] = None
     min_sparse_prompt_len: Optional[int] = None
+    prefetcher: Optional[str] = None
+    prefetcher_config: dict = field(default_factory=dict)
     sparse_extra_config: dict = field(
         default_factory=dict
     )  # Algorithm-specific config, parsed by each algorithm

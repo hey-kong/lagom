@@ -6,7 +6,11 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsv4.indexer import FP8_DTYPE, C4IndexerBackendMixin
+from sglang.srt.layers.attention.dsv4.indexer import (
+    FP8_DTYPE,
+    C4IndexerBackendMixin,
+    get_prefetch_candidates,
+)
 from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
     PagedIndexerMetadata,
@@ -19,6 +23,58 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 _INDEXER = "sglang.srt.layers.attention.dsv4.indexer"
+
+
+class TestDSV4PrefetchCandidates(CustomTestCase):
+    def test_tied_scores_do_not_change_formal_attention_top_k(self):
+        scores = torch.tensor([[10.0, 9.0, 8.0, 0.0, 0.0, 0.0, 0.0]])
+        seq_lens = torch.tensor([7], dtype=torch.int32)
+        # Model an arbitrary tied-score choice/order from the configured backend.
+        formal_top_k = torch.tensor([[6, 0, 2, 1]], dtype=torch.int32)
+        attention_without_prefetch = formal_top_k.clone()
+        formal_data_ptr = formal_top_k.data_ptr()
+        candidate_output = torch.full((1, 6), -1, dtype=torch.int32)
+
+        candidates = get_prefetch_candidates(
+            scores, seq_lens, formal_top_k, candidate_output
+        )
+
+        attention_with_prefetch = formal_top_k
+        torch.testing.assert_close(attention_with_prefetch, attention_without_prefetch)
+        self.assertEqual(formal_top_k.data_ptr(), formal_data_ptr)
+        self.assertEqual(candidates.shape, (1, 6))
+        self.assertEqual(set(candidates[0, :3].tolist()), {0, 1, 2})
+
+    def test_smaller_prefetch_is_ranked_instead_of_slicing_formal_top_k(self):
+        scores = torch.tensor([[1.0, 8.0, 3.0, 7.0, 2.0]])
+        seq_lens = torch.tensor([5], dtype=torch.int32)
+        formal_top_k = torch.tensor([[0, 4, 3, 1]], dtype=torch.int32)
+        original = formal_top_k.clone()
+        candidate_output = torch.full((1, 2), -1, dtype=torch.int32)
+
+        candidates = get_prefetch_candidates(
+            scores, seq_lens, formal_top_k, candidate_output
+        )
+
+        torch.testing.assert_close(formal_top_k, original)
+        torch.testing.assert_close(
+            candidates, torch.tensor([[1, 3]], dtype=torch.int32)
+        )
+
+    def test_equal_size_reuses_full_formal_set_without_selection(self):
+        scores = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
+        seq_lens = torch.tensor([4], dtype=torch.int32)
+        formal_top_k = torch.tensor([[3, 1, 2, 0]], dtype=torch.int32)
+        candidate_output = torch.full_like(formal_top_k, -1)
+
+        candidates = get_prefetch_candidates(
+            scores, seq_lens, formal_top_k, candidate_output
+        )
+
+        self.assertIs(candidates, formal_top_k)
+        torch.testing.assert_close(
+            candidates, torch.tensor([[3, 1, 2, 0]], dtype=torch.int32)
+        )
 
 
 class TestDSV4PagedIndexerMetadata(CustomTestCase):
