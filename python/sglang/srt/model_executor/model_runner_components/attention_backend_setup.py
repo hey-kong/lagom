@@ -51,6 +51,11 @@ def configure_aux_hidden_state_capture(
     Must be called before CUDA graph capture so the captured graphs
     include aux hidden state output paths.
     """
+    if eagle_use_aux_hidden_state and dflash_use_aux_hidden_state:
+        raise ValueError(
+            "EAGLE3 and DFLASH/DSPARK auxiliary hidden-state capture cannot be "
+            "enabled at the same time because their captured states have different semantics."
+        )
     if eagle_use_aux_hidden_state:
         model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
     if dflash_use_aux_hidden_state:
