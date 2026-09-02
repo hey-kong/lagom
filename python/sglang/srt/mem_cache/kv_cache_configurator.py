@@ -1126,7 +1126,7 @@ class KVCacheConfigurator:
             compression_ratios=compression_ratios,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            enable_hisparse=get_memory().enable_hisparse,
+            enable_hisparse=get_memory().enable_hisparse and not self.is_draft_worker,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
         )
         return token_to_kv_pool
@@ -1312,7 +1312,7 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
-        if get_memory().enable_hisparse:
+        if get_memory().enable_hisparse and not self.is_draft_worker:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -1684,7 +1684,7 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
                 else:
-                    if get_memory().enable_hisparse:
+                    if get_memory().enable_hisparse and not self.is_draft_worker:
                         from sglang.srt.mem_cache.sparsity import (
                             parse_hisparse_config,
                         )
@@ -1720,7 +1720,7 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
 
-            if get_memory().enable_hisparse and is_dsv4_model:
+            if get_memory().enable_hisparse and not self.is_draft_worker and is_dsv4_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
                 token_to_kv_pool_allocator = DeepSeekV4HiSparseTokenToKVPoolAllocator(
                     token_to_kv_pool_allocator

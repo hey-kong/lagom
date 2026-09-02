@@ -6,7 +6,7 @@ metatags:
 
 HiSparse reduces per-request GPU memory consumption during the decode phase by maintaining only a small "hot" KV buffer on GPU while keeping complete KV data in CPU pinned memory. Combined with PD disaggregation, it enables significantly higher decode concurrency.
 
-> **Prerequisites**: HiSparse works with models that use **DeepSeek Sparse Attention (DSA)** architectures (e.g., DeepSeek-V3.2, GLM-5.1) and **DeepSeek V4**. These models natively select a subset of tokens for attention, making it possible to keep only the top-k KV on GPU while storing the full KV in host memory — without accuracy loss. Additionally, HiSparse currently requires **PD disaggregation mode** and is enabled on the **decode instance** only.
+> **Prerequisites**: HiSparse works with models that use **DeepSeek Sparse Attention (DSA)** architectures (e.g., DeepSeek-V3.2, GLM-5.1) and **DeepSeek V4**. These models natively select a subset of tokens for attention, making it possible to keep only the top-k KV on GPU while storing the full KV in host memory — without accuracy loss. You can use the DeepSeek-V4 CUDA path in a non-disaggregated server, including with DSPARK. Other DSA deployments use HiSparse on a PD decode instance.
 
 ## Why HiSparse?
 
@@ -128,6 +128,8 @@ Pass as a JSON string via `--hisparse-config`:
 
 Example: `--hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_to_device_ratio": 10, "swap_in_block_size": 960}'`
 
+For DeepSeek-V4, C4 is the unit for resident and host-cache entries: one C4 entry covers four original tokens. The model's `index_topk` controls the effective attention Top-K and takes precedence over the compatible `top_k` CLI field. For DeepSeek-V4-Flash, `index_topk=512` therefore covers 2,048 original tokens; `top_k=2048` does **not** request 2,048 C4 entries. `device_buffer_size=4096` is 4,096 C4 entries. SGLang logs the effective C4 Top-K when these values differ.
+
 ### Shared-index prefetch (automatic)
 
 When a model reuses one anchor layer's top-k selection across a run of subsequent "skip" layers (DSA `index_topk_freq` / `index_topk_pattern`; native in GLM-5.2 as IndexShare), the working set of every skip layer is known the moment the anchor's index is computed. HiSparse exploits this automatically: the anchor's swap-in kernel records its miss plan (which host slots go to which device-buffer slots), and each skip layer replays that plan with a copy-only kernel issued ahead on a side stream, so the skip layers' host→device IO overlaps the intervening layers' compute instead of sitting on the decode critical path. The replay kernel uses a small fixed grid to keep its SM footprint low while overlapped.
@@ -158,7 +160,28 @@ The initial implementation is disabled with pipeline parallelism or speculative 
 
 ## Deployment
 
-HiSparse currently requires **PD disaggregation mode** and is enabled only on the **decode instance**.
+HiSparse supports PD decode deployments and the non-PD DeepSeek-V4 CUDA deployment below.
+
+### DeepSeek-V4 with DSPARK (non-PD)
+
+The target worker owns the HiSparse C4 host/device cache. The DSPARK draft worker keeps its independent KV cache in HBM; it does not allocate or release target HiSparse pages. TARGET_VERIFY processes each request's real Indexer Top-K steps in order so resident-table and LRU updates cannot race.
+
+```bash Command
+sglang serve \
+  --trust-remote-code \
+  --model-path /mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-0731/ \
+  --tp 4 \
+  --moe-runner-backend marlin \
+  --speculative-algorithm DSPARK \
+  --host 0.0.0.0 \
+  --port 32073 \
+  --disable-radix-cache \
+  --enable-metrics \
+  --enable-cache-report \
+  --max-running-requests 32 \
+  --enable-hisparse \
+  --hisparse-config '{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 5}'
+```
 
 ### Prefill Instance
 

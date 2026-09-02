@@ -351,7 +351,11 @@ class ModelRunner:
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
-        self.enable_hisparse = server_args.enable_hisparse
+        # HiSparse owns the target model's authoritative host C4 cache.  A
+        # DFlash/DSPARK draft runner has an independent KV lifetime and must
+        # never construct (or free) that cache merely because the target's
+        # command line enables HiSparse.
+        self.enable_hisparse = server_args.enable_hisparse and not is_draft_worker
 
         self.init_startup_observability()
 
@@ -854,6 +858,15 @@ class ModelRunner:
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
+        if hisparse_top_k != hisparse_cfg.top_k:
+            logger.info(
+                "DeepSeek-V4 HiSparse uses model index_topk=%d C4 entries "
+                "(%d original-token coverage); --hisparse-config top_k=%d "
+                "is retained for CLI compatibility but does not override the model indexer.",
+                hisparse_top_k,
+                hisparse_top_k * 4,
+                hisparse_cfg.top_k,
+            )
         self.hisparse_coordinator = HiSparseCoordinator(
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,

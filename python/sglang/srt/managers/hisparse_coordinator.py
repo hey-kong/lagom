@@ -1252,3 +1252,72 @@ class HiSparseCoordinator:
                         self.prefetch_stream
                     )
         return anchor_locs
+
+    def swap_in_selected_pages_spec(
+        self,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        layer_id: int,
+        *,
+        verify_lens_cpu: Optional[List[int]] = None,
+        output_buffer: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Swap DSPARK verify selections in request-major step order.
+
+        ``top_k_result`` is the *real* Indexer output, with either static
+        ``[B * W, K]`` rows or compact ``[sum(verify_lens), K]`` rows.  LRU and
+        resident-slot tables are per request, so processing rows as an ordinary
+        batch would race multiple blocks updating the same table.  Deliberately
+        issue the rows of each request in order; a later verify step can then
+        hit a page installed by the preceding step.  The output is supplied by
+        the caller during graph capture, avoiding replay-time allocation.
+
+        This synchronous path is intentional: speculative decoding disables
+        shared-index/previous-layer prefetch, while preserving the Indexer's
+        Top-K unchanged.
+        """
+        if top_k_result.dim() != 2:
+            raise ValueError(
+                "HiSparse speculative Top-K must be a 2-D flattened tensor, "
+                f"got shape {tuple(top_k_result.shape)}"
+            )
+        batch_size = req_pool_indices.numel()
+        if batch_size == 0:
+            return top_k_result.to(torch.int32)
+        if output_buffer is None:
+            output_buffer = torch.empty_like(top_k_result, dtype=torch.int32)
+        result = output_buffer[: top_k_result.size(0)]
+
+        if verify_lens_cpu is None:
+            if top_k_result.size(0) % batch_size != 0:
+                raise ValueError(
+                    "Static HiSparse verify rows must be divisible by batch size: "
+                    f"rows={top_k_result.size(0)}, batch={batch_size}"
+                )
+            verify_lens_cpu = [top_k_result.size(0) // batch_size] * batch_size
+        if len(verify_lens_cpu) != batch_size or sum(
+            verify_lens_cpu
+        ) != top_k_result.size(0):
+            raise ValueError(
+                "HiSparse ragged verify geometry does not match Top-K rows: "
+                f"lens={verify_lens_cpu}, rows={top_k_result.size(0)}"
+            )
+
+        row = 0
+        for req_offset, verify_len in enumerate(verify_lens_cpu):
+            for _ in range(verify_len):
+                seq_row = compressed_seq_lens[row : row + 1]
+                # Some metadata keeps one length per request rather than per
+                # compact row.  Select the request length in that case.
+                if compressed_seq_lens.numel() == batch_size:
+                    seq_row = compressed_seq_lens[req_offset : req_offset + 1]
+                self._run_swap_in_kernel(
+                    req_pool_indices[req_offset : req_offset + 1],
+                    seq_row,
+                    top_k_result[row : row + 1, : self.top_k],
+                    layer_id,
+                    output_buffer=result[row : row + 1],
+                )
+                row += 1
+        return result
