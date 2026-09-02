@@ -19,7 +19,7 @@ import contextlib
 import inspect
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Union
 
 import torch
@@ -890,6 +890,7 @@ class ModelRunner:
                 is_speculative=self.spec_algorithm.is_speculative(),
             ),
         )
+        disable_decode_graph_reason = None
         if self.spec_algorithm.is_dflash_family():
             # HiSparse TARGET_VERIFY currently builds request/step ownership on
             # the host. Capturing those Python-selected row addresses would
@@ -897,20 +898,35 @@ class ModelRunner:
             # different distribution in the same token bucket. Keep this
             # correctness path eager until the swap kernel consumes device
             # verify_lens/qo_indptr directly.
-            self.server_args.disable_cuda_graph = True
-            logger.warning(
+            disable_decode_graph_reason = (
                 "HiSparse with DFLASH/DSPARK currently uses eager target verify; "
-                "CUDA graph capture has been disabled to preserve dynamic ragged "
-                "request ownership."
+                "decode CUDA graph capture has been disabled to preserve dynamic "
+                "ragged request ownership."
             )
         if self.hisparse_coordinator.prefetcher is not None:
             # The candidate tensor and side-stream miss plan change every decode
             # step; capturing one would replay stale preceding-layer positions.
-            self.server_args.disable_cuda_graph = True
-            logger.warning(
+            disable_decode_graph_reason = (
                 "HiSparse previous prefetch currently requires eager decode; "
-                "CUDA graph capture has been disabled."
+                "decode CUDA graph capture has been disabled."
             )
+        if disable_decode_graph_reason is not None:
+            # ServerArgs is immutable after runtime-context publication. Update
+            # both the convenience leaf and the canonical phase config through
+            # the sanctioned override API; capture_decode_graph reads the latter.
+            from sglang.srt.model_executor.cuda_graph_config import Backend
+
+            cuda_graph_config = get_exec().graph.cuda_graph_config
+            cuda_graph_config = replace(
+                cuda_graph_config,
+                decode=replace(cuda_graph_config.decode, backend=Backend.DISABLED),
+            )
+            get_context().override(
+                "model_runner.hisparse_decode_graph_gate",
+                disable_decode_cuda_graph=True,
+                cuda_graph_config=cuda_graph_config,
+            )
+            logger.warning(disable_decode_graph_reason)
 
     def post_capture_resize_kv_pool(self):
         resize = compute_post_capture_kv_resize(self)

@@ -166,7 +166,7 @@ HiSparse supports PD decode deployments and the non-PD DeepSeek-V4 CUDA deployme
 
 The target worker owns the HiSparse C4 host/device cache. The DSPARK draft worker keeps its independent KV cache in HBM; it does not allocate or release target HiSparse pages. TARGET_VERIFY processes each request's real Indexer Top-K steps in order so resident-table and LRU updates cannot race.
 
-HiSparse with DSPARK currently runs TARGET_VERIFY eagerly. SGLang disables CUDA Graph capture for this combination because ragged request ownership can change between replays of the same token bucket; no additional command-line flag is required.
+HiSparse with DSPARK currently runs TARGET_VERIFY eagerly. SGLang disables decode CUDA Graph capture for this combination because ragged request ownership can change between replays of the same token bucket; no additional command-line flag is required. Prefill graph settings are unchanged.
 
 ```bash Command
 sglang serve \
