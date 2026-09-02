@@ -931,15 +931,23 @@ class C4IndexerBackendMixin:
                                 forward_batch._hisparse_verify_lens_cpu = (
                                     verify_lens_cpu
                                 )
-                    core_metadata.c4_sparse_page_indices = (
-                        hisparse_coordinator.swap_in_selected_pages_spec(
-                            req_pool_indices=forward_batch.req_pool_indices,
-                            compressed_seq_lens=indexer_metadata.c4_seq_lens,
-                            top_k_result=raw_indices,
-                            layer_id=compress_layer_id,
-                            verify_lens_cpu=verify_lens_cpu,
-                            output_buffer=c4_sparse_page_indices,
-                        )
+                    speculative_device_locs = (
+                        token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
+                            c4_sparse_page_indices
+                        ).to(torch.int32)
+                    )
+                    swapped_locs = hisparse_coordinator.swap_in_selected_pages_spec(
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                        top_k_result=raw_indices,
+                        layer_id=compress_layer_id,
+                        verify_lens_cpu=verify_lens_cpu,
+                        output_buffer=c4_sparse_page_indices,
+                    )
+                    # Host misses for current verify C4 rows resolve through the
+                    # transaction's scratch mapping rather than becoming -1.
+                    core_metadata.c4_sparse_page_indices = torch.where(
+                        swapped_locs >= 0, swapped_locs, speculative_device_locs
                     )
                 else:
                     core_metadata.c4_sparse_page_indices = (

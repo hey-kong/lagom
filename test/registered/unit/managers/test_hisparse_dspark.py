@@ -3,7 +3,19 @@ from types import MethodType
 import pytest
 import torch
 
-from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+from sglang.srt.managers.hisparse_coordinator import (
+    HiSparseCoordinator,
+    dspark_completed_c4_positions,
+)
+
+
+@pytest.mark.parametrize(
+    ("prefix_len", "expected"),
+    [(8, [2]), (9, [2]), (10, [2, 3]), (11, [2, 3])],
+)
+def test_dspark_c4_scratch_crosses_alignment(prefix_len, expected):
+    """Every prefix alignment must bind each C4 writer completed by six verify rows."""
+    assert dspark_completed_c4_positions(prefix_len, verify_width=6) == expected
 
 
 def _coordinator_with_recording_kernel():

@@ -74,7 +74,6 @@ _is_npu = is_npu()
 
 
 class DSparkWorkerV2(BaseSpecWorker):
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -646,6 +645,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             [draft_block_ids[:, :1], draft_tokens], dim=1
         ).contiguous()
 
+        hisparse_coordinator = self.model_runner.hisparse_coordinator
+        hisparse_window = None
+        if hisparse_coordinator is not None and hisparse_coordinator.is_dsv4_hisparse:
+            hisparse_window = hisparse_coordinator.prepare_dspark_verify_window(
+                req_pool_indices=batch.req_pool_indices,
+                prefix_lens=prefix_lens,
+                verify_width=verify_ids_2d.shape[1],
+            )
+
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
             GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
@@ -721,6 +729,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                 logits_output,
                 accept.out_tokens.reshape(-1),
                 chain_stride=self.verify_num_draft_tokens,
+            )
+
+        if hisparse_window is not None:
+            # Accepted C4 must become authoritative before the scheduler sees
+            # new_seq_lens; rejected scratch is released by the same transaction.
+            hisparse_coordinator.commit_dspark_verify_window(
+                hisparse_window, accept.commit_lens
             )
 
         if on_publish is not None:
