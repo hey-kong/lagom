@@ -302,8 +302,9 @@ template <int NUM_TOP_K, int HOT_BUFFER_SIZE>
 struct SmemLayout {
   static constexpr int HASH_SIZE = NUM_TOP_K * 2;
   static constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
-  // int32_t region: top_k_tokens + chunk_offset + evict_chunk_offset + hash_keys + total_hits + newest_hit
-  static constexpr int TOTAL_INT32 = NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + 2;
+  // int32_t region: top_k_tokens + chunk_offset + evict_chunk_offset +
+  // hash_keys + total_hits + newest_hit + invalid_count.
+  static constexpr int TOTAL_INT32 = NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + 3;
   // int16_t region: lru_slots_out + hash_vals
   static constexpr int TOTAL_INT16 = HOT_BUFFER_SIZE + HASH_SIZE;
   static constexpr size_t BYTES = TOTAL_INT32 * sizeof(int32_t) + TOTAL_INT16 * sizeof(int16_t);
@@ -432,6 +433,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Scalar counters
   int32_t& s_total_hits = s_hash_keys[HASH_SIZE];
   int32_t& s_newest_hit = s_hash_keys[HASH_SIZE + 1];
+  int32_t& s_invalid_count = s_hash_keys[HASH_SIZE + 2];
 
   int16_t* smem_i16 = reinterpret_cast<int16_t*>(smem_i32 + Layout::TOTAL_INT32);
   // Compacted slot ordering: [hits fwd->  ...  <-evictables bwd]
@@ -443,6 +445,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   if (tid == 0) {
     s_total_hits = 0;
     s_newest_hit = 0;
+    s_invalid_count = 0;
   }
   for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
     s_hash_keys[i] = HASH_EMPTY;
@@ -459,7 +462,15 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Insert top-k tokens into shared-memory hash table.
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
-    if (token_idx == newest_token) {
+    // TARGET_VERIFY contains graph-padding rows and can also expose C4
+    // positions which have not become authoritative host KV yet.  Never put a
+    // negative/out-of-sequence sentinel into the hash table: HASH_EMPTY is -1,
+    // and treating it as a miss eventually indexes host_cache_locs[-1].
+    if (token_idx < 0 || token_idx >= seq_len) {
+      s_top_k_tokens[i] = TOKEN_HIT;
+      req_top_k_device_locs[i] = -1;
+      atomicAdd(&s_invalid_count, 1);
+    } else if (token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
       s_top_k_tokens[i] = TOKEN_HIT;
@@ -589,6 +600,15 @@ __global__ void load_cache_to_device_buffer_kernel(
       is_miss = s_top_k_tokens[my_token_idx] != TOKEN_HIT;
       if (is_miss) {
         my_token = s_top_k_tokens[my_token_idx];
+        // Host pool contains committed, authoritative KV only.  A speculative
+        // C4 entry with no host location must not be copied from address -1.
+        // Leave its attention location invalid until the speculative scratch
+        // entry is committed/bound by the coordinator.
+        if (req_host_cache_locs[my_token] < 0) {
+          is_miss = false;
+          req_top_k_device_locs[my_token_idx] = -1;
+          atomicAdd(&s_invalid_count, 1);
+        }
       }
     }
 
@@ -631,7 +651,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
-  total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  total_misses = NUM_TOP_K - s_total_hits - s_newest_hit - s_invalid_count;
   if constexpr (RecordMissPlan) {
     if (tid == 0) {
       miss_count_out[bid] = total_misses;

@@ -25,6 +25,7 @@ def _coordinator_with_recording_kernel():
     [
         (None, [10, 10, 20, 20], [7, 7, 9, 9]),
         ([1, 3], [10, 20], [7, 9, 9, 9]),
+        (None, [[10, 10], [20, 20]], [7, 7, 9, 9]),
     ],
 )
 def test_dspark_swap_in_is_request_major(
@@ -59,4 +60,16 @@ def test_dspark_swap_in_rejects_inconsistent_ragged_geometry():
             top_k_result=torch.zeros((4, 2), dtype=torch.int64),
             layer_id=3,
             verify_lens_cpu=[1, 2],
+        )
+
+
+def test_dspark_swap_in_rejects_inconsistent_sequence_length_geometry():
+    """A short seq-len tensor would make the CUDA kernel read past its allocation."""
+    coordinator, _ = _coordinator_with_recording_kernel()
+    with pytest.raises(ValueError, match="sequence lengths"):
+        coordinator.swap_in_selected_pages_spec(
+            req_pool_indices=torch.tensor([7, 9]),
+            compressed_seq_lens=torch.tensor([10, 20, 30]),
+            top_k_result=torch.zeros((4, 2), dtype=torch.int64),
+            layer_id=3,
         )

@@ -1288,6 +1288,7 @@ class HiSparseCoordinator:
         if output_buffer is None:
             output_buffer = torch.empty_like(top_k_result, dtype=torch.int32)
         result = output_buffer[: top_k_result.size(0)]
+        compressed_seq_lens = compressed_seq_lens.reshape(-1)
 
         if verify_lens_cpu is None:
             if top_k_result.size(0) % batch_size != 0:
@@ -1302,6 +1303,15 @@ class HiSparseCoordinator:
             raise ValueError(
                 "HiSparse ragged verify geometry does not match Top-K rows: "
                 f"lens={verify_lens_cpu}, rows={top_k_result.size(0)}"
+            )
+
+        num_seq_lens = compressed_seq_lens.numel()
+        if num_seq_lens not in (batch_size, top_k_result.size(0)):
+            raise ValueError(
+                "HiSparse verify sequence lengths must contain one value per "
+                "request or Top-K row: "
+                f"lengths={num_seq_lens}, batch={batch_size}, "
+                f"rows={top_k_result.size(0)}"
             )
 
         row = 0
