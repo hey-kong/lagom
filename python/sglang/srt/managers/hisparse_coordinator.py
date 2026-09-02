@@ -1266,14 +1266,13 @@ class HiSparseCoordinator:
         """Swap DSPARK verify selections in request-major step order.
 
         ``top_k_result`` is the *real* Indexer output, with either static
-        ``[B * W, K]`` rows or compact ``[sum(verify_lens), K]`` rows.  LRU and
-        resident-slot tables are per request, so processing rows as an ordinary
-        batch would race multiple blocks updating the same table.  Deliberately
-        issue the rows of each request in order; a later verify step can then
-        hit a page installed by the preceding step.  The output is supplied by
-        the caller during graph capture, avoiding replay-time allocation.
+        ``[B * W, K]`` rows or compact ``[sum(verify_lens), K]`` rows. LRU and
+        resident-slot tables are per request, so two steps of one request must
+        never share a launch. Launch step-major batches instead: requests run
+        in parallel while each request's later step observes the prior launch.
+        Padding rows beyond ``sum(verify_lens)`` remain invalid and never launch.
 
-        This synchronous path is intentional: speculative decoding disables
+        This eager synchronous path is intentional: speculative decoding disables
         shared-index/previous-layer prefetch, while preserving the Indexer's
         Top-K unchanged.
         """
@@ -1288,6 +1287,7 @@ class HiSparseCoordinator:
         if output_buffer is None:
             output_buffer = torch.empty_like(top_k_result, dtype=torch.int32)
         result = output_buffer[: top_k_result.size(0)]
+        result.fill_(-1)
         compressed_seq_lens = compressed_seq_lens.reshape(-1)
 
         if verify_lens_cpu is None:
@@ -1297,16 +1297,15 @@ class HiSparseCoordinator:
                     f"rows={top_k_result.size(0)}, batch={batch_size}"
                 )
             verify_lens_cpu = [top_k_result.size(0) // batch_size] * batch_size
-        if len(verify_lens_cpu) != batch_size or sum(
-            verify_lens_cpu
-        ) != top_k_result.size(0):
+        real_rows = sum(verify_lens_cpu)
+        if len(verify_lens_cpu) != batch_size or real_rows > top_k_result.size(0):
             raise ValueError(
                 "HiSparse ragged verify geometry does not match Top-K rows: "
                 f"lens={verify_lens_cpu}, rows={top_k_result.size(0)}"
             )
 
         num_seq_lens = compressed_seq_lens.numel()
-        if num_seq_lens not in (batch_size, top_k_result.size(0)):
+        if num_seq_lens not in (batch_size, real_rows, top_k_result.size(0)):
             raise ValueError(
                 "HiSparse verify sequence lengths must contain one value per "
                 "request or Top-K row: "
@@ -1314,20 +1313,36 @@ class HiSparseCoordinator:
                 f"rows={top_k_result.size(0)}"
             )
 
-        row = 0
-        for req_offset, verify_len in enumerate(verify_lens_cpu):
-            for _ in range(verify_len):
-                seq_row = compressed_seq_lens[row : row + 1]
-                # Some metadata keeps one length per request rather than per
-                # compact row.  Select the request length in that case.
-                if compressed_seq_lens.numel() == batch_size:
-                    seq_row = compressed_seq_lens[req_offset : req_offset + 1]
-                self._run_swap_in_kernel(
-                    req_pool_indices[req_offset : req_offset + 1],
-                    seq_row,
-                    top_k_result[row : row + 1, : self.top_k],
-                    layer_id,
-                    output_buffer=result[row : row + 1],
-                )
-                row += 1
+        # One launch per verify step, with all requests owning that step in the
+        # same launch. This preserves per-request ordering while retaining
+        # request-level GPU parallelism. Compact rows are request-major, hence
+        # offsets identify the row for (request, step).
+        offsets = [0]
+        for verify_len in verify_lens_cpu:
+            offsets.append(offsets[-1] + verify_len)
+        for step in range(max(verify_lens_cpu, default=0)):
+            active_reqs = [
+                i for i, length in enumerate(verify_lens_cpu) if step < length
+            ]
+            row_ids = [offsets[i] + step for i in active_reqs]
+            active_idx = torch.tensor(
+                active_reqs, dtype=torch.int64, device=self.device
+            )
+            row_idx = torch.tensor(row_ids, dtype=torch.int64, device=self.device)
+            step_seq_lens = (
+                compressed_seq_lens[active_idx]
+                if num_seq_lens == batch_size
+                else compressed_seq_lens[row_idx]
+            )
+            step_output = torch.empty(
+                (len(active_reqs), self.top_k), dtype=torch.int32, device=self.device
+            )
+            self._run_swap_in_kernel(
+                req_pool_indices[active_idx],
+                step_seq_lens,
+                top_k_result[row_idx, : self.top_k],
+                layer_id,
+                output_buffer=step_output,
+            )
+            result[row_idx, : self.top_k] = step_output
         return result

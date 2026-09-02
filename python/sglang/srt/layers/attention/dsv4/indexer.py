@@ -916,9 +916,21 @@ class C4IndexerBackendMixin:
                     )
 
                     layout = resolve_ragged_verify_layout(forward_batch)
-                    verify_lens_cpu = (
-                        layout.verify_lens_cpu if layout is not None else None
-                    )
+                    verify_lens_cpu = None
+                    if layout is not None:
+                        verify_lens_cpu = layout.verify_lens_cpu
+                        if verify_lens_cpu is None:
+                            # CUDA graphs are disabled for this combination, so
+                            # materializing device-only ragged geometry here is
+                            # safe and prevents [1,3] from being guessed as [2,2].
+                            verify_lens_cpu = getattr(
+                                forward_batch, "_hisparse_verify_lens_cpu", None
+                            )
+                            if verify_lens_cpu is None:
+                                verify_lens_cpu = layout.verify_lens.to("cpu").tolist()
+                                forward_batch._hisparse_verify_lens_cpu = (
+                                    verify_lens_cpu
+                                )
                     core_metadata.c4_sparse_page_indices = (
                         hisparse_coordinator.swap_in_selected_pages_spec(
                             req_pool_indices=forward_batch.req_pool_indices,

@@ -890,6 +890,19 @@ class ModelRunner:
                 is_speculative=self.spec_algorithm.is_speculative(),
             ),
         )
+        if self.spec_algorithm.is_dflash_family():
+            # HiSparse TARGET_VERIFY currently builds request/step ownership on
+            # the host. Capturing those Python-selected row addresses would
+            # freeze the capture-time ragged distribution and replay it for a
+            # different distribution in the same token bucket. Keep this
+            # correctness path eager until the swap kernel consumes device
+            # verify_lens/qo_indptr directly.
+            self.server_args.disable_cuda_graph = True
+            logger.warning(
+                "HiSparse with DFLASH/DSPARK currently uses eager target verify; "
+                "CUDA graph capture has been disabled to preserve dynamic ragged "
+                "request ownership."
+            )
         if self.hisparse_coordinator.prefetcher is not None:
             # The candidate tensor and side-stream miss plan change every decode
             # step; capturing one would replay stale preceding-layer positions.
