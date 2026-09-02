@@ -96,6 +96,9 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
         self.assertIsInstance(batch.spec_info, DFlashDraftInputV2)
         self.assertTrue(torch.equal(batch.spec_info.bonus_tokens, torch.tensor([7])))
         self.assertTrue(torch.equal(batch.spec_info.new_seq_lens, batch.seq_lens))
+        self.assertTrue(
+            torch.equal(batch.spec_info.future_indices, batch.req_pool_indices)
+        )
 
 
 class TestHisparseCoordinatorReqPoolCpu(unittest.TestCase):

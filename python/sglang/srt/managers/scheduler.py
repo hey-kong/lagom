@@ -3022,6 +3022,12 @@ class Scheduler(
                 bonus_tokens=last_tokens,
                 new_seq_lens=batch.seq_lens,
             )
+            # The overlap resolver gathers the relayed bonus token (and any
+            # other speculative extras) through this stable request-slot key.
+            # Ordinary speculative batches receive it after run_batch; this
+            # HiSparse transition is rebuilt before its first decode, so seed
+            # the key here alongside the FutureMap stash above.
+            batch.spec_info.future_indices = batch.req_pool_indices
         return batch
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
