@@ -168,7 +168,7 @@ The target worker owns the HiSparse C4 host/device cache. The DSPARK draft worke
 
 Each DSPARK target verify is a HiSparse transaction. Completed C4 groups are bound to temporary writer pages before verify. After acceptance, accepted C4 KV is copied into the authoritative Host pool and fixed device buffer before sequence lengths are published; rejected and accepted temporary pages are then unmapped and released. Current-verify attention resolves Host misses through those temporary mappings, so it never substitutes a missing Host entry for the model Indexer's Top-K.
 
-With the default static DSPARK verify layout, HiSparse keeps decode CUDA Graph enabled and launches one request-parallel swap-in batch per verify step. For non-static ragged layouts, SGLang currently disables decode CUDA Graph because request ownership can change between replays of the same token bucket; no additional command-line flag is required. Prefill graph settings are unchanged.
+HiSparse with DSPARK currently disables decode CUDA Graph for both static and ragged layouts. Graph capture invokes the model outside the DSPARK C4 prepare/commit transaction, so capturing target verify before writer pages are bound is unsafe. No additional command-line flag is required, and prefill graph settings are unchanged. Restoring decode graphs requires the graph runner itself to stage fixed-capacity C4 transaction metadata before capture and every replay.
 
 ```bash Command
 sglang serve \
