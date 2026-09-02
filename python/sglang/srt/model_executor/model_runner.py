@@ -884,6 +884,11 @@ class ModelRunner:
             prefetcher_config=hisparse_cfg.prefetcher_config,
             pp_size=self.ps.pp_size,
             is_speculative=self.spec_algorithm.is_speculative(),
+            speculative_verify_width=(
+                (get_spec().speculative_num_draft_tokens or 0) + 1
+                if self.spec_algorithm.is_dflash_family()
+                else 0
+            ),
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,
                 pp_size=self.ps.pp_size,
@@ -892,17 +897,16 @@ class ModelRunner:
         )
         disable_decode_graph_reason = None
         if self.spec_algorithm.is_dflash_family():
-            # Even static row ownership is not sufficient now that each verify
-            # owns transaction-scoped C4 writer pages. Decode graph capture calls
-            # model.forward directly, outside DSparkWorkerV2's prepare/commit
-            # transaction, so captured kernels would observe dummy/unbound C4
-            # mappings. Keep target verify eager until graph capture/replay stages
-            # a HiSparseDSparkWindow explicitly.
-            disable_decode_graph_reason = (
-                "HiSparse with DFLASH/DSPARK uses transaction-scoped C4 writer "
-                "pages; decode CUDA graph capture has been disabled because the "
-                "capture runner does not prepare/commit that transaction yet."
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
             )
+
+            if read_ragged_verify_mode() != RaggedVerifyMode.STATIC:
+                disable_decode_graph_reason = (
+                    "HiSparse with compact/ragged DFLASH/DSPARK verify requires "
+                    "eager decode; static verify retains decode CUDA Graph."
+                )
         if self.hisparse_coordinator.prefetcher is not None:
             # The candidate tensor and side-stream miss plan change every decode
             # step; capturing one would replay stale preceding-layer positions.

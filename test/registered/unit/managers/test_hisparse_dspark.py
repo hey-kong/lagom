@@ -30,6 +30,33 @@ def test_dspark_long_commit_has_unique_reserved_destination():
     ) == [1, 2]
 
 
+def test_dspark_graph_scratch_metadata_updates_in_place():
+    """Replay must consume updated metadata without changing captured addresses."""
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator._dspark_scratch_compressed_locs = torch.full(
+        (4,), -1, dtype=torch.int64
+    )
+    coordinator._dspark_scratch_valid_mapping = torch.zeros(16, dtype=torch.bool)
+    compressed = torch.tensor([10, 11, 12], dtype=torch.int64)
+    swapped = torch.tensor([100, 101, 102], dtype=torch.int32)
+    writers = torch.tensor([200, 201, 202], dtype=torch.int32)
+
+    capture_result = coordinator.select_dspark_scratch_locs(
+        compressed, swapped, writers
+    )
+    torch.testing.assert_close(capture_result, swapped)
+
+    metadata_ptr = coordinator._dspark_scratch_compressed_locs.data_ptr()
+    coordinator._dspark_scratch_compressed_locs[:2].copy_(compressed[[0, 2]])
+    coordinator._dspark_scratch_valid_mapping[compressed[[0, 2]]] = True
+    replay_result = coordinator.select_dspark_scratch_locs(
+        compressed, swapped, writers
+    )
+
+    assert coordinator._dspark_scratch_compressed_locs.data_ptr() == metadata_ptr
+    torch.testing.assert_close(replay_result, torch.tensor([200, 101, 202]))
+
+
 def _coordinator_with_recording_kernel():
     coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
     coordinator.top_k = 2

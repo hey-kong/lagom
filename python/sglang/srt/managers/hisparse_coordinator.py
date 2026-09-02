@@ -82,11 +82,10 @@ class HiSparseTokenStats(NamedTuple):
 
 @dataclass
 class HiSparseDSparkWindow:
-    """Physical C4 pages owned only for one target-verify transaction."""
+    """Metadata for one target-verify transaction over fixed C4 scratch."""
 
     compressed_locs: torch.Tensor
     device_locs: torch.Tensor
-    scratch_page_locs: torch.Tensor
     previous_device_mapping: torch.Tensor
     req_offsets: List[int]
     req_pool_indices_cpu: List[int]
@@ -176,6 +175,7 @@ class HiSparseCoordinator:
         prefetcher_config: Optional[Mapping] = None,
         pp_size: int = 1,
         is_speculative: bool = False,
+        speculative_verify_width: int = 0,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -270,6 +270,42 @@ class HiSparseCoordinator:
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
         self._active_dspark_window: Optional[HiSparseDSparkWindow] = None
+        self._dspark_scratch_compressed_locs: Optional[torch.Tensor] = None
+        self._dspark_scratch_device_locs: Optional[torch.Tensor] = None
+        self._dspark_scratch_page_locs: Optional[torch.Tensor] = None
+        self._dspark_scratch_valid_mapping: Optional[torch.Tensor] = None
+        if self.is_dsv4_hisparse and is_speculative:
+            # A graph replay cannot change tensor addresses or allocate pages.
+            # Reserve enough whole pages for the worst alignment of every
+            # request, then update only their logical C4 identities before each
+            # replay.  The buffers exist during capture too, where -1 marks all
+            # entries invalid and therefore gives model.forward legal storage.
+            max_groups_per_req = (
+                speculative_verify_width + self.compress_ratio - 2
+            ) // self.compress_ratio + 1
+            scratch_capacity = max_num_req_slots * max(1, max_groups_per_req)
+            scratch_size = (
+                (scratch_capacity + self.page_size - 1) // self.page_size
+            ) * self.page_size
+            scratch_page_locs = (
+                self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
+                    scratch_size
+                )
+            )
+            if scratch_page_locs is None:
+                raise RuntimeError(
+                    "HiSparse DSPARK fixed C4 scratch allocation failed: "
+                    f"requested {scratch_size} entries"
+                )
+            self._dspark_scratch_page_locs = scratch_page_locs
+            self._dspark_scratch_device_locs = scratch_page_locs[:scratch_capacity]
+            self._dspark_scratch_compressed_locs = torch.full(
+                (scratch_capacity,), -1, dtype=torch.int64, device=self.device
+            )
+            self._dspark_scratch_valid_mapping = torch.zeros_like(
+                self.mem_pool_device.full_to_hisparse_device_index_mapping,
+                dtype=torch.bool,
+            )
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -1449,7 +1485,7 @@ class HiSparseCoordinator:
         if not full_locs:
             empty = torch.empty(0, dtype=torch.int64, device=self.device)
             return HiSparseDSparkWindow(
-                empty, empty, empty, empty, [], req_cpu, [], prefix_lens.clone()
+                empty, empty, empty, [], req_cpu, [], prefix_lens.clone()
             )
         full_locs = torch.stack(full_locs).to(torch.int64)
         compressed_locs = self.hisparse_kvcache.translate_loc_from_full_to_compressed(
@@ -1457,24 +1493,25 @@ class HiSparseCoordinator:
         )
         mapping = self.mem_pool_device.full_to_hisparse_device_index_mapping
         previous_device_mapping = mapping[compressed_locs].clone()
-        page_size = self.token_to_kv_pool_allocator.hisparse_page_size
-        scratch_size = (
-            (compressed_locs.numel() + page_size - 1) // page_size * page_size
+        if self._dspark_scratch_device_locs is None:
+            raise RuntimeError("HiSparse DSPARK fixed C4 scratch is not initialized")
+        if compressed_locs.numel() > self._dspark_scratch_device_locs.numel():
+            raise RuntimeError(
+                "HiSparse DSPARK verify exceeds fixed graph scratch capacity: "
+                f"need {compressed_locs.numel()}, have "
+                f"{self._dspark_scratch_device_locs.numel()}"
+            )
+        device_locs = self._dspark_scratch_device_locs[: compressed_locs.numel()]
+        self._dspark_scratch_compressed_locs.fill_(-1)
+        self._dspark_scratch_compressed_locs[: compressed_locs.numel()].copy_(
+            compressed_locs
         )
-        # Scratch owns whole pages independently. Never free a token address
-        # borrowed from alloc_for_spec_decode: PagedAllocator.free() releases its
-        # entire page and would leave sibling logical mappings dangling.
-        scratch_page_locs = (
-            self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(scratch_size)
-        )
-        if scratch_page_locs is None:
-            raise RuntimeError("HiSparse DSPARK C4 scratch allocation failed")
-        device_locs = scratch_page_locs[: compressed_locs.numel()]
+        self._dspark_scratch_valid_mapping.fill_(False)
+        self._dspark_scratch_valid_mapping[compressed_locs] = True
         mapping[compressed_locs] = device_locs.to(torch.int64)
         window = HiSparseDSparkWindow(
             compressed_locs,
             device_locs,
-            scratch_page_locs,
             previous_device_mapping,
             req_offsets,
             req_cpu,
@@ -1491,10 +1528,22 @@ class HiSparseCoordinator:
         mapped_device_locs: torch.Tensor,
     ) -> torch.Tensor:
         """Current-window C4 always reads its writer page, even on fast paths."""
-        window = self._active_dspark_window
-        if window is None or window.compressed_locs.numel() == 0:
+        # Always execute this selection when fixed scratch exists. During CUDA
+        # graph capture the identities are all -1; replay updates the same
+        # device buffer before launch, so no capture-time Python branch or slice
+        # address is frozen into the graph.
+        if self._dspark_scratch_valid_mapping is None:
             return swapped_locs
-        belongs_to_window = torch.isin(compressed_locs, window.compressed_locs)
+        valid_logical_loc = torch.logical_and(
+            compressed_locs >= 0,
+            compressed_locs < self._dspark_scratch_valid_mapping.numel(),
+        )
+        safe_locs = compressed_locs.clamp(
+            0, self._dspark_scratch_valid_mapping.numel() - 1
+        )
+        belongs_to_window = torch.logical_and(
+            valid_logical_loc, self._dspark_scratch_valid_mapping[safe_locs]
+        )
         return torch.where(belongs_to_window, mapped_device_locs, swapped_locs)
 
     def rollback_dspark_verify_window(self, window: HiSparseDSparkWindow) -> None:
@@ -1503,14 +1552,17 @@ class HiSparseCoordinator:
         self.mem_pool_device.full_to_hisparse_device_index_mapping[
             window.compressed_locs
         ] = window.previous_device_mapping
-        self.token_to_kv_pool_allocator.free_hisparse_indices(window.scratch_page_locs)
+        # Fixed scratch is coordinator-owned for its entire lifetime. Releasing
+        # it here would invalidate addresses captured by CUDA Graph.
+        self._dspark_scratch_compressed_locs.fill_(-1)
+        self._dspark_scratch_valid_mapping[window.compressed_locs] = False
         if self._active_dspark_window is window:
             self._active_dspark_window = None
 
     def commit_dspark_verify_window(
         self, window: HiSparseDSparkWindow, commit_lens: torch.Tensor
     ) -> None:
-        """Back up accepted completed C4 entries, then release all scratch."""
+        """Back up accepted C4 entries, then reset fixed scratch metadata."""
         if window.compressed_locs.numel() == 0:
             return
         commit_cpu = commit_lens.to("cpu").tolist()
