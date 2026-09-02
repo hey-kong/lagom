@@ -1287,7 +1287,6 @@ class HiSparseCoordinator:
         if output_buffer is None:
             output_buffer = torch.empty_like(top_k_result, dtype=torch.int32)
         result = output_buffer[: top_k_result.size(0)]
-        result.fill_(-1)
         compressed_seq_lens = compressed_seq_lens.reshape(-1)
 
         if verify_lens_cpu is None:
@@ -1296,7 +1295,38 @@ class HiSparseCoordinator:
                     "Static HiSparse verify rows must be divisible by batch size: "
                     f"rows={top_k_result.size(0)}, batch={batch_size}"
                 )
-            verify_lens_cpu = [top_k_result.size(0) // batch_size] * batch_size
+            verify_width = top_k_result.size(0) // batch_size
+            top_k_by_req = top_k_result.view(batch_size, verify_width, -1)
+            result_by_req = result.view(batch_size, verify_width, -1)
+            if compressed_seq_lens.numel() == batch_size:
+                seq_lens_by_req = None
+            elif compressed_seq_lens.numel() == top_k_result.size(0):
+                seq_lens_by_req = compressed_seq_lens.view(batch_size, verify_width)
+            else:
+                raise ValueError(
+                    "Static HiSparse verify sequence lengths must contain one "
+                    "value per request or Top-K row: "
+                    f"lengths={compressed_seq_lens.numel()}, batch={batch_size}, "
+                    f"rows={top_k_result.size(0)}"
+                )
+            # Static ownership is fixed and request-aligned, including CUDA
+            # Graph padding. Launch one full request batch per step: the kernel's
+            # num_real_reqs mask now correctly removes padded request blocks.
+            for step in range(verify_width):
+                self._run_swap_in_kernel(
+                    req_pool_indices,
+                    (
+                        compressed_seq_lens
+                        if seq_lens_by_req is None
+                        else seq_lens_by_req[:, step]
+                    ),
+                    top_k_by_req[:, step, : self.top_k],
+                    layer_id,
+                    output_buffer=result_by_req[:, step, : self.top_k],
+                )
+            return result
+
+        result.fill_(-1)
         real_rows = sum(verify_lens_cpu)
         if len(verify_lens_cpu) != batch_size or real_rows > top_k_result.size(0):
             raise ValueError(

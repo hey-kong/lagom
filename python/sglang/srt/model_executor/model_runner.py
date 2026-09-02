@@ -892,17 +892,21 @@ class ModelRunner:
         )
         disable_decode_graph_reason = None
         if self.spec_algorithm.is_dflash_family():
-            # HiSparse TARGET_VERIFY currently builds request/step ownership on
-            # the host. Capturing those Python-selected row addresses would
-            # freeze the capture-time ragged distribution and replay it for a
-            # different distribution in the same token bucket. Keep this
-            # correctness path eager until the swap kernel consumes device
-            # verify_lens/qo_indptr directly.
-            disable_decode_graph_reason = (
-                "HiSparse with DFLASH/DSPARK currently uses eager target verify; "
-                "decode CUDA graph capture has been disabled to preserve dynamic "
-                "ragged request ownership."
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
             )
+
+            # Static ownership is request-aligned and graph-safe. Ragged
+            # ownership is built on the host; capturing those selected row
+            # addresses would freeze the capture-time distribution and replay
+            # it for a different distribution in the same token bucket.
+            if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+                disable_decode_graph_reason = (
+                    "HiSparse with DFLASH/DSPARK ragged target verify currently "
+                    "runs eagerly; decode CUDA graph capture has been disabled "
+                    "to preserve dynamic request ownership."
+                )
         if self.hisparse_coordinator.prefetcher is not None:
             # The candidate tensor and side-stream miss plan change every decode
             # step; capturing one would replay stale preceding-layer positions.
