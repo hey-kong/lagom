@@ -6,6 +6,7 @@ import torch
 from sglang.srt.managers.hisparse_coordinator import (
     HiSparseCoordinator,
     dspark_completed_c4_positions,
+    dspark_fixed_buffer_commit_indices,
 )
 
 
@@ -16,6 +17,17 @@ from sglang.srt.managers.hisparse_coordinator import (
 def test_dspark_c4_scratch_crosses_alignment(prefix_len, expected):
     """Every prefix alignment must bind each C4 writer completed by six verify rows."""
     assert dspark_completed_c4_positions(prefix_len, verify_width=6) == expected
+
+
+def test_dspark_long_commit_has_unique_reserved_destination():
+    """Two accepted long C4s from one request must copy only the newest one."""
+    assert dspark_fixed_buffer_commit_indices(
+        accepted=[0, 1, 2],
+        req_offsets=[0, 0, 1],
+        req_pool_indices_cpu=[7, 9],
+        c4_positions=[4096, 4097, 4098],
+        device_buffer_size=4096,
+    ) == [1, 2]
 
 
 def _coordinator_with_recording_kernel():

@@ -47,6 +47,26 @@ def dspark_completed_c4_positions(prefix_len: int, verify_width: int) -> List[in
     ]
 
 
+def dspark_fixed_buffer_commit_indices(
+    accepted: List[int],
+    req_offsets: List[int],
+    req_pool_indices_cpu: List[int],
+    c4_positions: List[int],
+    device_buffer_size: int,
+) -> List[int]:
+    """Unique fixed-buffer copies; newest long C4 wins per request."""
+    fixed_copy: List[int] = []
+    latest_long: Dict[int, int] = {}
+    for i in accepted:
+        req_idx = req_pool_indices_cpu[req_offsets[i]]
+        if c4_positions[i] < device_buffer_size:
+            fixed_copy.append(i)
+        else:
+            latest_long[req_idx] = i
+    fixed_copy.extend(latest_long.values())
+    return fixed_copy
+
+
 class HiSparseAct(NamedTuple):
     start_event: device_module.Event
     finish_event: device_module.Event
@@ -66,6 +86,8 @@ class HiSparseDSparkWindow:
 
     compressed_locs: torch.Tensor
     device_locs: torch.Tensor
+    scratch_page_locs: torch.Tensor
+    previous_device_mapping: torch.Tensor
     req_offsets: List[int]
     req_pool_indices_cpu: List[int]
     c4_positions: List[int]
@@ -247,6 +269,7 @@ class HiSparseCoordinator:
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
+        self._active_dspark_window: Optional[HiSparseDSparkWindow] = None
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -1426,43 +1449,63 @@ class HiSparseCoordinator:
         if not full_locs:
             empty = torch.empty(0, dtype=torch.int64, device=self.device)
             return HiSparseDSparkWindow(
-                empty, empty, [], req_cpu, [], prefix_lens.clone()
+                empty, empty, empty, empty, [], req_cpu, [], prefix_lens.clone()
             )
         full_locs = torch.stack(full_locs).to(torch.int64)
         compressed_locs = self.hisparse_kvcache.translate_loc_from_full_to_compressed(
             full_locs
         )
         mapping = self.mem_pool_device.full_to_hisparse_device_index_mapping
-        # alloc_for_spec_decode may already have provisioned these physical C4
-        # pages. Treat them as transaction-owned scratch instead of allocating
-        # a second copy; positions freed after a prior rejected window are filled
-        # on demand here.
-        device_locs = mapping[compressed_locs].clone()
-        missing = device_locs <= 0
-        if torch.any(missing):
-            new_locs = self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
-                int(missing.sum().item())
-            )
-            if new_locs is None:
-                raise RuntimeError("HiSparse DSPARK C4 scratch allocation failed")
-            device_locs[missing] = new_locs.to(torch.int64)
+        previous_device_mapping = mapping[compressed_locs].clone()
+        page_size = self.token_to_kv_pool_allocator.hisparse_page_size
+        scratch_size = (
+            (compressed_locs.numel() + page_size - 1) // page_size * page_size
+        )
+        # Scratch owns whole pages independently. Never free a token address
+        # borrowed from alloc_for_spec_decode: PagedAllocator.free() releases its
+        # entire page and would leave sibling logical mappings dangling.
+        scratch_page_locs = (
+            self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(scratch_size)
+        )
+        if scratch_page_locs is None:
+            raise RuntimeError("HiSparse DSPARK C4 scratch allocation failed")
+        device_locs = scratch_page_locs[: compressed_locs.numel()]
         mapping[compressed_locs] = device_locs.to(torch.int64)
-        return HiSparseDSparkWindow(
+        window = HiSparseDSparkWindow(
             compressed_locs,
             device_locs,
+            scratch_page_locs,
+            previous_device_mapping,
             req_offsets,
             req_cpu,
             c4_positions,
             prefix_lens.clone(),
         )
+        self._active_dspark_window = window
+        return window
+
+    def select_dspark_scratch_locs(
+        self,
+        compressed_locs: torch.Tensor,
+        swapped_locs: torch.Tensor,
+        mapped_device_locs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Current-window C4 always reads its writer page, even on fast paths."""
+        window = self._active_dspark_window
+        if window is None or window.compressed_locs.numel() == 0:
+            return swapped_locs
+        belongs_to_window = torch.isin(compressed_locs, window.compressed_locs)
+        return torch.where(belongs_to_window, mapped_device_locs, swapped_locs)
 
     def rollback_dspark_verify_window(self, window: HiSparseDSparkWindow) -> None:
         if window.compressed_locs.numel() == 0:
             return
         self.mem_pool_device.full_to_hisparse_device_index_mapping[
             window.compressed_locs
-        ] = 0
-        self.token_to_kv_pool_allocator.free_hisparse_indices(window.device_locs)
+        ] = window.previous_device_mapping
+        self.token_to_kv_pool_allocator.free_hisparse_indices(window.scratch_page_locs)
+        if self._active_dspark_window is window:
+            self._active_dspark_window = None
 
     def commit_dspark_verify_window(
         self, window: HiSparseDSparkWindow, commit_lens: torch.Tensor
@@ -1500,10 +1543,21 @@ class HiSparseCoordinator:
                 window.device_locs[accepted_idx],
                 io_backend="kernel",
             )
+            # Short-context C4s have distinct fixed slots. Long-context C4s all
+            # share the reserved newest slot, so copy only the latest accepted
+            # C4 per request to keep transfer destinations unique.
+            fixed_copy = dspark_fixed_buffer_commit_indices(
+                accepted,
+                window.req_offsets,
+                window.req_pool_indices_cpu,
+                window.c4_positions,
+                self.device_buffer_size,
+            )
+            fixed_idx = torch.tensor(fixed_copy, dtype=torch.int64, device=self.device)
             accepted_req_slots = [
-                window.req_pool_indices_cpu[window.req_offsets[i]] for i in accepted
+                window.req_pool_indices_cpu[window.req_offsets[i]] for i in fixed_copy
             ]
-            accepted_c4_pos = [window.c4_positions[i] for i in accepted]
+            accepted_c4_pos = [window.c4_positions[i] for i in fixed_copy]
             fixed_slots = [min(pos, self.device_buffer_size) for pos in accepted_c4_pos]
             dst_locs = self.req_to_device_buffer[
                 torch.tensor(accepted_req_slots, dtype=torch.int64, device=self.device),
@@ -1512,7 +1566,7 @@ class HiSparseCoordinator:
             transfer_cache_dsv4_mla(
                 src_ptrs=self.mem_pool_host.device_ptrs,
                 dst_ptrs=self.mem_pool_host.device_ptrs,
-                src_indices=window.device_locs[accepted_idx],
+                src_indices=window.device_locs[fixed_idx],
                 dst_indices=dst_locs,
             )
             for req_idx, c4_pos, fixed_slot in zip(

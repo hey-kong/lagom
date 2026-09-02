@@ -946,8 +946,12 @@ class C4IndexerBackendMixin:
                     )
                     # Host misses for current verify C4 rows resolve through the
                     # transaction's scratch mapping rather than becoming -1.
-                    core_metadata.c4_sparse_page_indices = torch.where(
-                        swapped_locs >= 0, swapped_locs, speculative_device_locs
+                    core_metadata.c4_sparse_page_indices = (
+                        hisparse_coordinator.select_dspark_scratch_locs(
+                            c4_sparse_page_indices,
+                            swapped_locs,
+                            speculative_device_locs,
+                        )
                     )
                 else:
                     core_metadata.c4_sparse_page_indices = (
