@@ -12,6 +12,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode  # noqa: E402
+from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -30,12 +31,8 @@ def _make_req(req_pool_idx, origin_input_ids, output_ids):
 
 
 class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
-    def test_build_hisparse_decode_batch_populates_req_pool_indices_cpu(self):
-        # _build_hisparse_decode_batch builds a ScheduleBatch off the normal
-        # extend path, so it must populate the req_pool_indices_cpu host mirror
-        # in lockstep with the device tensor. A missing mirror crashes hisparse
-        # decode bookkeeping (map_last_loc_to_buffer -> _grow_device_buffers
-        # indexes req_pool_indices_cpu).
+    @staticmethod
+    def _scheduler(spec_algorithm):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.device = "cpu"
         scheduler.req_to_token_pool = types.SimpleNamespace(device="cpu")
@@ -45,8 +42,21 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
             is_encoder_decoder=False, vocab_size=32
         )
         scheduler.enable_overlap = False
-        scheduler.spec_algorithm = types.SimpleNamespace(is_none=lambda: True)
+        scheduler.spec_algorithm = spec_algorithm
         scheduler.future_map = MagicMock()
+        return scheduler
+
+    def test_build_hisparse_decode_batch_populates_req_pool_indices_cpu(self):
+        # _build_hisparse_decode_batch builds a ScheduleBatch off the normal
+        # extend path, so it must populate the req_pool_indices_cpu host mirror
+        # in lockstep with the device tensor. A missing mirror crashes hisparse
+        # decode bookkeeping (map_last_loc_to_buffer -> _grow_device_buffers
+        # indexes req_pool_indices_cpu).
+        scheduler = self._scheduler(
+            types.SimpleNamespace(
+                is_none=lambda: True, is_dflash_family=lambda: False
+            )
+        )
 
         reqs = [
             _make_req(req_pool_idx=4, origin_input_ids=[1, 2, 3], output_ids=[7]),
@@ -65,6 +75,27 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
         self.assertTrue(
             torch.equal(batch.req_pool_indices_cpu, batch.req_pool_indices.cpu())
         )
+
+    def test_build_hisparse_dspark_decode_batch_initializes_draft_state(self):
+        """HiSparse rebuilds the decode batch, so it must recreate DSPARK state."""
+        scheduler = self._scheduler(
+            types.SimpleNamespace(
+                is_none=lambda: False, is_dflash_family=lambda: True
+            )
+        )
+        reqs = [
+            _make_req(req_pool_idx=4, origin_input_ids=[1, 2, 3], output_ids=[7])
+        ]
+
+        with patch(
+            "sglang.srt.managers.scheduler.SamplingBatchInfo.from_schedule_batch",
+            return_value=MagicMock(),
+        ):
+            batch = scheduler._build_hisparse_decode_batch(reqs)
+
+        self.assertIsInstance(batch.spec_info, DFlashDraftInputV2)
+        self.assertTrue(torch.equal(batch.spec_info.bonus_tokens, torch.tensor([7])))
+        self.assertTrue(torch.equal(batch.spec_info.new_seq_lens, batch.seq_lens))
 
 
 class TestHisparseCoordinatorReqPoolCpu(unittest.TestCase):

@@ -1040,6 +1040,12 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             max_speculative_num_draft_tokens(),
         )
     if batch.spec_algorithm.is_dflash_family():
+        if batch.spec_info is None:
+            raise RuntimeError(
+                "DFLASH/DSPARK decode batch is missing draft state. The "
+                "prefill-to-decode transition must initialize spec_info before "
+                "calling prepare_for_decode."
+            )
         batch.spec_info.prepare_for_decode(batch)
     else:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
