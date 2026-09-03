@@ -684,7 +684,7 @@ def alloc_for_spec_decode(
     allocator = tree_cache.token_to_kv_pool_allocator
     use_dsv4_hisparse_logical_only = (
         batch is not None
-        and batch.spec_algorithm.is_dflash_family()
+        and batch.spec_algorithm.is_dspark()
         and isinstance(allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator)
     )
     if num_needed_tokens > 0:

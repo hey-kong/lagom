@@ -654,89 +654,101 @@ class DSparkWorkerV2(BaseSpecWorker):
                 verify_width=verify_ids_2d.shape[1],
             )
 
-        # Must stay ahead of the target verify launch below.
-        grammar_tree = (
-            GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
-        )
+        hisparse_committed = False
+        try:
+            # Must stay ahead of the target verify launch below.
+            grammar_tree = (
+                GrammarTree.from_linear_chain(verify_ids_2d)
+                if batch.has_grammar
+                else None
+            )
 
-        # A live grammar forces the eager path: the folded epilogue accepts inside
-        # the cuda graph off its own buffers, where the mask below never lands.
-        fold_eligible = (
-            self._verify_executor.verify_epilogue is not None
-            and proposal.folded
-            # The epilogue's in-graph accept is greedy (accept_greedy_triton);
-            # sampling batches must take the eager accept path even when the
-            # draft proposal itself folded.
-            and (sampling_info is None or sampling_info.is_all_greedy)
-            and verify_logits_adjustments_are_noop(sampling_info)
-            and self._simulate_acc_len <= 0
-            and not batch.has_grammar
-        )
-        prepare_mamba_track_for_verify(batch)
-        with self._observers.segment(InfoSegment.TARGET_VERIFY):
-            if run_compact:
-                target_verify, hidden_strided = self._verify_executor.run_compact(
-                    batch=batch,
-                    layout=layout,
-                    draft_block_ids=draft_block_ids,
-                    draft_tokens=draft_tokens,
-                    bs=bs,
-                    device=device,
+            # A live grammar forces the eager path: the folded epilogue accepts inside
+            # the cuda graph off its own buffers, where the mask below never lands.
+            fold_eligible = (
+                self._verify_executor.verify_epilogue is not None
+                and proposal.folded
+                # The epilogue's in-graph accept is greedy (accept_greedy_triton);
+                # sampling batches must take the eager accept path even when the
+                # draft proposal itself folded.
+                and (sampling_info is None or sampling_info.is_all_greedy)
+                and verify_logits_adjustments_are_noop(sampling_info)
+                and self._simulate_acc_len <= 0
+                and not batch.has_grammar
+            )
+            prepare_mamba_track_for_verify(batch)
+            with self._observers.segment(InfoSegment.TARGET_VERIFY):
+                if run_compact:
+                    target_verify, hidden_strided = self._verify_executor.run_compact(
+                        batch=batch,
+                        layout=layout,
+                        draft_block_ids=draft_block_ids,
+                        draft_tokens=draft_tokens,
+                        bs=bs,
+                        device=device,
+                        sampling_info=sampling_info,
+                        inject_gate=fold_eligible,
+                    )
+                else:
+                    target_verify = self._verify_executor.run_non_compact(
+                        batch=batch,
+                        draft_input=draft_input,
+                        verify_ids_2d=verify_ids_2d,
+                        verify_window=verify_window,
+                        sampling_info=sampling_info,
+                    )
+                    hidden_strided = None
+            logits_output = target_verify.logits_output
+            can_run_cuda_graph = target_verify.can_run_cuda_graph
+            if batch.has_grammar:
+                # run_compact scatters its rows back to (bs * chain_len), so the mask
+                # lines up with the logits on both verify paths.
+                grammar_mask = build_grammar_vocab_mask(
+                    reqs=batch.reqs,
+                    tree=grammar_tree,
                     sampling_info=sampling_info,
-                    inject_gate=fold_eligible,
+                    device=logits_output.next_token_logits.device,
+                    barrier=grammar_barrier,
                 )
-            else:
-                target_verify = self._verify_executor.run_non_compact(
-                    batch=batch,
-                    draft_input=draft_input,
-                    verify_ids_2d=verify_ids_2d,
-                    verify_window=verify_window,
-                    sampling_info=sampling_info,
-                )
-                hidden_strided = None
-        logits_output = target_verify.logits_output
-        can_run_cuda_graph = target_verify.can_run_cuda_graph
-        if batch.has_grammar:
-            # run_compact scatters its rows back to (bs * chain_len), so the mask
-            # lines up with the logits on both verify paths.
-            grammar_mask = build_grammar_vocab_mask(
-                reqs=batch.reqs,
-                tree=grammar_tree,
+                if grammar_mask is not None:
+                    grammar_mask.apply(logits_output.next_token_logits)
+
+            epilogue = self._verify_executor.verify_epilogue
+            folded_accept = fold_eligible and run_compact and can_run_cuda_graph
+            accept = self._verify_executor.accept_and_finalize(
+                folded_accept=folded_accept,
+                bs=bs,
+                verify_ids_2d=verify_ids_2d,
+                target_logits=logits_output.next_token_logits,
+                draft_block=draft_block,
                 sampling_info=sampling_info,
-                device=logits_output.next_token_logits.device,
-                barrier=grammar_barrier,
+                draft_input=draft_input,
+                layout=layout,
+                prefix_lens=prefix_lens,
+                draft_tokens=draft_tokens,
             )
-            if grammar_mask is not None:
-                grammar_mask.apply(logits_output.next_token_logits)
+            if batch.return_logprob:
+                compute_spec_logprobs(
+                    batch,
+                    logits_output,
+                    accept.out_tokens.reshape(-1),
+                    chain_stride=self.verify_num_draft_tokens,
+                )
 
-        epilogue = self._verify_executor.verify_epilogue
-        folded_accept = fold_eligible and run_compact and can_run_cuda_graph
-        accept = self._verify_executor.accept_and_finalize(
-            folded_accept=folded_accept,
-            bs=bs,
-            verify_ids_2d=verify_ids_2d,
-            target_logits=logits_output.next_token_logits,
-            draft_block=draft_block,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-            layout=layout,
-            prefix_lens=prefix_lens,
-            draft_tokens=draft_tokens,
-        )
-        if batch.return_logprob:
-            compute_spec_logprobs(
-                batch,
-                logits_output,
-                accept.out_tokens.reshape(-1),
-                chain_stride=self.verify_num_draft_tokens,
-            )
+            if hisparse_window is not None:
+                # Accepted C4 must become authoritative before the scheduler sees
+                # new_seq_lens; rejected scratch is released by the same transaction.
+                hisparse_coordinator.commit_dspark_verify_window(
+                    hisparse_window, accept.commit_lens
+                )
+                hisparse_committed = True
 
-        if hisparse_window is not None:
-            # Accepted C4 must become authoritative before the scheduler sees
-            # new_seq_lens; rejected scratch is released by the same transaction.
-            hisparse_coordinator.commit_dspark_verify_window(
-                hisparse_window, accept.commit_lens
-            )
+        finally:
+            if hisparse_window is not None and not hisparse_committed:
+                # prepare mutates the global C4 mapping. Any failure in target
+                # forward, grammar, acceptance, logprob, or commit must restore
+                # it before the scheduler can continue or retract the request.
+                hisparse_coordinator.rollback_dspark_verify_window(hisparse_window)
 
         if on_publish is not None:
             if confidence is not None:

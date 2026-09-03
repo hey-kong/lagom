@@ -90,7 +90,7 @@ class HiSparseDSparkWindow:
     req_offsets: List[int]
     req_pool_indices_cpu: List[int]
     c4_positions: List[int]
-    prefix_lens: torch.Tensor
+    prefix_lens_cpu: List[int]
 
 
 def resolve_shared_index_layers(
@@ -270,11 +270,13 @@ class HiSparseCoordinator:
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
         self._active_dspark_window: Optional[HiSparseDSparkWindow] = None
+        self._dspark_commit_done_event = device_module.Event()
+        self._has_pending_dspark_commit = False
         self._dspark_scratch_compressed_locs: Optional[torch.Tensor] = None
         self._dspark_scratch_device_locs: Optional[torch.Tensor] = None
         self._dspark_scratch_page_locs: Optional[torch.Tensor] = None
         self._dspark_scratch_valid_mapping: Optional[torch.Tensor] = None
-        if self.is_dsv4_hisparse and is_speculative:
+        if self.is_dsv4_hisparse and is_speculative and speculative_verify_width > 0:
             # A graph replay cannot change tensor addresses or allocate pages.
             # Reserve enough whole pages for the worst alignment of every
             # request, then update only their logical C4 identities before each
@@ -1469,6 +1471,11 @@ class HiSparseCoordinator:
         """Bind temporary physical C4 writer pages for one DSPARK verify."""
         if not self.is_dsv4_hisparse:
             raise RuntimeError("DSPARK HiSparse windows require DeepSeek-V4 C4")
+        if self._has_pending_dspark_commit:
+            # Commit copies may have been issued by another producer stream.
+            # A stream dependency preserves overlap without a CPU-wide barrier.
+            self._dspark_commit_done_event.wait(device_module.current_stream())
+            self._has_pending_dspark_commit = False
         req_offsets: List[int] = []
         c4_positions: List[int] = []
         full_locs = []
@@ -1485,7 +1492,7 @@ class HiSparseCoordinator:
         if not full_locs:
             empty = torch.empty(0, dtype=torch.int64, device=self.device)
             return HiSparseDSparkWindow(
-                empty, empty, empty, [], req_cpu, [], prefix_lens.clone()
+                empty, empty, empty, [], req_cpu, [], prefix_cpu
             )
         full_locs = torch.stack(full_locs).to(torch.int64)
         compressed_locs = self.hisparse_kvcache.translate_loc_from_full_to_compressed(
@@ -1502,22 +1509,28 @@ class HiSparseCoordinator:
                 f"{self._dspark_scratch_device_locs.numel()}"
             )
         device_locs = self._dspark_scratch_device_locs[: compressed_locs.numel()]
-        self._dspark_scratch_compressed_locs.fill_(-1)
-        self._dspark_scratch_compressed_locs[: compressed_locs.numel()].copy_(
-            compressed_locs
-        )
-        self._dspark_scratch_valid_mapping.fill_(False)
-        self._dspark_scratch_valid_mapping[compressed_locs] = True
-        mapping[compressed_locs] = device_locs.to(torch.int64)
-        window = HiSparseDSparkWindow(
-            compressed_locs,
-            device_locs,
-            previous_device_mapping,
-            req_offsets,
-            req_cpu,
-            c4_positions,
-            prefix_lens.clone(),
-        )
+        try:
+            self._dspark_scratch_compressed_locs.fill_(-1)
+            self._dspark_scratch_compressed_locs[: compressed_locs.numel()].copy_(
+                compressed_locs
+            )
+            self._dspark_scratch_valid_mapping.fill_(False)
+            self._dspark_scratch_valid_mapping[compressed_locs] = True
+            mapping[compressed_locs] = device_locs.to(torch.int64)
+            window = HiSparseDSparkWindow(
+                compressed_locs,
+                device_locs,
+                previous_device_mapping,
+                req_offsets,
+                req_cpu,
+                c4_positions,
+                prefix_cpu,
+            )
+        except Exception:
+            mapping[compressed_locs] = previous_device_mapping
+            self._dspark_scratch_compressed_locs.fill_(-1)
+            self._dspark_scratch_valid_mapping[compressed_locs] = False
+            raise
         self._active_dspark_window = window
         return window
 
@@ -1566,13 +1579,14 @@ class HiSparseCoordinator:
         if window.compressed_locs.numel() == 0:
             return
         commit_cpu = commit_lens.to("cpu").tolist()
+        committed_copies = False
         accepted = [
             i
             for i, (req_offset, c4_pos) in enumerate(
                 zip(window.req_offsets, window.c4_positions)
             )
             if (c4_pos + 1) * self.compress_ratio
-            <= int(window.prefix_lens[req_offset]) + int(commit_cpu[req_offset])
+            <= window.prefix_lens_cpu[req_offset] + int(commit_cpu[req_offset])
         ]
         if accepted:
             accepted_idx = torch.tensor(accepted, dtype=torch.int64, device=self.device)
@@ -1630,5 +1644,10 @@ class HiSparseCoordinator:
                 accepted_req_slots, accepted_c4_pos, fixed_slots
             ):
                 self.req_device_buffer_tokens[:, req_idx, fixed_slot] = c4_pos
-            device_module.current_stream().synchronize()
+            committed_copies = True
         self.rollback_dspark_verify_window(window)
+        if committed_copies:
+            # Record after mapping rollback too: a subsequent verify may run on
+            # another stream and must observe both the copies and metadata reset.
+            self._dspark_commit_done_event.record(device_module.current_stream())
+            self._has_pending_dspark_commit = True

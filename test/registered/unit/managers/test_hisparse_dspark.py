@@ -47,15 +47,14 @@ def test_dspark_page_multiple_commit_stays_token_granular(monkeypatch):
     """Sixteen scattered accepts must not be mistaken for one whole C4 page."""
     count = 16
     transfer = MagicMock()
+    stream = SimpleNamespace(synchronize=MagicMock())
     monkeypatch.setattr(
         "sglang.srt.managers.hisparse_coordinator.transfer_cache_dsv4_mla",
         transfer,
     )
     monkeypatch.setattr(
         "sglang.srt.managers.hisparse_coordinator.device_module",
-        SimpleNamespace(
-            current_stream=lambda: SimpleNamespace(synchronize=lambda: None)
-        ),
+        SimpleNamespace(current_stream=lambda: stream),
     )
     host = SimpleNamespace(
         device_ptrs=object(),
@@ -79,6 +78,8 @@ def test_dspark_page_multiple_commit_stays_token_granular(monkeypatch):
     coordinator.req_device_buffer_tokens = torch.full(
         (1, count, 4097), -1, dtype=torch.int32
     )
+    coordinator._dspark_commit_done_event = SimpleNamespace(record=MagicMock())
+    coordinator._has_pending_dspark_commit = False
     coordinator.rollback_dspark_verify_window = MagicMock()
     window = HiSparseDSparkWindow(
         compressed_locs=torch.arange(count),
@@ -87,7 +88,7 @@ def test_dspark_page_multiple_commit_stays_token_granular(monkeypatch):
         req_offsets=list(range(count)),
         req_pool_indices_cpu=list(range(count)),
         c4_positions=[0] * count,
-        prefix_lens=torch.zeros(count, dtype=torch.int64),
+        prefix_lens_cpu=[0] * count,
     )
 
     coordinator.commit_dspark_verify_window(
@@ -96,12 +97,12 @@ def test_dspark_page_multiple_commit_stays_token_granular(monkeypatch):
 
     host.backup_from_device_all_layer.assert_not_called()
     first_transfer = transfer.call_args_list[0].kwargs
-    torch.testing.assert_close(
-        first_transfer["dst_indices"], torch.arange(count) * 16
-    )
+    torch.testing.assert_close(first_transfer["dst_indices"], torch.arange(count) * 16)
     torch.testing.assert_close(
         first_transfer["src_indices"], torch.arange(100, 100 + count)
     )
+    stream.synchronize.assert_not_called()
+    coordinator._dspark_commit_done_event.record.assert_called_once_with(stream)
 
 
 @pytest.mark.parametrize(
@@ -143,9 +144,7 @@ def test_dspark_graph_scratch_metadata_updates_in_place():
     metadata_ptr = coordinator._dspark_scratch_compressed_locs.data_ptr()
     coordinator._dspark_scratch_compressed_locs[:2].copy_(compressed[[0, 2]])
     coordinator._dspark_scratch_valid_mapping[compressed[[0, 2]]] = True
-    replay_result = coordinator.select_dspark_scratch_locs(
-        compressed, swapped, writers
-    )
+    replay_result = coordinator.select_dspark_scratch_locs(compressed, swapped, writers)
 
     assert coordinator._dspark_scratch_compressed_locs.data_ptr() == metadata_ptr
     torch.testing.assert_close(replay_result, torch.tensor([200, 101, 202]))

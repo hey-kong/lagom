@@ -931,9 +931,13 @@ class C4IndexerBackendMixin:
                                 forward_batch._hisparse_verify_lens_cpu = (
                                     verify_lens_cpu
                                 )
+                    # swap_in_selected_pages_spec writes device locations into
+                    # its output buffer. Preserve the compressed logical C4
+                    # locations for the transaction-validity lookup below.
+                    logical_c4_sparse_page_indices = c4_sparse_page_indices.clone()
                     speculative_device_locs = (
                         token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
-                            c4_sparse_page_indices
+                            logical_c4_sparse_page_indices
                         ).to(torch.int32)
                     )
                     swapped_locs = hisparse_coordinator.swap_in_selected_pages_spec(
@@ -948,7 +952,7 @@ class C4IndexerBackendMixin:
                     # transaction's scratch mapping rather than becoming -1.
                     core_metadata.c4_sparse_page_indices = (
                         hisparse_coordinator.select_dspark_scratch_locs(
-                            c4_sparse_page_indices,
+                            logical_c4_sparse_page_indices,
                             swapped_locs,
                             speculative_device_locs,
                         )

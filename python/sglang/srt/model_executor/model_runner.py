@@ -903,9 +903,7 @@ class ModelRunner:
             pp_size=self.ps.pp_size,
             is_speculative=self.spec_algorithm.is_speculative(),
             speculative_verify_width=(
-                speculative_verify_width
-                if self.spec_algorithm.is_dflash_family()
-                else 0
+                speculative_verify_width if self.spec_algorithm.is_dspark() else 0
             ),
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,
