@@ -1589,11 +1589,16 @@ class HiSparseCoordinator:
                     )
                 )
             host_locs = torch.cat(host_locs)
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device,
-                host_locs,
-                window.device_locs[accepted_idx],
-                io_backend="kernel",
+            # Accepted entries are gathered across requests and are not a
+            # contiguous, page-aligned range.  DeepSeekV4PagedHostPool's generic
+            # backup dispatch treats a page-size multiple as whole pages, which
+            # would retain only the first slot of each arbitrary group.  Always
+            # use token-granular C4 transfer for speculative commit.
+            transfer_cache_dsv4_mla(
+                src_ptrs=self.mem_pool_host.device_ptrs,
+                dst_ptrs=self.mem_pool_host.data_ptrs,
+                src_indices=window.device_locs[accepted_idx].to(torch.int64),
+                dst_indices=host_locs.to(torch.int64),
             )
             # Short-context C4s have distinct fixed slots. Long-context C4s all
             # share the reserved newest slot, so copy only the latest accepted

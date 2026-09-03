@@ -1,13 +1,107 @@
-from types import MethodType
+from types import MethodType, SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 
 from sglang.srt.managers.hisparse_coordinator import (
     HiSparseCoordinator,
+    HiSparseDSparkWindow,
     dspark_completed_c4_positions,
     dspark_fixed_buffer_commit_indices,
 )
+from sglang.srt.mem_cache.allocation import alloc_paged_token_slots_extend
+
+
+def test_dspark_spec_reservation_allocates_logical_kv_only(monkeypatch):
+    """Fixed C4 scratch, not the optimistic tail, owns physical C4 storage."""
+    logical_locs = torch.arange(8, dtype=torch.int64)
+    allocator = SimpleNamespace(
+        page_size=4,
+        alloc_logical_only=MagicMock(return_value=logical_locs),
+        alloc_extend=MagicMock(),
+    )
+    tree_cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
+    monkeypatch.setattr(
+        "sglang.srt.mem_cache.allocation.evict_from_tree_cache",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = alloc_paged_token_slots_extend(
+        tree_cache,
+        prefix_lens=torch.tensor([0]),
+        prefix_lens_cpu=torch.tensor([0]),
+        seq_lens=torch.tensor([8]),
+        seq_lens_cpu=torch.tensor([8]),
+        last_loc=torch.tensor([-1]),
+        extend_num_tokens=8,
+        logical_only=True,
+    )
+
+    torch.testing.assert_close(result, logical_locs)
+    allocator.alloc_logical_only.assert_called_once()
+    allocator.alloc_extend.assert_not_called()
+
+
+def test_dspark_page_multiple_commit_stays_token_granular(monkeypatch):
+    """Sixteen scattered accepts must not be mistaken for one whole C4 page."""
+    count = 16
+    transfer = MagicMock()
+    monkeypatch.setattr(
+        "sglang.srt.managers.hisparse_coordinator.transfer_cache_dsv4_mla",
+        transfer,
+    )
+    monkeypatch.setattr(
+        "sglang.srt.managers.hisparse_coordinator.device_module",
+        SimpleNamespace(
+            current_stream=lambda: SimpleNamespace(synchronize=lambda: None)
+        ),
+    )
+    host = SimpleNamespace(
+        device_ptrs=object(),
+        data_ptrs=object(),
+        alloc_paged_token_slots=MagicMock(
+            side_effect=[torch.tensor([i * 16]) for i in range(count)]
+        ),
+        backup_from_device_all_layer=MagicMock(),
+    )
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator.compress_ratio = 4
+    coordinator.device = "cpu"
+    coordinator.device_buffer_size = 4096
+    coordinator.mem_pool_host = host
+    coordinator.mem_pool_device = object()
+    coordinator.req_to_host_pool = object()
+    coordinator.req_to_host_pool_allocated_len = object()
+    coordinator.req_to_device_buffer = torch.arange(
+        count * 4097, dtype=torch.int64
+    ).view(count, 4097)
+    coordinator.req_device_buffer_tokens = torch.full(
+        (1, count, 4097), -1, dtype=torch.int32
+    )
+    coordinator.rollback_dspark_verify_window = MagicMock()
+    window = HiSparseDSparkWindow(
+        compressed_locs=torch.arange(count),
+        device_locs=torch.arange(100, 100 + count),
+        previous_device_mapping=torch.zeros(count, dtype=torch.int64),
+        req_offsets=list(range(count)),
+        req_pool_indices_cpu=list(range(count)),
+        c4_positions=[0] * count,
+        prefix_lens=torch.zeros(count, dtype=torch.int64),
+    )
+
+    coordinator.commit_dspark_verify_window(
+        window, torch.full((count,), 4, dtype=torch.int64)
+    )
+
+    host.backup_from_device_all_layer.assert_not_called()
+    first_transfer = transfer.call_args_list[0].kwargs
+    torch.testing.assert_close(
+        first_transfer["dst_indices"], torch.arange(count) * 16
+    )
+    torch.testing.assert_close(
+        first_transfer["src_indices"], torch.arange(100, 100 + count)
+    )
 
 
 @pytest.mark.parametrize(

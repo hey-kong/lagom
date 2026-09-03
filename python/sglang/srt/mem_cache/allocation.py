@@ -181,6 +181,7 @@ def alloc_paged_token_slots_extend(
     extend_num_tokens: int,
     req_pool_indices: Optional[torch.Tensor] = None,
     batch=None,
+    logical_only: bool = False,
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -195,15 +196,30 @@ def alloc_paged_token_slots_extend(
         if batch is not None:
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
 
-    out = allocator.alloc_extend(
-        prefix_lens,
-        prefix_lens_cpu,
-        seq_lens,
-        seq_lens_cpu,
-        last_loc,
-        extend_num_tokens,
-        **extra_alloc_kwargs,
-    )
+    if logical_only:
+        # DSPARK target verify owns its C4 writer storage in the coordinator's
+        # fixed scratch window.  Its optimistic tail still needs full logical
+        # locations (and the logical allocator's SWA storage), but allocating
+        # ordinary C4 pages here would retain one physical page per speculative
+        # reservation and make HBM usage grow with sequence length.
+        out = allocator.alloc_logical_only(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+    else:
+        out = allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            **extra_alloc_kwargs,
+        )
 
     if is_dsv4:
         bundle = out
@@ -630,6 +646,11 @@ def assign_req_to_token_pool_func(
 
 
 def _alloc_paged_token_slots_extend_npu(*args, **kwargs):
+    logical_only = kwargs.pop("logical_only", False)
+    if logical_only:
+        raise RuntimeError(
+            "logical-only DSPARK HiSparse speculative allocation is CUDA-only"
+        )
     from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
         alloc_paged_token_slots_extend_npu,
     )
@@ -656,8 +677,18 @@ def alloc_for_spec_decode(
     num_needed_tokens: int,
     batch: Optional[ScheduleBatch] = None,
 ) -> None:
+    from sglang.srt.mem_cache.allocator.hisparse import (
+        DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    )
+
+    allocator = tree_cache.token_to_kv_pool_allocator
+    use_dsv4_hisparse_logical_only = (
+        batch is not None
+        and batch.spec_algorithm.is_dflash_family()
+        and isinstance(allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator)
+    )
     if num_needed_tokens > 0:
-        if tree_cache.token_to_kv_pool_allocator.page_size == 1:
+        if allocator.page_size == 1:
             out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)
         else:
             last_loc = get_last_loc(
@@ -676,6 +707,7 @@ def alloc_for_spec_decode(
                 num_needed_tokens,
                 req_pool_indices=req_pool_indices,
                 batch=batch,
+                logical_only=use_dsv4_hisparse_logical_only,
             )
         # Updating req_to_token is a write to a shared tensor: it must not overlap
         # with the previous batch's forward, which also reads req_to_token.
