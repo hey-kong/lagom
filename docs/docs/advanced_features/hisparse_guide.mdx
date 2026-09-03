@@ -25,7 +25,7 @@ Each decode step follows this flow:
 1. **Forward decode** — generate the next token
 2. **Top-k selection** — select the most relevant token positions via attention scores
 3. **Swap-in** — the CUDA kernel loads top-k KV entries from host to device buffer:
-   - *Short sequences* (`seq_len ≤ device_buffer_size`): fast path, all KV already in buffer
+   - *Short sequences* (`logical_kv_len ≤ device_buffer_size`): fast path, all logical KV entries are already in the buffer
    - *Long sequences*: hit detection → LRU reordering → miss handling (host → device copy)
 4. **Decode attention** — compute attention using the top-k device locations
 5. **Eager backup** — asynchronously copy the previous token's KV from device to host
@@ -96,12 +96,12 @@ Pass as a JSON string via `--hisparse-config`:
     <tr>
       <td><code>top_k</code></td>
       <td>int</td>
-      <td>Number of topk entries</td>
+      <td>Configured number of sparse logical KV entries. DeepSeek-V4 uses the model's <code>index_topk</code> instead, measured in C4 entries.</td>
     </tr>
     <tr>
       <td><code>device_buffer_size</code></td>
       <td>int</td>
-      <td>Number of token slots in the per-request GPU device buffer</td>
+      <td>Number of logical KV slots in the per-request GPU device buffer. One slot represents one token for ordinary DSA and one four-token C4 group for DeepSeek-V4.</td>
     </tr>
     <tr>
       <td><code>host_to_device_ratio</code></td>
