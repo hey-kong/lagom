@@ -1499,7 +1499,7 @@ class HiSparseCoordinator:
                 empty, empty, empty, [], req_cpu, [], prefix_cpu
             )
         full_locs = torch.stack(full_locs).to(torch.int64)
-        compressed_locs = self.hisparse_kvcache.translate_loc_from_full_to_compressed(
+        compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
             full_locs
         )
         mapping = self.mem_pool_device.full_to_hisparse_device_index_mapping

@@ -210,6 +210,41 @@ def test_dspark_graph_scratch_metadata_updates_in_place():
     torch.testing.assert_close(replay_result, torch.tensor([200, 101, 202]))
 
 
+def test_dspark_prepare_translates_with_coordinator_device_pool():
+    """Coordinator stores the DSV4 C4 pool as mem_pool_device."""
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator.is_dsv4_hisparse = True
+    coordinator.compress_ratio = 4
+    coordinator.device = "cpu"
+    coordinator._has_pending_dspark_commit = False
+    coordinator.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.tensor([[0, 1, 2, 12]], dtype=torch.int64)
+    )
+    mapping = torch.zeros(16, dtype=torch.int64)
+    translate = MagicMock(return_value=torch.tensor([5], dtype=torch.int64))
+    coordinator.mem_pool_device = SimpleNamespace(
+        translate_loc_from_full_to_compressed=translate,
+        full_to_hisparse_device_index_mapping=mapping,
+    )
+    coordinator._dspark_scratch_device_locs = torch.tensor([91], dtype=torch.int64)
+    coordinator._dspark_scratch_compressed_locs = torch.full(
+        (1,), -1, dtype=torch.int64
+    )
+    coordinator._dspark_scratch_valid_mapping = torch.zeros(16, dtype=torch.bool)
+    coordinator._active_dspark_window = None
+
+    window = coordinator.prepare_dspark_verify_window(
+        req_pool_indices=torch.tensor([0]),
+        prefix_lens=torch.tensor([3]),
+        verify_width=1,
+    )
+
+    translate.assert_called_once()
+    torch.testing.assert_close(window.compressed_locs, torch.tensor([5]))
+    assert mapping[5] == 91
+    assert coordinator._dspark_scratch_valid_mapping[5]
+
+
 def _coordinator_with_recording_kernel():
     coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
     coordinator.top_k = 2
