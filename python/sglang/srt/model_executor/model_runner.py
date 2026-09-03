@@ -852,12 +852,30 @@ class ModelRunner:
             HiSparseCoordinator,
             resolve_shared_index_layers,
         )
-        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+        from sglang.srt.mem_cache.sparsity import (
+            parse_hisparse_config,
+            resolve_dspark_device_buffer_size,
+        )
 
         hisparse_cfg = parse_hisparse_config(self.server_args)
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
+        speculative_verify_width = get_spec().speculative_num_draft_tokens or 0
+        if self.spec_algorithm.is_dspark():
+            hisparse_cfg = resolve_dspark_device_buffer_size(
+                hisparse_cfg,
+                raw_hisparse_config=self.server_args.hisparse_config,
+                verify_width=speculative_verify_width,
+                effective_top_k=hisparse_top_k,
+            )
+            logger.info(
+                "HiSparse DSPARK resident buffer uses %d C4 entries "
+                "(verify_width=%d * effective_top_k=%d).",
+                hisparse_cfg.device_buffer_size,
+                speculative_verify_width,
+                hisparse_top_k,
+            )
         if hisparse_top_k != hisparse_cfg.top_k:
             logger.info(
                 "DeepSeek-V4 HiSparse uses model index_topk=%d C4 entries "
@@ -885,7 +903,7 @@ class ModelRunner:
             pp_size=self.ps.pp_size,
             is_speculative=self.spec_algorithm.is_speculative(),
             speculative_verify_width=(
-                (get_spec().speculative_num_draft_tokens or 0) + 1
+                speculative_verify_width
                 if self.spec_algorithm.is_dflash_family()
                 else 0
             ),

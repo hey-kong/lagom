@@ -8,7 +8,10 @@ from sglang.srt.managers.hisparse_prefetcher import (
     create_hisparse_prefetcher,
     supported_hisparse_prefetchers,
 )
-from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+from sglang.srt.mem_cache.sparsity import (
+    parse_hisparse_config,
+    resolve_dspark_device_buffer_size,
+)
 
 
 def _config(value):
@@ -22,6 +25,39 @@ def test_legacy_config_is_unchanged():
     )
     assert config.prefetcher is None
     assert config.prefetcher_config == {}
+
+
+def test_dspark_defaults_device_buffer_to_verify_union_upper_bound():
+    config = _config('{"top_k":2048,"host_to_device_ratio":5}')
+    resolve_dspark_device_buffer_size(
+        config,
+        raw_hisparse_config='{"top_k":2048,"host_to_device_ratio":5}',
+        verify_width=6,
+        effective_top_k=512,
+    )
+    assert config.device_buffer_size == 3072
+
+
+def test_dspark_preserves_sufficient_explicit_device_buffer():
+    config = _config('{"top_k":2048,"device_buffer_size":4096}')
+    resolve_dspark_device_buffer_size(
+        config,
+        raw_hisparse_config='{"top_k":2048,"device_buffer_size":4096}',
+        verify_width=6,
+        effective_top_k=512,
+    )
+    assert config.device_buffer_size == 4096
+
+
+def test_dspark_rejects_insufficient_explicit_device_buffer():
+    config = _config('{"top_k":512,"device_buffer_size":2048}')
+    with pytest.raises(ValueError, match=r"6 \* 512 = 3072"):
+        resolve_dspark_device_buffer_size(
+            config,
+            raw_hisparse_config='{"top_k":512,"device_buffer_size":2048}',
+            verify_width=6,
+            effective_top_k=512,
+        )
 
 
 def test_previous_default_size():
