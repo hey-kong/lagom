@@ -69,7 +69,9 @@ def test_dspark_page_multiple_commit_stays_token_granular(monkeypatch):
     coordinator.device = "cpu"
     coordinator.device_buffer_size = 4096
     coordinator.mem_pool_host = host
-    coordinator.mem_pool_device = object()
+    coordinator.mem_pool_device = SimpleNamespace(
+        full_to_hisparse_device_index_mapping=torch.arange(count, dtype=torch.int64)
+    )
     coordinator.req_to_host_pool = object()
     coordinator.req_to_host_pool_allocated_len = object()
     coordinator.req_to_device_buffer = torch.arange(
@@ -80,7 +82,8 @@ def test_dspark_page_multiple_commit_stays_token_granular(monkeypatch):
     )
     coordinator._dspark_commit_done_event = SimpleNamespace(record=MagicMock())
     coordinator._has_pending_dspark_commit = False
-    coordinator.rollback_dspark_verify_window = MagicMock()
+    coordinator._dspark_scratch_compressed_locs = torch.arange(count)
+    coordinator._dspark_scratch_valid_mapping = torch.ones(count, dtype=torch.bool)
     window = HiSparseDSparkWindow(
         compressed_locs=torch.arange(count),
         device_locs=torch.arange(100, 100 + count),
@@ -90,6 +93,7 @@ def test_dspark_page_multiple_commit_stays_token_granular(monkeypatch):
         c4_positions=[0] * count,
         prefix_lens_cpu=[0] * count,
     )
+    coordinator._active_dspark_window = window
 
     coordinator.commit_dspark_verify_window(
         window, torch.full((count,), 4, dtype=torch.int64)
@@ -103,6 +107,62 @@ def test_dspark_page_multiple_commit_stays_token_granular(monkeypatch):
     )
     stream.synchronize.assert_not_called()
     coordinator._dspark_commit_done_event.record.assert_called_once_with(stream)
+
+
+def test_dspark_all_rejected_rollback_records_cross_stream_event(monkeypatch):
+    """An all-rejected window still publishes asynchronous mapping rollback."""
+    producer_stream = object()
+    event = SimpleNamespace(record=MagicMock(), wait=MagicMock())
+    monkeypatch.setattr(
+        "sglang.srt.managers.hisparse_coordinator.device_module",
+        SimpleNamespace(current_stream=lambda: producer_stream),
+    )
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator.compress_ratio = 4
+    coordinator.device = "cpu"
+    coordinator.mem_pool_device = SimpleNamespace(
+        full_to_hisparse_device_index_mapping=torch.tensor([0, 91, 0])
+    )
+    coordinator._dspark_scratch_compressed_locs = torch.tensor([1, -1])
+    coordinator._dspark_scratch_valid_mapping = torch.tensor([False, True, False])
+    coordinator._dspark_commit_done_event = event
+    coordinator._has_pending_dspark_commit = False
+    window = HiSparseDSparkWindow(
+        compressed_locs=torch.tensor([1]),
+        device_locs=torch.tensor([91]),
+        previous_device_mapping=torch.tensor([7]),
+        req_offsets=[0],
+        req_pool_indices_cpu=[3],
+        c4_positions=[2],
+        prefix_lens_cpu=[8],
+    )
+    coordinator._active_dspark_window = window
+
+    coordinator.commit_dspark_verify_window(window, torch.tensor([0]))
+
+    assert coordinator.mem_pool_device.full_to_hisparse_device_index_mapping[1] == 7
+    assert not coordinator._dspark_scratch_valid_mapping[1]
+    assert coordinator._active_dspark_window is None
+    assert coordinator._has_pending_dspark_commit
+    event.record.assert_called_once_with(producer_stream)
+
+    consumer_stream = object()
+    monkeypatch.setattr(
+        "sglang.srt.managers.hisparse_coordinator.device_module",
+        SimpleNamespace(current_stream=lambda: consumer_stream),
+    )
+    coordinator.is_dsv4_hisparse = True
+    coordinator.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.zeros((4, 4), dtype=torch.int64)
+    )
+    coordinator.prepare_dspark_verify_window(
+        req_pool_indices=torch.tensor([3]),
+        prefix_lens=torch.tensor([0]),
+        verify_width=1,
+    )
+
+    event.wait.assert_called_once_with(consumer_stream)
+    assert not coordinator._has_pending_dspark_commit
 
 
 @pytest.mark.parametrize(

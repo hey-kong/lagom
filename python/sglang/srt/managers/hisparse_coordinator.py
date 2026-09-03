@@ -304,9 +304,13 @@ class HiSparseCoordinator:
             self._dspark_scratch_compressed_locs = torch.full(
                 (scratch_capacity,), -1, dtype=torch.int64, device=self.device
             )
-            self._dspark_scratch_valid_mapping = torch.zeros_like(
-                self.mem_pool_device.full_to_hisparse_device_index_mapping,
+            # The mapping may be exposed through weakref.proxy; zeros_like
+            # dispatches on the proxy subclass and fails. Allocate an ordinary
+            # tensor from its shape instead.
+            self._dspark_scratch_valid_mapping = torch.zeros(
+                self.mem_pool_device.full_to_hisparse_device_index_mapping.shape,
                 dtype=torch.bool,
+                device=self.device,
             )
 
         self.tp_group = tp_group
@@ -1571,6 +1575,11 @@ class HiSparseCoordinator:
         self._dspark_scratch_valid_mapping[window.compressed_locs] = False
         if self._active_dspark_window is window:
             self._active_dspark_window = None
+        # Record every non-empty rollback, including all-rejected and exception
+        # paths. A later verify may prepare scratch on another stream and must
+        # not race these mapping/validity writes.
+        self._dspark_commit_done_event.record(device_module.current_stream())
+        self._has_pending_dspark_commit = True
 
     def commit_dspark_verify_window(
         self, window: HiSparseDSparkWindow, commit_lens: torch.Tensor
@@ -1579,7 +1588,6 @@ class HiSparseCoordinator:
         if window.compressed_locs.numel() == 0:
             return
         commit_cpu = commit_lens.to("cpu").tolist()
-        committed_copies = False
         accepted = [
             i
             for i, (req_offset, c4_pos) in enumerate(
@@ -1644,10 +1652,4 @@ class HiSparseCoordinator:
                 accepted_req_slots, accepted_c4_pos, fixed_slots
             ):
                 self.req_device_buffer_tokens[:, req_idx, fixed_slot] = c4_pos
-            committed_copies = True
         self.rollback_dspark_verify_window(window)
-        if committed_copies:
-            # Record after mapping rollback too: a subsequent verify may run on
-            # another stream and must observe both the copies and metadata reset.
-            self._dspark_commit_done_event.record(device_module.current_stream())
-            self._has_pending_dspark_commit = True
