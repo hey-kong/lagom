@@ -27,8 +27,9 @@ def decide_needs_cpu_seq_lens(
     """Whether FutureMap must publish seq_lens_cpu / sum.
 
     OR over per-backend needs_cpu_seq_lens; force True under TBO (it reads the
-    CPU mirror outside the backend layer to split the batch) or ngram (its
-    USE_FULL_MASK verify path reads the host mirror regardless of backend).
+    CPU mirror outside the backend layer to split the batch), ngram (its
+    USE_FULL_MASK verify path reads the host mirror regardless of backend), or
+    HiSparse EAGLE3 (its C4 verify transaction plans from the host mirror).
     """
     # Local import: keep overlap_utils' module-level deps leaf-only so it stays
     # importable everywhere; spec_info pulls in the spec/schedule_batch graph.
@@ -38,6 +39,12 @@ def decide_needs_cpu_seq_lens(
         # FIXME: support TBO without seq lens cpu value
         return True
     algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    if server_args.enable_hisparse and algo.is_eagle3():
+        # HiSparse must identify C4 boundaries and bind scratch writer pages
+        # before target verification.  The EAGLE3 verify path deliberately
+        # consumes the scheduler's host mirrors rather than synchronously
+        # materializing its GPU metadata at that latency-critical point.
+        return True
     if algo.is_ngram():
         # ngram's USE_FULL_MASK verify path reads seq_lens_cpu per req to size
         # the tree mask, regardless of the attn backend (e.g. Triton opts out).
