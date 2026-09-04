@@ -388,6 +388,11 @@ class HiSparseCoordinator:
             max_num_req_slots=max_num_req_slots,
         )
         self.prefetcher = None
+        self.prefetcher_name = prefetcher_name.lower() if prefetcher_name else None
+        if self.prefetcher_name == "oasiskv" and not self.is_dsv4_hisparse:
+            raise ValueError(
+                'HiSparse prefetcher "oasiskv" requires the DeepSeek-V4 C4 Indexer'
+            )
         # Validate even when a higher-priority mode wins, so misspellings never
         # become silently dormant configuration.
         validate_hisparse_prefetcher(
@@ -398,8 +403,16 @@ class HiSparseCoordinator:
             entry_token_span=self.prefetch_entry_token_span,
         )
         if envs.SGLANG_DISABLE_HISPARSE_PREFETCH.get():
+            if self.prefetcher_name == "oasiskv":
+                raise ValueError(
+                    "OasisKV was requested but SGLANG_DISABLE_HISPARSE_PREFETCH is set"
+                )
             logger.info("HiSparse prefetch mode: disabled")
         elif self.enable_prefetch:
+            if self.prefetcher_name == "oasiskv":
+                raise ValueError(
+                    "OasisKV conflicts with legacy shared-index prefetch for this model"
+                )
             logger.info("HiSparse prefetch mode: legacy shared-index")
             if prefetcher_name is not None:
                 logger.info(
@@ -408,6 +421,11 @@ class HiSparseCoordinator:
                     prefetcher_name,
                 )
         elif prefetcher_name is not None and (pp_size != 1 or is_speculative):
+            if self.prefetcher_name == "oasiskv":
+                raise ValueError(
+                    "OasisKV LOOKAHEAD_ONLY requires pp_size=1 and cannot run "
+                    "with speculative verification"
+                )
             logger.warning(
                 'HiSparse prefetcher "%s" is disabled under pipeline parallelism '
                 "or speculative decoding; HiSparse prefetch mode: disabled",
@@ -469,6 +487,16 @@ class HiSparseCoordinator:
             self._previous_prefetch_target_layer = None
             self._previous_prefetch_num_reqs = 0
             self._previous_prefetch_pending_entries = 0
+            # A monotonically increasing incarnation prevents an async copy
+            # planned for a finished request from being consumed after its
+            # scheduler slot is reused.
+            self._prefetch_generation = torch.zeros(
+                max_num_req_slots, dtype=torch.int64, device="cpu"
+            )
+            self._pending_prefetch_req_slots = None
+            self._pending_prefetch_generations = None
+            self._pending_prefetch_source_len = None
+            self._pending_prefetch_target_position = None
             logger.info(
                 "HiSparse Previous Prefetcher: %d-token coverage maps to %d "
                 "logical KV entries per request (entry span=%d tokens); Indexer "
@@ -1153,6 +1181,12 @@ class HiSparseCoordinator:
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
+        if self.prefetcher is not None:
+            if self._previous_prefetch_pending_entries:
+                self._previous_prefetch_event.wait(device_module.current_stream())
+                self._previous_prefetch_pending_entries = 0
+                self._previous_prefetch_target_layer = None
+            self._prefetch_generation[req.req_pool_idx] += 1
 
     def _run_swap_in_kernel(
         self,
@@ -1290,6 +1324,86 @@ class HiSparseCoordinator:
         self._previous_prefetch_pending_entries = submitted_entries
         self.prefetcher.stats.submitted_entries += submitted_entries
 
+    def submit_oasiskv_prefetch(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        source_committed_lens_cpu: torch.Tensor,
+        predicted_c4_entries: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        """Prefetch target-C4 predictions for the next token of this layer.
+
+        Callers invoke this only after normal and no-commit draft attention
+        have finished reading the layer working set.  The stream edge in
+        ``_submit_previous_prefetch`` makes the H2D write wait for those reads.
+        Predictions never feed the current attention selection.
+        """
+        if self.prefetcher_name != "oasiskv" or self.prefetcher is None:
+            raise RuntimeError("submit_oasiskv_prefetch requires OasisKV mode")
+        if (
+            req_pool_indices_cpu.device.type != "cpu"
+            or source_committed_lens_cpu.device.type != "cpu"
+        ):
+            raise ValueError("OasisKV scheduler metadata must use CPU mirror tensors")
+        # Reuse Previous's plan-only RESOLVE and copy path, but target the same
+        # layer: this is temporal (next-token), not cross-layer, prediction.
+        self._submit_previous_prefetch_to_layer(
+            req_pool_indices, compressed_seq_lens, predicted_c4_entries, layer_id
+        )
+        slots = req_pool_indices_cpu.to(torch.int64).clone()
+        self._pending_prefetch_req_slots = slots
+        self._pending_prefetch_generations = self._prefetch_generation[slots].clone()
+        self._pending_prefetch_source_len = source_committed_lens_cpu.clone()
+        self._pending_prefetch_target_position = source_committed_lens_cpu + 1
+
+    def _submit_previous_prefetch_to_layer(
+        self, req_pool_indices, compressed_seq_lens, candidates, target_layer
+    ) -> None:
+        selected = self.prefetcher.select(candidates)
+        num_reqs = selected.size(0)
+        self._prefetch_candidate_buffer[:num_reqs].copy_(selected)
+        self._run_swap_in_kernel(
+            req_pool_indices,
+            compressed_seq_lens,
+            self._prefetch_candidate_buffer[:num_reqs],
+            target_layer,
+            record_plan=True,
+            num_top_k=self.prefetcher.logical_entries,
+            output_buffer=self._previous_prefetch_device_locs,
+            miss_plan=(
+                self._previous_miss_src,
+                self._previous_miss_dst,
+                self._previous_miss_count,
+            ),
+            skip_io=True,
+        )
+        self._previous_prefetch_stream.wait_stream(device_module.current_stream())
+        with device_module.stream(self._previous_prefetch_stream):
+            copy_cache_planned_mla(
+                miss_src=self._previous_miss_src[:num_reqs],
+                miss_dst=self._previous_miss_dst[:num_reqs],
+                miss_count=self._previous_miss_count[:num_reqs],
+                num_real_reqs=self.num_real_reqs,
+                host_cache=self.mem_pool_host.kv_buffer[target_layer],
+                device_buffer=self.mem_pool_device.kv_buffer[target_layer],
+                item_size_bytes=self.item_size_bytes,
+                num_blocks=4,
+                is_dsv4_layout=self.is_dsv4_hisparse,
+                skip_io=self.skip_io,
+            )
+            self._previous_prefetch_event.record(self._previous_prefetch_stream)
+        self._previous_prefetch_target_layer = target_layer
+        self._previous_prefetch_num_reqs = num_reqs
+        self._previous_prefetch_pending_entries = (
+            num_reqs * self.prefetcher.logical_entries
+        )
+        self.prefetcher.stats.submitted_entries += (
+            self._previous_prefetch_pending_entries
+        )
+
     def _run_copy_only_kernel(self, num_reqs: int, skip_layer: int) -> None:
         """Replay the anchor's recorded miss plan into a skip layer's buffers
         (IO-only; the anchor's slot table stays valid -- lockstep layout)."""
@@ -1327,12 +1441,15 @@ class HiSparseCoordinator:
                 top_k_result[:, : self.top_k],
                 layer_id,
             )
-            self._submit_previous_prefetch(
-                req_pool_indices,
-                compressed_seq_lens,
-                top_k_result if prefetch_candidates is None else prefetch_candidates,
-                layer_id,
-            )
+            if self.prefetcher_name == "previous":
+                self._submit_previous_prefetch(
+                    req_pool_indices,
+                    compressed_seq_lens,
+                    top_k_result
+                    if prefetch_candidates is None
+                    else prefetch_candidates,
+                    layer_id,
+                )
             return result
 
         num_reqs = req_pool_indices.size(0)

@@ -2076,6 +2076,10 @@ class ServerArgs:
         "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
         NS("spec"),
     ] = None
+    # Internal execution mode selected by HiSparse ``prefetcher=oasiskv``.
+    # This is deliberately independent of speculative_algorithm: OasisKV uses
+    # EAGLE-3 only as a one-token predictor and must never enter verification.
+    is_oasiskv_lookahead: bool = False
     speculative_draft_model_path: A[
         Optional[str],
         Arg(

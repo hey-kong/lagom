@@ -12,6 +12,13 @@ class HiSparsePrefetchStats:
     selected_entries: int = 0
     submitted_entries: int = 0
     completed_h2d_entries: int = 0
+    prediction_hits: int = 0
+    prediction_total: int = 0
+    prefetch_hits: int = 0
+    prefetch_h2d_bytes: int = 0
+    fallback_h2d_bytes: int = 0
+    draft_target_forward_seconds: float = 0.0
+    prefetch_wait_seconds: float = 0.0
 
 
 class HiSparsePrefetcher(ABC):
@@ -122,5 +129,22 @@ class PreviousPrefetcher(HiSparsePrefetcher):
                 f"{self.logical_entries} are required"
             )
         result = previous[:, : self.logical_entries]
+        self.stats.selected_entries += result.numel()
+        return result
+
+
+@register_hisparse_prefetcher("oasiskv")
+class OasisKVPrefetcher(HiSparsePrefetcher):
+    """Candidates predicted by a draft-token query in the target C4 indexer."""
+
+    def select(self, predicted):
+        if predicted is None or predicted.ndim != 2:
+            raise ValueError("OasisKV prediction must be a two-dimensional tensor")
+        if predicted.shape[1] < self.logical_entries:
+            raise ValueError(
+                f"OasisKV prediction has {predicted.shape[1]} entries, but "
+                f"{self.logical_entries} are required"
+            )
+        result = predicted[:, : self.logical_entries]
         self.stats.selected_entries += result.numel()
         return result

@@ -62,6 +62,7 @@ def _resolve_speculative_algorithm_alias(
 
 
 def handle_speculative_decoding(server_args: ServerArgs) -> None:
+    _handle_oasiskv_lookahead(server_args)
     if (
         server_args.speculative_draft_model_path is not None
         and server_args.speculative_draft_model_revision is None
@@ -142,6 +143,54 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
     if algo is not None:
         algo.handle_server_args(server_args)
+
+
+def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
+    """Resolve OasisKV without enabling speculative verification.
+
+    ``speculative_*`` fields describe the embedded EAGLE-3 predictor, while
+    ``speculative_algorithm`` intentionally remains ``None`` so the regular
+    decode scheduler retains ownership of committed tokens and KV state.
+    """
+    try:
+        config = json.loads(server_args.hisparse_config or "{}")
+    except json.JSONDecodeError:
+        return  # the canonical HiSparse parser emits the detailed error later
+    if str(config.get("prefetcher", "")).lower() != "oasiskv":
+        return
+    if not server_args.enable_hisparse:
+        raise ValueError('HiSparse prefetcher "oasiskv" requires --enable-hisparse.')
+    if not server_args.speculative_draft_model_path:
+        raise ValueError(
+            'HiSparse prefetcher "oasiskv" requires '
+            "--speculative-draft-model-path pointing to a compatible EAGLE-3 checkpoint."
+        )
+    if server_args.speculative_algorithm is not None:
+        raise ValueError(
+            'HiSparse prefetcher "oasiskv" is LOOKAHEAD_ONLY and conflicts with '
+            "--speculative-algorithm; speculative acceptance/verification is disabled."
+        )
+    conflicts = {
+        "--speculative-num-steps": (server_args.speculative_num_steps, 1),
+        "--speculative-eagle-topk": (server_args.speculative_eagle_topk, 1),
+        "--speculative-num-draft-tokens": (
+            server_args.speculative_num_draft_tokens,
+            1,
+        ),
+    }
+    for flag, (value, required) in conflicts.items():
+        if value is not None and int(value) != required:
+            raise ValueError(
+                f'HiSparse prefetcher "oasiskv" requires {flag}={required}, got {value}.'
+            )
+    server_args.speculative_num_steps = 1
+    server_args.speculative_eagle_topk = 1
+    server_args.speculative_num_draft_tokens = 1
+    server_args.is_oasiskv_lookahead = True
+    logger.info(
+        "OasisKV LOOKAHEAD_ONLY enabled: EAGLE-3 steps=1 topk=1; "
+        "acceptance/verification disabled"
+    )
 
 
 def _handle_dflash(server_args: ServerArgs) -> None:
