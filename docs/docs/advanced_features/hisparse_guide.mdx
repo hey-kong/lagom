@@ -6,7 +6,7 @@ metatags:
 
 HiSparse reduces per-request GPU memory consumption during the decode phase by maintaining only a small "hot" KV buffer on GPU while keeping complete KV data in CPU pinned memory. Combined with PD disaggregation, it enables significantly higher decode concurrency.
 
-> **Prerequisites**: HiSparse works with models that use **DeepSeek Sparse Attention (DSA)** architectures (e.g., DeepSeek-V3.2, GLM-5.1) and **DeepSeek V4**. These models natively select a subset of tokens for attention, making it possible to keep only the top-k KV on GPU while storing the full KV in host memory — without accuracy loss. Additionally, HiSparse currently requires **PD disaggregation mode** and is enabled on the **decode instance** only.
+> **Prerequisites**: HiSparse works with models that use **DeepSeek Sparse Attention (DSA)** architectures (e.g., DeepSeek-V3.2, GLM-5.1) and **DeepSeek V4**. These models natively select a subset of tokens for attention, making it possible to keep only the top-k KV on GPU while storing the full KV in host memory — without accuracy loss. You can use the DeepSeek-V4 CUDA path in a non-disaggregated server, including with DSPARK. Other DSA deployments use HiSparse on a PD decode instance.
 
 ## Why HiSparse?
 
@@ -25,7 +25,7 @@ Each decode step follows this flow:
 1. **Forward decode** — generate the next token
 2. **Top-k selection** — select the most relevant token positions via attention scores
 3. **Swap-in** — the CUDA kernel loads top-k KV entries from host to device buffer:
-   - *Short sequences* (`seq_len ≤ device_buffer_size`): fast path, all KV already in buffer
+   - *Short sequences* (`logical_kv_len ≤ device_buffer_size`): fast path, all logical KV entries are already in the buffer
    - *Long sequences*: hit detection → LRU reordering → miss handling (host → device copy)
 4. **Decode attention** — compute attention using the top-k device locations
 5. **Eager backup** — asynchronously copy the previous token's KV from device to host
@@ -96,12 +96,12 @@ Pass as a JSON string via `--hisparse-config`:
     <tr>
       <td><code>top_k</code></td>
       <td>int</td>
-      <td>Number of topk entries</td>
+      <td>Configured number of sparse logical KV entries. DeepSeek-V4 uses the model's <code>index_topk</code> instead, measured in C4 entries.</td>
     </tr>
     <tr>
       <td><code>device_buffer_size</code></td>
       <td>int</td>
-      <td>Number of token slots in the per-request GPU device buffer</td>
+      <td>Number of logical KV slots in the per-request GPU device buffer. One slot represents one token for ordinary DSA and one four-token C4 group for DeepSeek-V4.</td>
     </tr>
     <tr>
       <td><code>host_to_device_ratio</code></td>
@@ -127,6 +127,8 @@ Pass as a JSON string via `--hisparse-config`:
 </table>
 
 Example: `--hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_to_device_ratio": 10, "swap_in_block_size": 960}'`
+
+For DeepSeek-V4, C4 is the unit for resident and host-cache entries: one C4 entry covers four original tokens. The model's `index_topk` controls the effective attention Top-K and takes precedence over the compatible `top_k` CLI field. For DeepSeek-V4-Flash, `index_topk=512` therefore covers 2,048 original tokens; `top_k=2048` does **not** request 2,048 C4 entries. `device_buffer_size=4096` is 4,096 C4 entries. SGLang logs the effective C4 Top-K when these values differ.
 
 ### Shared-index prefetch (automatic)
 
@@ -158,7 +160,34 @@ The initial implementation is disabled with pipeline parallelism or speculative 
 
 ## Deployment
 
-HiSparse currently requires **PD disaggregation mode** and is enabled only on the **decode instance**.
+HiSparse supports PD decode deployments and the non-PD DeepSeek-V4 CUDA deployment below.
+
+### DeepSeek-V4 with DSPARK (non-PD)
+
+The target worker owns the HiSparse C4 host/device cache. The DSPARK draft worker keeps its independent KV cache in HBM; it does not allocate or release target HiSparse pages. TARGET_VERIFY processes each request's real Indexer Top-K steps in order so resident-table and LRU updates cannot race.
+
+Each DSPARK target verify is a HiSparse transaction. Before CUDA Graph capture, the target reserves whole-page C4 scratch for the maximum request count and verify width. DSPARK's optimistic tail allocates only full-token logical locations and SWA storage; it does not allocate ordinary physical C4 pages. Before each replay the coordinator updates the fixed device buffers that identify valid C4 logical locations and writer locations. After acceptance, accepted C4 KV is copied token-by-token into the authoritative Host pool and fixed device buffer before sequence lengths are published; accepted and rejected logical mappings are then restored, while the fixed-address scratch remains reserved for the next replay. Current-verify attention selects transaction scratch unconditionally for matching C4 locations, so short-context and newest-slot fast paths cannot substitute stale KV for the model Indexer's Top-K.
+
+For HiSparse with DSPARK, omitting `device_buffer_size` sets it to `verify_width × effective_top_k` C4 entries. This is the worst-case union size when every verify position selects a disjoint Top-K and keeps every returned slot stable until batched attention completes. If you specify `device_buffer_size`, startup rejects values below this bound. `verify_width` is `--speculative-num-draft-tokens` (DSPARK gamma plus one), and `effective_top_k` is the model's `index_topk`, not the compatible `top_k` field in `--hisparse-config`.
+
+The default static DSPARK verify layout supports decode CUDA Graph. Capture uses the same preallocated scratch addresses as replay; its valid-location buffer is initialized with sentinel values, so capture warmup cannot publish or read a speculative C4 entry. Compact and ragged verify layouts remain eager because their row-to-request geometry changes between replays. The `previous` HiSparse prefetcher also remains eager.
+
+```bash Command
+sglang serve \
+  --trust-remote-code \
+  --model-path /mnt/public_data/deepseek-ai/DeepSeek-V4-Flash-0731/ \
+  --tp 4 \
+  --moe-runner-backend marlin \
+  --speculative-algorithm DSPARK \
+  --host 0.0.0.0 \
+  --port 32073 \
+  --disable-radix-cache \
+  --enable-metrics \
+  --enable-cache-report \
+  --max-running-requests 32 \
+  --enable-hisparse \
+  --hisparse-config '{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 5}'
+```
 
 ### Prefill Instance
 

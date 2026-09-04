@@ -1,6 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
+from dataclasses import dataclass
 from typing import Dict, List, Mapping, NamedTuple, Optional, Tuple, Union
 
 import torch
@@ -9,6 +10,7 @@ from sglang.kernels.ops.kvcache.hisparse import (
     copy_cache_planned_mla,
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
+    transfer_cache_dsv4_mla,
 )
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
@@ -36,6 +38,35 @@ _is_hip = is_hip()
 logger = logging.getLogger(__name__)
 
 
+def dspark_completed_c4_positions(prefix_len: int, verify_width: int) -> List[int]:
+    """C4 positions whose four-token group completes inside a verify window."""
+    return [
+        token_pos // 4
+        for token_pos in range(prefix_len, prefix_len + verify_width)
+        if (token_pos + 1) % 4 == 0
+    ]
+
+
+def dspark_fixed_buffer_commit_indices(
+    accepted: List[int],
+    req_offsets: List[int],
+    req_pool_indices_cpu: List[int],
+    c4_positions: List[int],
+    device_buffer_size: int,
+) -> List[int]:
+    """Unique fixed-buffer copies; newest long C4 wins per request."""
+    fixed_copy: List[int] = []
+    latest_long: Dict[int, int] = {}
+    for i in accepted:
+        req_idx = req_pool_indices_cpu[req_offsets[i]]
+        if c4_positions[i] < device_buffer_size:
+            fixed_copy.append(i)
+        else:
+            latest_long[req_idx] = i
+    fixed_copy.extend(latest_long.values())
+    return fixed_copy
+
+
 class HiSparseAct(NamedTuple):
     start_event: device_module.Event
     finish_event: device_module.Event
@@ -47,6 +78,19 @@ class HiSparseTokenStats(NamedTuple):
     device_token_usage: float
     host_tokens: int
     host_token_usage: float
+
+
+@dataclass
+class HiSparseDSparkWindow:
+    """Metadata for one target-verify transaction over fixed C4 scratch."""
+
+    compressed_locs: torch.Tensor
+    device_locs: torch.Tensor
+    previous_device_mapping: torch.Tensor
+    req_offsets: List[int]
+    req_pool_indices_cpu: List[int]
+    c4_positions: List[int]
+    prefix_lens_cpu: List[int]
 
 
 def resolve_shared_index_layers(
@@ -131,6 +175,7 @@ class HiSparseCoordinator:
         prefetcher_config: Optional[Mapping] = None,
         pp_size: int = 1,
         is_speculative: bool = False,
+        speculative_verify_width: int = 0,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -224,6 +269,49 @@ class HiSparseCoordinator:
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
+        self._active_dspark_window: Optional[HiSparseDSparkWindow] = None
+        self._dspark_commit_done_event = device_module.Event()
+        self._has_pending_dspark_commit = False
+        self._dspark_scratch_compressed_locs: Optional[torch.Tensor] = None
+        self._dspark_scratch_device_locs: Optional[torch.Tensor] = None
+        self._dspark_scratch_page_locs: Optional[torch.Tensor] = None
+        self._dspark_scratch_valid_mapping: Optional[torch.Tensor] = None
+        if self.is_dsv4_hisparse and is_speculative and speculative_verify_width > 0:
+            # A graph replay cannot change tensor addresses or allocate pages.
+            # Reserve enough whole pages for the worst alignment of every
+            # request, then update only their logical C4 identities before each
+            # replay.  The buffers exist during capture too, where -1 marks all
+            # entries invalid and therefore gives model.forward legal storage.
+            max_groups_per_req = (
+                speculative_verify_width + self.compress_ratio - 2
+            ) // self.compress_ratio + 1
+            scratch_capacity = max_num_req_slots * max(1, max_groups_per_req)
+            scratch_size = (
+                (scratch_capacity + self.page_size - 1) // self.page_size
+            ) * self.page_size
+            scratch_page_locs = (
+                self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
+                    scratch_size
+                )
+            )
+            if scratch_page_locs is None:
+                raise RuntimeError(
+                    "HiSparse DSPARK fixed C4 scratch allocation failed: "
+                    f"requested {scratch_size} entries"
+                )
+            self._dspark_scratch_page_locs = scratch_page_locs
+            self._dspark_scratch_device_locs = scratch_page_locs[:scratch_capacity]
+            self._dspark_scratch_compressed_locs = torch.full(
+                (scratch_capacity,), -1, dtype=torch.int64, device=self.device
+            )
+            # The mapping may be exposed through weakref.proxy; zeros_like
+            # dispatches on the proxy subclass and fails. Allocate an ordinary
+            # tensor from its shape instead.
+            self._dspark_scratch_valid_mapping = torch.zeros(
+                self.mem_pool_device.full_to_hisparse_device_index_mapping.shape,
+                dtype=torch.bool,
+                device=self.device,
+            )
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -1252,3 +1340,316 @@ class HiSparseCoordinator:
                         self.prefetch_stream
                     )
         return anchor_locs
+
+    def swap_in_selected_pages_spec(
+        self,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        layer_id: int,
+        *,
+        verify_lens_cpu: Optional[List[int]] = None,
+        output_buffer: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Swap DSPARK verify selections in request-major step order.
+
+        ``top_k_result`` is the *real* Indexer output, with either static
+        ``[B * W, K]`` rows or compact ``[sum(verify_lens), K]`` rows. LRU and
+        resident-slot tables are per request, so two steps of one request must
+        never share a launch. Launch step-major batches instead: requests run
+        in parallel while each request's later step observes the prior launch.
+        Padding rows beyond ``sum(verify_lens)`` remain invalid and never launch.
+
+        This eager synchronous path is intentional: speculative decoding disables
+        shared-index/previous-layer prefetch, while preserving the Indexer's
+        Top-K unchanged.
+        """
+        if top_k_result.dim() != 2:
+            raise ValueError(
+                "HiSparse speculative Top-K must be a 2-D flattened tensor, "
+                f"got shape {tuple(top_k_result.shape)}"
+            )
+        batch_size = req_pool_indices.numel()
+        if batch_size == 0:
+            return top_k_result.to(torch.int32)
+        if output_buffer is None:
+            output_buffer = torch.empty_like(top_k_result, dtype=torch.int32)
+        result = output_buffer[: top_k_result.size(0)]
+        compressed_seq_lens = compressed_seq_lens.reshape(-1)
+
+        if verify_lens_cpu is None:
+            if top_k_result.size(0) % batch_size != 0:
+                raise ValueError(
+                    "Static HiSparse verify rows must be divisible by batch size: "
+                    f"rows={top_k_result.size(0)}, batch={batch_size}"
+                )
+            verify_width = top_k_result.size(0) // batch_size
+            top_k_by_req = top_k_result.view(batch_size, verify_width, -1)
+            result_by_req = result.view(batch_size, verify_width, -1)
+            if compressed_seq_lens.numel() == batch_size:
+                seq_lens_by_req = None
+            elif compressed_seq_lens.numel() == top_k_result.size(0):
+                seq_lens_by_req = compressed_seq_lens.view(batch_size, verify_width)
+            else:
+                raise ValueError(
+                    "Static HiSparse verify sequence lengths must contain one "
+                    "value per request or Top-K row: "
+                    f"lengths={compressed_seq_lens.numel()}, batch={batch_size}, "
+                    f"rows={top_k_result.size(0)}"
+                )
+            # Static ownership is fixed and request-aligned, including CUDA
+            # Graph padding. Launch one full request batch per step: the kernel's
+            # num_real_reqs mask now correctly removes padded request blocks.
+            for step in range(verify_width):
+                self._run_swap_in_kernel(
+                    req_pool_indices,
+                    (
+                        compressed_seq_lens
+                        if seq_lens_by_req is None
+                        else seq_lens_by_req[:, step]
+                    ),
+                    top_k_by_req[:, step, : self.top_k],
+                    layer_id,
+                    output_buffer=result_by_req[:, step, : self.top_k],
+                )
+            return result
+
+        result.fill_(-1)
+        real_rows = sum(verify_lens_cpu)
+        if len(verify_lens_cpu) != batch_size or real_rows > top_k_result.size(0):
+            raise ValueError(
+                "HiSparse ragged verify geometry does not match Top-K rows: "
+                f"lens={verify_lens_cpu}, rows={top_k_result.size(0)}"
+            )
+
+        num_seq_lens = compressed_seq_lens.numel()
+        if num_seq_lens not in (batch_size, real_rows, top_k_result.size(0)):
+            raise ValueError(
+                "HiSparse verify sequence lengths must contain one value per "
+                "request or Top-K row: "
+                f"lengths={num_seq_lens}, batch={batch_size}, "
+                f"rows={top_k_result.size(0)}"
+            )
+
+        # One launch per verify step, with all requests owning that step in the
+        # same launch. This preserves per-request ordering while retaining
+        # request-level GPU parallelism. Compact rows are request-major, hence
+        # offsets identify the row for (request, step).
+        offsets = [0]
+        for verify_len in verify_lens_cpu:
+            offsets.append(offsets[-1] + verify_len)
+        for step in range(max(verify_lens_cpu, default=0)):
+            active_reqs = [
+                i for i, length in enumerate(verify_lens_cpu) if step < length
+            ]
+            row_ids = [offsets[i] + step for i in active_reqs]
+            active_idx = torch.tensor(
+                active_reqs, dtype=torch.int64, device=self.device
+            )
+            row_idx = torch.tensor(row_ids, dtype=torch.int64, device=self.device)
+            step_seq_lens = (
+                compressed_seq_lens[active_idx]
+                if num_seq_lens == batch_size
+                else compressed_seq_lens[row_idx]
+            )
+            step_output = torch.empty(
+                (len(active_reqs), self.top_k), dtype=torch.int32, device=self.device
+            )
+            self._run_swap_in_kernel(
+                req_pool_indices[active_idx],
+                step_seq_lens,
+                top_k_result[row_idx, : self.top_k],
+                layer_id,
+                output_buffer=step_output,
+            )
+            result[row_idx, : self.top_k] = step_output
+        return result
+
+    def prepare_dspark_verify_window(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        verify_width: int,
+    ) -> HiSparseDSparkWindow:
+        """Bind temporary physical C4 writer pages for one DSPARK verify."""
+        if not self.is_dsv4_hisparse:
+            raise RuntimeError("DSPARK HiSparse windows require DeepSeek-V4 C4")
+        if self._has_pending_dspark_commit:
+            # Commit copies may have been issued by another producer stream.
+            # A stream dependency preserves overlap without a CPU-wide barrier.
+            self._dspark_commit_done_event.wait(device_module.current_stream())
+            self._has_pending_dspark_commit = False
+        req_offsets: List[int] = []
+        c4_positions: List[int] = []
+        full_locs = []
+        prefix_cpu = prefix_lens.to("cpu").tolist()
+        req_cpu = req_pool_indices.to("cpu").tolist()
+        for req_offset, (req_idx, prefix_len) in enumerate(zip(req_cpu, prefix_cpu)):
+            for c4_pos in dspark_completed_c4_positions(prefix_len, verify_width):
+                token_pos = (c4_pos + 1) * self.compress_ratio - 1
+                req_offsets.append(req_offset)
+                c4_positions.append(c4_pos)
+                full_locs.append(
+                    self.req_to_token_pool.req_to_token[req_idx, token_pos]
+                )
+        if not full_locs:
+            empty = torch.empty(0, dtype=torch.int64, device=self.device)
+            return HiSparseDSparkWindow(
+                empty, empty, empty, [], req_cpu, [], prefix_cpu
+            )
+        full_locs = torch.stack(full_locs).to(torch.int64)
+        compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
+            full_locs
+        )
+        mapping = self.mem_pool_device.full_to_hisparse_device_index_mapping
+        previous_device_mapping = mapping[compressed_locs].clone()
+        if self._dspark_scratch_device_locs is None:
+            raise RuntimeError("HiSparse DSPARK fixed C4 scratch is not initialized")
+        if compressed_locs.numel() > self._dspark_scratch_device_locs.numel():
+            raise RuntimeError(
+                "HiSparse DSPARK verify exceeds fixed graph scratch capacity: "
+                f"need {compressed_locs.numel()}, have "
+                f"{self._dspark_scratch_device_locs.numel()}"
+            )
+        device_locs = self._dspark_scratch_device_locs[: compressed_locs.numel()]
+        try:
+            self._dspark_scratch_compressed_locs.fill_(-1)
+            self._dspark_scratch_compressed_locs[: compressed_locs.numel()].copy_(
+                compressed_locs
+            )
+            self._dspark_scratch_valid_mapping.fill_(False)
+            self._dspark_scratch_valid_mapping[compressed_locs] = True
+            mapping[compressed_locs] = device_locs.to(torch.int64)
+            window = HiSparseDSparkWindow(
+                compressed_locs,
+                device_locs,
+                previous_device_mapping,
+                req_offsets,
+                req_cpu,
+                c4_positions,
+                prefix_cpu,
+            )
+        except Exception:
+            mapping[compressed_locs] = previous_device_mapping
+            self._dspark_scratch_compressed_locs.fill_(-1)
+            self._dspark_scratch_valid_mapping[compressed_locs] = False
+            raise
+        self._active_dspark_window = window
+        return window
+
+    def select_dspark_scratch_locs(
+        self,
+        compressed_locs: torch.Tensor,
+        swapped_locs: torch.Tensor,
+        mapped_device_locs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Current-window C4 always reads its writer page, even on fast paths."""
+        # Always execute this selection when fixed scratch exists. During CUDA
+        # graph capture the identities are all -1; replay updates the same
+        # device buffer before launch, so no capture-time Python branch or slice
+        # address is frozen into the graph.
+        if self._dspark_scratch_valid_mapping is None:
+            return swapped_locs
+        valid_logical_loc = torch.logical_and(
+            compressed_locs >= 0,
+            compressed_locs < self._dspark_scratch_valid_mapping.numel(),
+        )
+        safe_locs = compressed_locs.clamp(
+            0, self._dspark_scratch_valid_mapping.numel() - 1
+        )
+        belongs_to_window = torch.logical_and(
+            valid_logical_loc, self._dspark_scratch_valid_mapping[safe_locs]
+        )
+        return torch.where(belongs_to_window, mapped_device_locs, swapped_locs)
+
+    def rollback_dspark_verify_window(self, window: HiSparseDSparkWindow) -> None:
+        if window.compressed_locs.numel() == 0:
+            return
+        self.mem_pool_device.full_to_hisparse_device_index_mapping[
+            window.compressed_locs
+        ] = window.previous_device_mapping
+        # Fixed scratch is coordinator-owned for its entire lifetime. Releasing
+        # it here would invalidate addresses captured by CUDA Graph.
+        self._dspark_scratch_compressed_locs.fill_(-1)
+        self._dspark_scratch_valid_mapping[window.compressed_locs] = False
+        if self._active_dspark_window is window:
+            self._active_dspark_window = None
+        # Record every non-empty rollback, including all-rejected and exception
+        # paths. A later verify may prepare scratch on another stream and must
+        # not race these mapping/validity writes.
+        self._dspark_commit_done_event.record(device_module.current_stream())
+        self._has_pending_dspark_commit = True
+
+    def commit_dspark_verify_window(
+        self, window: HiSparseDSparkWindow, commit_lens: torch.Tensor
+    ) -> None:
+        """Back up accepted C4 entries, then reset fixed scratch metadata."""
+        if window.compressed_locs.numel() == 0:
+            return
+        commit_cpu = commit_lens.to("cpu").tolist()
+        accepted = [
+            i
+            for i, (req_offset, c4_pos) in enumerate(
+                zip(window.req_offsets, window.c4_positions)
+            )
+            if (c4_pos + 1) * self.compress_ratio
+            <= window.prefix_lens_cpu[req_offset] + int(commit_cpu[req_offset])
+        ]
+        if accepted:
+            accepted_idx = torch.tensor(accepted, dtype=torch.int64, device=self.device)
+            host_locs = []
+            for i in accepted:
+                req_idx = window.req_pool_indices_cpu[window.req_offsets[i]]
+                host_locs.append(
+                    self.mem_pool_host.alloc_paged_token_slots(
+                        self.req_to_host_pool,
+                        self.req_to_host_pool_allocated_len,
+                        req_idx,
+                        window.c4_positions[i],
+                        1,
+                    )
+                )
+            host_locs = torch.cat(host_locs)
+            # Accepted entries are gathered across requests and are not a
+            # contiguous, page-aligned range.  DeepSeekV4PagedHostPool's generic
+            # backup dispatch treats a page-size multiple as whole pages, which
+            # would retain only the first slot of each arbitrary group.  Always
+            # use token-granular C4 transfer for speculative commit.
+            transfer_cache_dsv4_mla(
+                src_ptrs=self.mem_pool_host.device_ptrs,
+                dst_ptrs=self.mem_pool_host.data_ptrs,
+                src_indices=window.device_locs[accepted_idx].to(torch.int64),
+                dst_indices=host_locs.to(torch.int64),
+            )
+            # Short-context C4s have distinct fixed slots. Long-context C4s all
+            # share the reserved newest slot, so copy only the latest accepted
+            # C4 per request to keep transfer destinations unique.
+            fixed_copy = dspark_fixed_buffer_commit_indices(
+                accepted,
+                window.req_offsets,
+                window.req_pool_indices_cpu,
+                window.c4_positions,
+                self.device_buffer_size,
+            )
+            fixed_idx = torch.tensor(fixed_copy, dtype=torch.int64, device=self.device)
+            accepted_req_slots = [
+                window.req_pool_indices_cpu[window.req_offsets[i]] for i in fixed_copy
+            ]
+            accepted_c4_pos = [window.c4_positions[i] for i in fixed_copy]
+            fixed_slots = [min(pos, self.device_buffer_size) for pos in accepted_c4_pos]
+            dst_locs = self.req_to_device_buffer[
+                torch.tensor(accepted_req_slots, dtype=torch.int64, device=self.device),
+                torch.tensor(fixed_slots, dtype=torch.int64, device=self.device),
+            ]
+            transfer_cache_dsv4_mla(
+                src_ptrs=self.mem_pool_host.device_ptrs,
+                dst_ptrs=self.mem_pool_host.device_ptrs,
+                src_indices=window.device_locs[fixed_idx],
+                dst_indices=dst_locs,
+            )
+            for req_idx, c4_pos, fixed_slot in zip(
+                accepted_req_slots, accepted_c4_pos, fixed_slots
+            ):
+                self.req_device_buffer_tokens[:, req_idx, fixed_slot] = c4_pos
+        self.rollback_dspark_verify_window(window)

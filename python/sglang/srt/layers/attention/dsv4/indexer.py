@@ -837,6 +837,10 @@ class C4IndexerBackendMixin:
         hisparse_decode = (
             hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
         )
+        hisparse_verify = (
+            hisparse_coordinator is not None
+            and forward_batch.forward_mode.is_target_verify()
+        )
 
         raw_indices = None
         if capture_enabled:
@@ -845,6 +849,11 @@ class C4IndexerBackendMixin:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
                 : c4_sparse_page_indices.size(0)
             ]
+        elif hisparse_verify:
+            # TARGET_VERIFY has B*W (or sum(verify_lens)) rows, which can be
+            # larger than the decode-only B-row coordinator buffer.  This
+            # allocation becomes a fixed graph-pool address when captured.
+            raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
@@ -897,19 +906,67 @@ class C4IndexerBackendMixin:
                 candidate_output,
             )
         if hisparse_coordinator is not None:
-            if hisparse_decode:
+            if hisparse_decode or hisparse_verify:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
                     c4_indexer.layer_id
                 ].compress_layer_id
-                core_metadata.c4_sparse_page_indices = (
-                    hisparse_coordinator.swap_in_selected_pages(
+                if hisparse_verify:
+                    from sglang.srt.speculative.ragged_verify import (
+                        resolve_ragged_verify_layout,
+                    )
+
+                    layout = resolve_ragged_verify_layout(forward_batch)
+                    verify_lens_cpu = None
+                    if layout is not None:
+                        verify_lens_cpu = layout.verify_lens_cpu
+                        if verify_lens_cpu is None:
+                            # CUDA graphs are disabled for this combination, so
+                            # materializing device-only ragged geometry here is
+                            # safe and prevents [1,3] from being guessed as [2,2].
+                            verify_lens_cpu = getattr(
+                                forward_batch, "_hisparse_verify_lens_cpu", None
+                            )
+                            if verify_lens_cpu is None:
+                                verify_lens_cpu = layout.verify_lens.to("cpu").tolist()
+                                forward_batch._hisparse_verify_lens_cpu = (
+                                    verify_lens_cpu
+                                )
+                    # swap_in_selected_pages_spec writes device locations into
+                    # its output buffer. Preserve the compressed logical C4
+                    # locations for the transaction-validity lookup below.
+                    logical_c4_sparse_page_indices = c4_sparse_page_indices.clone()
+                    speculative_device_locs = (
+                        token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
+                            logical_c4_sparse_page_indices
+                        ).to(torch.int32)
+                    )
+                    swapped_locs = hisparse_coordinator.swap_in_selected_pages_spec(
                         req_pool_indices=forward_batch.req_pool_indices,
                         compressed_seq_lens=indexer_metadata.c4_seq_lens,
                         top_k_result=raw_indices,
                         layer_id=compress_layer_id,
-                        prefetch_candidates=prefetch_candidates,
+                        verify_lens_cpu=verify_lens_cpu,
+                        output_buffer=c4_sparse_page_indices,
                     )
-                )
+                    # Host misses for current verify C4 rows resolve through the
+                    # transaction's scratch mapping rather than becoming -1.
+                    core_metadata.c4_sparse_page_indices = (
+                        hisparse_coordinator.select_dspark_scratch_locs(
+                            logical_c4_sparse_page_indices,
+                            swapped_locs,
+                            speculative_device_locs,
+                        )
+                    )
+                else:
+                    core_metadata.c4_sparse_page_indices = (
+                        hisparse_coordinator.swap_in_selected_pages(
+                            req_pool_indices=forward_batch.req_pool_indices,
+                            compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                            top_k_result=raw_indices,
+                            layer_id=compress_layer_id,
+                            prefetch_candidates=prefetch_candidates,
+                        )
+                    )
             else:
                 # flash_mla C4 attention requires int32 page indices.
                 core_metadata.c4_sparse_page_indices = (

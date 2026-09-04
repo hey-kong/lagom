@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.sparsity.factory import (
     get_sparse_coordinator,
     parse_hisparse_config,
     register_sparse_coordinator,
+    resolve_dspark_device_buffer_size,
 )
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "get_sparse_coordinator",
     "parse_hisparse_config",
     "register_sparse_coordinator",
+    "resolve_dspark_device_buffer_size",
 ]

@@ -19,7 +19,7 @@ import contextlib
 import inspect
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Union
 
 import torch
@@ -351,7 +351,11 @@ class ModelRunner:
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
-        self.enable_hisparse = server_args.enable_hisparse
+        # HiSparse owns the target model's authoritative host C4 cache.  A
+        # DFlash/DSPARK draft runner has an independent KV lifetime and must
+        # never construct (or free) that cache merely because the target's
+        # command line enables HiSparse.
+        self.enable_hisparse = server_args.enable_hisparse and not is_draft_worker
 
         self.init_startup_observability()
 
@@ -848,12 +852,39 @@ class ModelRunner:
             HiSparseCoordinator,
             resolve_shared_index_layers,
         )
-        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+        from sglang.srt.mem_cache.sparsity import (
+            parse_hisparse_config,
+            resolve_dspark_device_buffer_size,
+        )
 
         hisparse_cfg = parse_hisparse_config(self.server_args)
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
+        speculative_verify_width = get_spec().speculative_num_draft_tokens or 0
+        if self.spec_algorithm.is_dspark():
+            hisparse_cfg = resolve_dspark_device_buffer_size(
+                hisparse_cfg,
+                raw_hisparse_config=self.server_args.hisparse_config,
+                verify_width=speculative_verify_width,
+                effective_top_k=hisparse_top_k,
+            )
+            logger.info(
+                "HiSparse DSPARK resident buffer uses %d C4 entries "
+                "(verify_width=%d * effective_top_k=%d).",
+                hisparse_cfg.device_buffer_size,
+                speculative_verify_width,
+                hisparse_top_k,
+            )
+        if hisparse_top_k != hisparse_cfg.top_k:
+            logger.info(
+                "DeepSeek-V4 HiSparse uses model index_topk=%d C4 entries "
+                "(%d original-token coverage); --hisparse-config top_k=%d "
+                "is retained for CLI compatibility but does not override the model indexer.",
+                hisparse_top_k,
+                hisparse_top_k * 4,
+                hisparse_cfg.top_k,
+            )
         self.hisparse_coordinator = HiSparseCoordinator(
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -871,20 +902,51 @@ class ModelRunner:
             prefetcher_config=hisparse_cfg.prefetcher_config,
             pp_size=self.ps.pp_size,
             is_speculative=self.spec_algorithm.is_speculative(),
+            speculative_verify_width=(
+                speculative_verify_width if self.spec_algorithm.is_dspark() else 0
+            ),
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,
                 pp_size=self.ps.pp_size,
                 is_speculative=self.spec_algorithm.is_speculative(),
             ),
         )
+        disable_decode_graph_reason = None
+        if self.spec_algorithm.is_dflash_family():
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
+            )
+
+            if read_ragged_verify_mode() != RaggedVerifyMode.STATIC:
+                disable_decode_graph_reason = (
+                    "HiSparse with compact/ragged DFLASH/DSPARK verify requires "
+                    "eager decode; static verify retains decode CUDA Graph."
+                )
         if self.hisparse_coordinator.prefetcher is not None:
             # The candidate tensor and side-stream miss plan change every decode
             # step; capturing one would replay stale preceding-layer positions.
-            self.server_args.disable_cuda_graph = True
-            logger.warning(
+            disable_decode_graph_reason = (
                 "HiSparse previous prefetch currently requires eager decode; "
-                "CUDA graph capture has been disabled."
+                "decode CUDA graph capture has been disabled."
             )
+        if disable_decode_graph_reason is not None:
+            # ServerArgs is immutable after runtime-context publication. Update
+            # both the convenience leaf and the canonical phase config through
+            # the sanctioned override API; capture_decode_graph reads the latter.
+            from sglang.srt.model_executor.cuda_graph_config import Backend
+
+            cuda_graph_config = get_exec().graph.cuda_graph_config
+            cuda_graph_config = replace(
+                cuda_graph_config,
+                decode=replace(cuda_graph_config.decode, backend=Backend.DISABLED),
+            )
+            get_context().override(
+                "model_runner.hisparse_decode_graph_gate",
+                disable_decode_cuda_graph=True,
+                cuda_graph_config=cuda_graph_config,
+            )
+            logger.warning(disable_decode_graph_reason)
 
     def post_capture_resize_kv_pool(self):
         resize = compute_post_capture_kv_resize(self)

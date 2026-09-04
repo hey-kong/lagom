@@ -3008,7 +3008,26 @@ class Scheduler(
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, self.model_config.vocab_size
         )
-        # todo hisparse, maybe other info to contain for the new batch
+        # HiSparse stages prefill KV asynchronously and rebuilds the decode
+        # ScheduleBatch instead of merging the original prefill batch.  Preserve
+        # the DSPARK/DFLASH state that the ordinary prefill-to-decode path would
+        # receive from GenerationBatchResult.next_draft_input; otherwise the
+        # first prepare_for_decode dereferences a None spec_info.
+        if self.spec_algorithm.is_dflash_family():
+            # Local import avoids scheduler -> draft_worker_common -> tp_worker
+            # -> scheduler during module initialization.
+            from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
+
+            batch.spec_info = make_draft_input_v2(
+                bonus_tokens=last_tokens,
+                new_seq_lens=batch.seq_lens,
+            )
+            # The overlap resolver gathers the relayed bonus token (and any
+            # other speculative extras) through this stable request-slot key.
+            # Ordinary speculative batches receive it after run_batch; this
+            # HiSparse transition is rebuilt before its first decode, so seed
+            # the key here alongside the FutureMap stash above.
+            batch.spec_info.future_indices = batch.req_pool_indices
         return batch
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
