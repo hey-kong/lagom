@@ -1551,11 +1551,14 @@ class HiSparseCoordinator:
             )
         device_locs = self._dspark_scratch_device_locs[: compressed_locs.numel()]
         try:
-            self._dspark_scratch_compressed_locs.fill_(-1)
             self._dspark_scratch_compressed_locs[: compressed_locs.numel()].copy_(
                 compressed_locs
             )
-            self._dspark_scratch_valid_mapping.fill_(False)
+            # rollback_dspark_verify_window clears precisely the entries made
+            # valid by the preceding transaction.  Do not clear the complete
+            # logical C4 map here: its size tracks the host-backed cache and a
+            # full-device fill on every speculative step is both redundant and
+            # disproportionately expensive for long-context configurations.
             self._dspark_scratch_valid_mapping[compressed_locs] = True
             mapping[compressed_locs] = device_locs.to(torch.int64)
             window = HiSparseDSparkWindow(
@@ -1569,7 +1572,6 @@ class HiSparseCoordinator:
             )
         except Exception:
             mapping[compressed_locs] = previous_device_mapping
-            self._dspark_scratch_compressed_locs.fill_(-1)
             self._dspark_scratch_valid_mapping[compressed_locs] = False
             raise
         self._active_dspark_window = window
@@ -1608,7 +1610,11 @@ class HiSparseCoordinator:
         ] = window.previous_device_mapping
         # Fixed scratch is coordinator-owned for its entire lifetime. Releasing
         # it here would invalidate addresses captured by CUDA Graph.
-        self._dspark_scratch_compressed_locs.fill_(-1)
+        # The compressed-location tensor is fixed-address graph input storage;
+        # validity is authoritative, so stale values outside the next window's
+        # overwritten prefix are intentionally left untouched.  Clearing the
+        # full tensor would add another decode-step kernel with no semantic
+        # effect.
         self._dspark_scratch_valid_mapping[window.compressed_locs] = False
         if self._active_dspark_window is window:
             self._active_dspark_window = None
