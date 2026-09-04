@@ -648,10 +648,17 @@ class DSparkWorkerV2(BaseSpecWorker):
         hisparse_coordinator = self.model_runner.hisparse_coordinator
         hisparse_window = None
         if hisparse_coordinator is not None and hisparse_coordinator.is_dsv4_hisparse:
+            if batch.has_grammar:
+                raise RuntimeError(
+                    "DeepSeek-V4 HiSparse DSPARK verify does not support grammar "
+                    "or constrained decoding"
+                )
             hisparse_window = hisparse_coordinator.prepare_dspark_verify_window(
                 req_pool_indices=batch.req_pool_indices,
                 prefix_lens=prefix_lens,
                 verify_width=verify_ids_2d.shape[1],
+                req_pool_indices_cpu=batch.req_pool_indices_cpu,
+                prefix_lens_cpu=batch.seq_lens_cpu,
             )
 
         hisparse_committed = False

@@ -566,6 +566,15 @@ def run_eagle_verify(
         and hisparse_coordinator.is_dsv4_hisparse
         and not batch.forward_mode.is_idle()
     ):
+        if batch.has_grammar:
+            # Grammar processing may retain fewer tokens than eagle_sample's
+            # accept_lens.  C4 promotion happens in the worker, before the
+            # scheduler performs that truncation, so accepting this combination
+            # would make host KV longer than the authoritative request prefix.
+            raise RuntimeError(
+                "DeepSeek-V4 HiSparse EAGLE verify does not support grammar or "
+                "constrained decoding"
+            )
         if topk != 1:
             raise RuntimeError(
                 "DeepSeek-V4 HiSparse EAGLE verify requires a chain (topk=1)"
@@ -574,6 +583,8 @@ def run_eagle_verify(
             req_pool_indices=batch.req_pool_indices,
             prefix_lens=batch.seq_lens,
             verify_width=verify_input.draft_token_num,
+            req_pool_indices_cpu=batch.req_pool_indices_cpu,
+            prefix_lens_cpu=batch.seq_lens_cpu,
         )
 
     hisparse_committed = False
@@ -606,9 +617,8 @@ def run_eagle_verify(
             accept_index,
         ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
         if hisparse_window is not None:
-            # accept_lens includes the verified root/bonus token and is exactly
-            # the scheduler's commit length.  It is the sole authority for C4
-            # promotion; every other candidate remains scratch-only.
+            # Grammar is rejected above, so accept_lens cannot subsequently be
+            # shortened by the scheduler's grammar result processing.
             hisparse_coordinator.commit_dspark_verify_window(
                 hisparse_window, accept_lens
             )
