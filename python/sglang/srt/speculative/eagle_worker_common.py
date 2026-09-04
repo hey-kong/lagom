@@ -559,32 +559,63 @@ def run_eagle_verify(
     # eagle_prepare_for_verify marked the batch in exactly that case; the
     # non-cuda-graph path stays unmarked and gets forward_extend's init
     # (post-pad).
-    forward_batch_output = target_worker.forward_batch_generation(
-        batch=None,
-        forward_batch=verify_forward_batch,
-        is_verify=True,
-    )
-    logits_output = forward_batch_output.logits_output
-
-    # Generate vocab mask for constrained decoding
-    grammar_mask = None
-    if batch.has_grammar:
-        grammar_mask = build_grammar_vocab_mask(
-            reqs=batch.reqs,
-            tree=grammar_tree,
-            sampling_info=batch.sampling_info,
-            device=verify_input.retrieve_next_token.device,
-            barrier=grammar_barrier,
+    hisparse_coordinator = target_worker.model_runner.hisparse_coordinator
+    hisparse_window = None
+    if (
+        hisparse_coordinator is not None
+        and hisparse_coordinator.is_dsv4_hisparse
+        and not batch.forward_mode.is_idle()
+    ):
+        if topk != 1:
+            raise RuntimeError(
+                "DeepSeek-V4 HiSparse EAGLE verify requires a chain (topk=1)"
+            )
+        hisparse_window = hisparse_coordinator.prepare_dspark_verify_window(
+            req_pool_indices=batch.req_pool_indices,
+            prefix_lens=batch.seq_lens,
+            verify_width=verify_input.draft_token_num,
         )
 
-    # Sample
-    maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
-    maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    (
-        predict,
-        accept_lens,
-        accept_index,
-    ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+    hisparse_committed = False
+    try:
+        forward_batch_output = target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+        )
+        logits_output = forward_batch_output.logits_output
+
+        # Generate vocab mask for constrained decoding
+        grammar_mask = None
+        if batch.has_grammar:
+            grammar_mask = build_grammar_vocab_mask(
+                reqs=batch.reqs,
+                tree=grammar_tree,
+                sampling_info=batch.sampling_info,
+                device=verify_input.retrieve_next_token.device,
+                barrier=grammar_barrier,
+            )
+
+        # Acceptance is deliberately inside the transaction: an exception in
+        # grammar masking, diagnostics, or sampling must restore C4 mappings.
+        maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+        maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
+        (
+            predict,
+            accept_lens,
+            accept_index,
+        ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+        if hisparse_window is not None:
+            # accept_lens includes the verified root/bonus token and is exactly
+            # the scheduler's commit length.  It is the sole authority for C4
+            # promotion; every other candidate remains scratch-only.
+            hisparse_coordinator.commit_dspark_verify_window(
+                hisparse_window, accept_lens
+            )
+            hisparse_committed = True
+    finally:
+        if hisparse_window is not None and not hisparse_committed:
+            hisparse_coordinator.rollback_dspark_verify_window(hisparse_window)
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),

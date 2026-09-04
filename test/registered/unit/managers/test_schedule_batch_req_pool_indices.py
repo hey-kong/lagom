@@ -13,6 +13,7 @@ from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator  # noqa
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode  # noqa: E402
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2  # noqa: E402
+from sglang.srt.speculative.eagle_info import EagleDraftInput  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -54,7 +55,9 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
         # indexes req_pool_indices_cpu).
         scheduler = self._scheduler(
             types.SimpleNamespace(
-                is_none=lambda: True, is_dflash_family=lambda: False
+                is_none=lambda: True,
+                is_eagle=lambda: False,
+                is_dflash_family=lambda: False,
             )
         )
 
@@ -80,7 +83,9 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
         """HiSparse rebuilds the decode batch, so it must recreate DSPARK state."""
         scheduler = self._scheduler(
             types.SimpleNamespace(
-                is_none=lambda: False, is_dflash_family=lambda: True
+                is_none=lambda: False,
+                is_eagle=lambda: False,
+                is_dflash_family=lambda: True,
             )
         )
         reqs = [
@@ -96,6 +101,33 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
         self.assertIsInstance(batch.spec_info, DFlashDraftInputV2)
         self.assertTrue(torch.equal(batch.spec_info.bonus_tokens, torch.tensor([7])))
         self.assertTrue(torch.equal(batch.spec_info.new_seq_lens, batch.seq_lens))
+        self.assertTrue(
+            torch.equal(batch.spec_info.future_indices, batch.req_pool_indices)
+        )
+
+    def test_build_hisparse_eagle_decode_batch_preserves_prefill_relay(self):
+        """Do not overwrite EAGLE top-k/hidden relay with a bonus-only stash."""
+        scheduler = self._scheduler(
+            types.SimpleNamespace(
+                is_none=lambda: False,
+                is_eagle=lambda: True,
+                is_dflash_family=lambda: False,
+            )
+        )
+        reqs = [
+            _make_req(req_pool_idx=4, origin_input_ids=[1, 2, 3], output_ids=[7]),
+            _make_req(req_pool_idx=9, origin_input_ids=[1, 2], output_ids=[8]),
+        ]
+
+        with patch(
+            "sglang.srt.managers.scheduler.SamplingBatchInfo.from_schedule_batch",
+            return_value=MagicMock(),
+        ):
+            batch = scheduler._build_hisparse_decode_batch(reqs)
+
+        scheduler.future_map.stash.assert_not_called()
+        self.assertIsInstance(batch.spec_info, EagleDraftInput)
+        self.assertIsNone(batch.spec_info.bonus_tokens)
         self.assertTrue(
             torch.equal(batch.spec_info.future_indices, batch.req_pool_indices)
         )

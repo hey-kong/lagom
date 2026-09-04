@@ -2996,9 +2996,14 @@ class Scheduler(
         last_tokens = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
-        )
+        # EAGLE's prefill forward already stashed its complete draft payload
+        # (bonus token, top-k proposal, and hidden states) under these request
+        # slots. A bonus-only re-stash loses that state and dereferences a None
+        # topk_p in FutureMap.stash. Preserve the prefill relay entry instead.
+        if not self.spec_algorithm.is_eagle():
+            self.future_map.stash(
+                batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
+            )
         batch.input_ids = None
 
         if batch.return_logprob:
@@ -3013,7 +3018,15 @@ class Scheduler(
         # the DSPARK/DFLASH state that the ordinary prefill-to-decode path would
         # receive from GenerationBatchResult.next_draft_input; otherwise the
         # first prepare_for_decode dereferences a None spec_info.
-        if self.spec_algorithm.is_dflash_family():
+        if self.spec_algorithm.is_eagle():
+            # FutureMap populates the values from the complete prefill payload
+            # at forward entry; the rebuilt batch only needs its stable keys.
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            batch.spec_info = EagleDraftInput(
+                bonus_tokens=None, future_indices=batch.req_pool_indices
+            )
+        elif self.spec_algorithm.is_dflash_family():
             # Local import avoids scheduler -> draft_worker_common -> tp_worker
             # -> scheduler during module initialization.
             from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
