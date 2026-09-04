@@ -1495,8 +1495,16 @@ class HiSparseCoordinator:
         req_pool_indices: torch.Tensor,
         prefix_lens: torch.Tensor,
         verify_width: int,
+        req_pool_indices_cpu: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
     ) -> HiSparseDSparkWindow:
-        """Bind temporary physical C4 writer pages for one DSPARK verify."""
+        """Bind temporary physical C4 writer pages for one DSPARK verify.
+
+        The CPU tensors are the scheduler-owned mirrors of the device metadata.
+        Requiring them here is deliberate: materializing either device tensor on
+        the host introduces a device-wide synchronization immediately before
+        every speculative verify (including CUDA graph replay).
+        """
         if not self.is_dsv4_hisparse:
             raise RuntimeError("DSPARK HiSparse windows require DeepSeek-V4 C4")
         if self._has_pending_dspark_commit:
@@ -1507,8 +1515,13 @@ class HiSparseCoordinator:
         req_offsets: List[int] = []
         c4_positions: List[int] = []
         full_locs = []
-        prefix_cpu = prefix_lens.to("cpu").tolist()
-        req_cpu = req_pool_indices.to("cpu").tolist()
+        if (
+            prefix_lens_cpu.device.type != "cpu"
+            or req_pool_indices_cpu.device.type != "cpu"
+        ):
+            raise ValueError("DSPARK verify CPU metadata must reside on the CPU")
+        prefix_cpu = prefix_lens_cpu.tolist()
+        req_cpu = req_pool_indices_cpu.tolist()
         for req_offset, (req_idx, prefix_len) in enumerate(zip(req_cpu, prefix_cpu)):
             for c4_pos in dspark_completed_c4_positions(prefix_len, verify_width):
                 token_pos = (c4_pos + 1) * self.compress_ratio - 1

@@ -159,6 +159,8 @@ def test_dspark_all_rejected_rollback_records_cross_stream_event(monkeypatch):
         req_pool_indices=torch.tensor([3]),
         prefix_lens=torch.tensor([0]),
         verify_width=1,
+        req_pool_indices_cpu=torch.tensor([3]),
+        prefix_lens_cpu=torch.tensor([0]),
     )
 
     event.wait.assert_called_once_with(consumer_stream)
@@ -237,6 +239,8 @@ def test_dspark_prepare_translates_with_coordinator_device_pool():
         req_pool_indices=torch.tensor([0]),
         prefix_lens=torch.tensor([3]),
         verify_width=1,
+        req_pool_indices_cpu=torch.tensor([0]),
+        prefix_lens_cpu=torch.tensor([3]),
     )
 
     translate.assert_called_once()
