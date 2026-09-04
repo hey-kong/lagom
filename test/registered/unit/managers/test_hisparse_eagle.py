@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from sglang.srt.managers.hisparse_coordinator import (
+    HiSparseCoordinator,
     HiSparseDSparkWindow,
     dspark_completed_c4_positions,
     speculative_accepted_c4_indices,
@@ -58,3 +59,33 @@ def test_eagle_commit_rejects_mismatched_batch_metadata():
     window = _window([10, 7], [4, 9])
     with pytest.raises(ValueError, match="commit geometry mismatch"):
         speculative_accepted_c4_indices(window, [2])
+
+
+def test_eagle_cuda_graph_scratch_replay_keeps_addresses_and_changes_identity():
+    """EAGLE replay updates values, never graph-captured tensor addresses."""
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator._dspark_scratch_compressed_locs = torch.full(
+        (4,), -1, dtype=torch.int64
+    )
+    coordinator._dspark_scratch_valid_mapping = torch.zeros(32, dtype=torch.bool)
+    logical_c4 = torch.tensor([6, 7, 8], dtype=torch.int64)
+    resident = torch.tensor([16, 17, 18], dtype=torch.int32)
+    scratch = torch.tensor([26, 27, 28], dtype=torch.int32)
+
+    identity_ptr = coordinator._dspark_scratch_compressed_locs.data_ptr()
+    validity_ptr = coordinator._dspark_scratch_valid_mapping.data_ptr()
+    torch.testing.assert_close(
+        coordinator.select_dspark_scratch_locs(logical_c4, resident, scratch),
+        resident,
+    )
+
+    # Model one replay's prepare phase. The graph sees the same buffers but a
+    # different transaction identity, including a non-contiguous C4 selection.
+    coordinator._dspark_scratch_compressed_locs[:2].copy_(logical_c4[[0, 2]])
+    coordinator._dspark_scratch_valid_mapping[logical_c4[[0, 2]]] = True
+    torch.testing.assert_close(
+        coordinator.select_dspark_scratch_locs(logical_c4, resident, scratch),
+        torch.tensor([26, 17, 28], dtype=torch.int32),
+    )
+    assert coordinator._dspark_scratch_compressed_locs.data_ptr() == identity_ptr
+    assert coordinator._dspark_scratch_valid_mapping.data_ptr() == validity_ptr

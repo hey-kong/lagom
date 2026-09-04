@@ -928,13 +928,14 @@ class ModelRunner:
             self.spec_algorithm.is_eagle()
             and not self.spec_algorithm.is_frozen_kv_mtp()
         ):
-            # EAGLE's verify metadata is prepared on a side stream and its C4
-            # transaction identities change per request.  Keep draft graphs,
-            # but run target verify eagerly until those identities can be
-            # updated as graph inputs rather than Python-side transaction data.
-            disable_decode_graph_reason = (
-                "DeepSeek-V4 HiSparse + EAGLE target verify uses eager decode "
-                "for transactional C4 scratch; HiSparse and EAGLE remain enabled."
+            # The coordinator reserves fixed-address C4 scratch for the whole
+            # runner lifetime. Per-replay logical identities and validity bits
+            # are copied into those stable tensors before graph launch, so
+            # chain EAGLE target verify is CUDA-Graph safe and must not be
+            # forced to eager mode here.
+            logger.info(
+                "DeepSeek-V4 HiSparse + chain EAGLE target verify is eligible "
+                "for CUDA Graph with fixed transactional C4 scratch."
             )
         if self.spec_algorithm.is_dflash_family():
             from sglang.srt.speculative.ragged_verify import (
