@@ -902,8 +902,20 @@ class ModelRunner:
             prefetcher_config=hisparse_cfg.prefetcher_config,
             pp_size=self.ps.pp_size,
             is_speculative=self.spec_algorithm.is_speculative(),
+            # DeepSeek-V4 writes C4 entries while speculative candidates are
+            # still provisional.  Both DSPARK and chain EAGLE therefore need
+            # the coordinator-owned verify scratch (the accepted path is
+            # committed only after target sampling).
             speculative_verify_width=(
-                speculative_verify_width if self.spec_algorithm.is_dspark() else 0
+                speculative_verify_width
+                if (
+                    self.spec_algorithm.is_dspark()
+                    or (
+                        self.spec_algorithm.is_eagle()
+                        and not self.spec_algorithm.is_frozen_kv_mtp()
+                    )
+                )
+                else 0
             ),
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,
@@ -912,6 +924,18 @@ class ModelRunner:
             ),
         )
         disable_decode_graph_reason = None
+        if (
+            self.spec_algorithm.is_eagle()
+            and not self.spec_algorithm.is_frozen_kv_mtp()
+        ):
+            # EAGLE's verify metadata is prepared on a side stream and its C4
+            # transaction identities change per request.  Keep draft graphs,
+            # but run target verify eagerly until those identities can be
+            # updated as graph inputs rather than Python-side transaction data.
+            disable_decode_graph_reason = (
+                "DeepSeek-V4 HiSparse + EAGLE target verify uses eager decode "
+                "for transactional C4 scratch; HiSparse and EAGLE remain enabled."
+            )
         if self.spec_algorithm.is_dflash_family():
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,

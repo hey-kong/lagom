@@ -95,9 +95,25 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
     )
 
-    assert (
-        server_args.disable_radix_cache
-    ), "Hierarchical sparse attention currently requires --disable-radix-cache."
+    assert server_args.disable_radix_cache, (
+        "Hierarchical sparse attention currently requires --disable-radix-cache."
+    )
+
+    # A branching EAGLE tree contains several candidates at the same logical
+    # token position.  DeepSeek-V4 C4 has one entry per logical four-token
+    # group, so sharing that entry between branches would make target verify
+    # order-dependent.  Chain EAGLE (the production EAGLE-3 recipe) has an
+    # unambiguous request/position mapping and is supported transactionally.
+    if (
+        is_v4_hisparse
+        and server_args.speculative_algorithm in ("EAGLE", "EAGLE3")
+        and server_args.speculative_eagle_topk not in (None, 1)
+    ):
+        raise ValueError(
+            "DeepSeek-V4 HiSparse currently supports EAGLE/EAGLE3 only with "
+            "--speculative-eagle-topk=1; branching trees require branch-local "
+            "C4 scratch."
+        )
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.

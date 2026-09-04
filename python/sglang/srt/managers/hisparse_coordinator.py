@@ -67,6 +67,30 @@ def dspark_fixed_buffer_commit_indices(
     return fixed_copy
 
 
+def speculative_accepted_c4_indices(
+    window: "HiSparseDSparkWindow", commit_lens: List[int], compress_ratio: int = 4
+) -> List[int]:
+    """Return scratch rows fully covered by scheduler-confirmed commits.
+
+    This is shared by DSPARK and chain EAGLE.  In particular, a C4 crossing
+    the verify boundary is retained only if its fourth token is committed;
+    partial groups stay represented by ordinary token KV until a later step.
+    """
+    if len(commit_lens) != len(window.prefix_lens_cpu):
+        raise ValueError(
+            "HiSparse verify commit geometry mismatch: "
+            f"commits={len(commit_lens)}, requests={len(window.prefix_lens_cpu)}"
+        )
+    return [
+        i
+        for i, (req_offset, c4_pos) in enumerate(
+            zip(window.req_offsets, window.c4_positions)
+        )
+        if (c4_pos + 1) * compress_ratio
+        <= window.prefix_lens_cpu[req_offset] + int(commit_lens[req_offset])
+    ]
+
+
 class HiSparseAct(NamedTuple):
     start_event: device_module.Event
     finish_event: device_module.Event
@@ -1588,14 +1612,9 @@ class HiSparseCoordinator:
         if window.compressed_locs.numel() == 0:
             return
         commit_cpu = commit_lens.to("cpu").tolist()
-        accepted = [
-            i
-            for i, (req_offset, c4_pos) in enumerate(
-                zip(window.req_offsets, window.c4_positions)
-            )
-            if (c4_pos + 1) * self.compress_ratio
-            <= window.prefix_lens_cpu[req_offset] + int(commit_cpu[req_offset])
-        ]
+        accepted = speculative_accepted_c4_indices(
+            window, commit_cpu, self.compress_ratio
+        )
         if accepted:
             accepted_idx = torch.tensor(accepted, dtype=torch.int64, device=self.device)
             host_locs = []
