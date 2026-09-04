@@ -1,12 +1,14 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from sglang.srt.arg_groups.speculative_hook import _handle_oasiskv_lookahead
 from sglang.srt.speculative.oasiskv_lookahead import (
     OasisKVAttentionView,
     OasisKVLookaheadLane,
 )
+from sglang.srt.managers.hisparse_coordinator import OasisKVPrefetchTask
 
 
 def _args(**overrides):
@@ -87,3 +89,36 @@ def test_mutating_draft_forward_is_rejected():
             attention_view=OasisKVAttentionView(None, None, None, None, 1),
             request_metadata={},
         )
+
+
+def test_prefetch_identity_rejects_slot_generation_and_position_reuse():
+    task = OasisKVPrefetchTask(
+        layer_id=3,
+        ring_slot=1,
+        req_slots=torch.tensor([2, 7]),
+        generations=torch.tensor([4, 9]),
+        source_lens=torch.tensor([10, 20]),
+        target_positions=torch.tensor([11, 21]),
+        predicted_entries=None,
+        device_locs=None,
+        miss_src=None,
+        miss_dst=None,
+        miss_count=None,
+        event=None,
+        valid=True,
+    )
+
+    def matches(slots=(2, 7), generations=(4, 9), lens=(11, 21)):
+        values = torch.tensor(lens)
+        return task.matches(
+            layer_id=3,
+            req_slots=torch.tensor(slots),
+            generations=torch.tensor(generations),
+            committed_lens=values,
+            token_positions=values,
+        )
+
+    assert matches()
+    assert not matches(slots=(7, 2))  # same batch size, different requests
+    assert not matches(generations=(5, 9))  # scheduler slot was reused
+    assert not matches(lens=(12, 21))  # decode advanced past the prediction

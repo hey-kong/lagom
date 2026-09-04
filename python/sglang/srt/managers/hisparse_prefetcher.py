@@ -9,16 +9,19 @@ from typing import Callable, Dict, Mapping, Optional
 
 @dataclass
 class HiSparsePrefetchStats:
+    draft_tokens_generated: int = 0
     selected_entries: int = 0
     submitted_entries: int = 0
     completed_h2d_entries: int = 0
     prediction_hits: int = 0
     prediction_total: int = 0
     prefetch_hits: int = 0
+    prefetch_misses: int = 0
     prefetch_h2d_bytes: int = 0
     fallback_h2d_bytes: int = 0
     draft_target_forward_seconds: float = 0.0
     prefetch_wait_seconds: float = 0.0
+    stale_tasks: int = 0
 
 
 class HiSparsePrefetcher(ABC):
