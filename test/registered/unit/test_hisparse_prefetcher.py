@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from sglang.srt.managers.hisparse_prefetcher import (
+    OasisKVPrefetcher,
     PreviousPrefetcher,
     create_hisparse_prefetcher,
     supported_hisparse_prefetchers,
@@ -143,7 +144,7 @@ def test_unknown_algorithm_and_fields_are_rejected():
         create_hisparse_prefetcher(
             "random", {}, effective_top_k=4, device_buffer_size=8
         )
-    with pytest.raises(ValueError, match="supported prefetchers: previous"):
+    with pytest.raises(ValueError, match="supported prefetchers: oasiskv, previous"):
         create_hisparse_prefetcher(
             "previous_layer_topk", {}, effective_top_k=4, device_buffer_size=8
         )
@@ -154,7 +155,21 @@ def test_unknown_algorithm_and_fields_are_rejected():
             effective_top_k=4,
             device_buffer_size=8,
         )
-    assert supported_hisparse_prefetchers() == ("previous",)
+    assert supported_hisparse_prefetchers() == ("oasiskv", "previous")
+
+
+def test_oasiskv_token_coverage_and_selection():
+    prefetcher = create_hisparse_prefetcher(
+        "oasiskv",
+        {"size": 4096},
+        effective_top_k=512,
+        device_buffer_size=4096,
+        entry_token_span=4,
+    )
+    assert isinstance(prefetcher, OasisKVPrefetcher)
+    assert prefetcher.logical_entries == 1024
+    predicted = torch.arange(2048, dtype=torch.int32).view(2, 1024)
+    assert torch.equal(prefetcher.select(predicted), predicted)
 
 
 def test_selects_highest_score_prefix_without_modifying_input():
