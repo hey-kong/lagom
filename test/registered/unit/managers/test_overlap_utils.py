@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
 
 
@@ -11,11 +13,12 @@ def _args(*, algorithm="EAGLE3", enable_hisparse=False):
     )
 
 
-def test_hisparse_eagle3_requires_cpu_seq_lens():
+@pytest.mark.parametrize("algorithm", ["EAGLE3", "DSPARK"])
+def test_hisparse_speculative_decode_requires_cpu_seq_lens(algorithm):
     backend = SimpleNamespace(needs_cpu_seq_lens=False)
 
     assert decide_needs_cpu_seq_lens(
-        _args(enable_hisparse=True), (backend, backend)
+        _args(algorithm=algorithm, enable_hisparse=True), (backend, backend)
     )
 
 
