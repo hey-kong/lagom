@@ -1480,6 +1480,18 @@ class MQALayer(MqaAttentionBase):
                 x_quant=x_quant,
             )
 
+        if getattr(forward_batch, "is_oasiskv_paired", False):
+            num_requests = int(forward_batch.oasiskv_num_requests)
+            if q.shape[0] != 2 * num_requests:
+                raise RuntimeError(
+                    "OasisKV DeepSeek-V4 QKV rows must be request-major width two"
+                )
+            if forward_batch.oasiskv_draft_queries is None:
+                forward_batch.oasiskv_draft_queries = {}
+            # q is the real target Q projection.  C4 prediction consumes only
+            # odd (draft) rows after the shared paired layer invocation.
+            forward_batch.oasiskv_draft_queries[self.layer_id] = q[1::2]
+
         # The cache write is always fused / already done by _forward_prepare* --
         # tell the backend to skip its own store_cache. When `kv is None`
         # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
@@ -1898,6 +1910,17 @@ class DeepseekV4DecoderLayer(nn.Module):
         Optional[torch.Tensor],
     ]:
         use_fused = self.use_fused_mhc_post_pre
+
+        if getattr(forward_batch, "is_oasiskv_paired", False):
+            expected = 2 * int(forward_batch.oasiskv_num_requests)
+            if hidden_states.shape[0] != expected:
+                raise RuntimeError(
+                    "OasisKV DeepSeek-V4 layer received a non-paired token layout"
+                )
+            # This counter is incremented inside the real decoder layer, rather
+            # than by the orchestration facade, and therefore measures actual
+            # target layer traversals.
+            forward_batch.oasiskv_layer_traversals += 1
 
         if prev_residual is not None and use_fused:
             residual, post, comb, hidden_states = _get_mhc_ops().mhc_fused_post_pre(

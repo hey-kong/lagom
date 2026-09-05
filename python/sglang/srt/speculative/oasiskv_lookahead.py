@@ -42,6 +42,7 @@ class OasisKVPairedBatch:
     committed_lens: Any
     positions: Any
     attention_view: OasisKVAttentionView
+    transaction: "OasisKVStateTransaction | None" = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,47 @@ class OasisKVProfile:
     draft_c4_predictions: int = 0
     submitted_prefetch_entries: int = 0
     speculative_acceptance: int = 0
+
+
+@dataclass
+class OasisKVScratchState:
+    """Storage owned exclusively by a draft lane for one paired traversal."""
+
+    kv: Any
+    c4: Any
+    page_table: Any
+    host_kv: Any
+    sequence_lengths: Any
+    eagle_features: Any
+
+
+class OasisKVStateTransaction:
+    """Enforce scratch-only draft writes and an explicit normal commit.
+
+    The target integration supplies fingerprints of all scheduler-visible
+    state (KV/C4, page tables, host KV, lengths and EAGLE features).  Target
+    layers run against ``scratch`` and are not allowed to mutate that state;
+    only the final ``commit_normal`` callback is permitted to do so.
+    """
+
+    def __init__(
+        self,
+        *,
+        scratch: OasisKVScratchState,
+        snapshot_authoritative: Callable[[], Any],
+        commit_normal: Callable[..., Any],
+    ):
+        self.scratch = scratch
+        self._snapshot = snapshot_authoritative
+        self._commit = commit_normal
+        self._before = snapshot_authoritative()
+
+    def commit_normal(self, normal_state: Any, *, batch: OasisKVPairedBatch) -> Any:
+        if self._snapshot() != self._before:
+            raise RuntimeError(
+                "OasisKV target layers wrote paired data into authoritative state"
+            )
+        return self._commit(normal_state, batch=batch)
 
 
 class OasisKVFeatureStore:
@@ -167,7 +209,12 @@ class OasisKVPairedTargetExecutor:
             # Both dictionary values deliberately alias the same selection.
             normal_locations[layer_id] = result.shared_sparse_locations
             draft_locations[layer_id] = result.shared_sparse_locations
-        normal_output, normal_features = self.commit_normal(hidden[0], batch=batch)
+        if batch.transaction is not None:
+            normal_output, normal_features = batch.transaction.commit_normal(
+                hidden[0], batch=batch
+            )
+        else:
+            normal_output, normal_features = self.commit_normal(hidden[0], batch=batch)
         return OasisKVPairedOutput(
             normal_output=normal_output,
             normal_features=normal_features,
@@ -210,6 +257,8 @@ class OasisKVLookaheadLane:
         target_c4_predict: Callable[[int, Any], Any],
         submit_prefetch: Callable[..., None],
         snapshot_draft_state: Callable[[], Any],
+        normal_target_forward: Callable[..., Any] | None = None,
+        begin_state_transaction: Callable[..., OasisKVStateTransaction] | None = None,
         feature_store: OasisKVFeatureStore | None = None,
         profile: OasisKVProfile | None = None,
     ):
@@ -218,6 +267,8 @@ class OasisKVLookaheadLane:
         self._predict = target_c4_predict
         self._submit = submit_prefetch
         self._snapshot = snapshot_draft_state
+        self._normal_forward = normal_target_forward
+        self._begin_transaction = begin_state_transaction
         self.features = feature_store or OasisKVFeatureStore()
         self.profile = profile or OasisKVProfile()
 
@@ -240,7 +291,21 @@ class OasisKVLookaheadLane:
         # dynamic batch; normal HiSparse remains authoritative and no stale or
         # synthetic draft is ever used.
         if any(feature is None for feature in features):
-            return None, []
+            if self._normal_forward is None:
+                raise RuntimeError(
+                    "OasisKV missing EAGLE features requires normal_target_forward"
+                )
+            normal_output, normal_features = self._normal_forward(
+                normal_tokens=normal_tokens,
+                attention_view=attention_view,
+                request_slots=request_slots,
+                generations=generations,
+            )
+            for slot, generation, feature in zip(
+                request_slots, generations, normal_features
+            ):
+                self.features.put(slot, generation, feature)
+            return normal_output, []
 
         draft_tokens = self._draft_one(
             normal_hidden_states=features,
@@ -257,6 +322,15 @@ class OasisKVLookaheadLane:
             committed_lens=committed_lens,
             positions=(committed_lens, committed_lens + 1),
             attention_view=attention_view,
+            transaction=(
+                self._begin_transaction(
+                    request_slots=request_slots,
+                    generations=generations,
+                    committed_lens=committed_lens,
+                )
+                if self._begin_transaction is not None
+                else None
+            ),
         )
         before = self._snapshot()
         output = self._paired_forward(paired)
@@ -268,9 +342,9 @@ class OasisKVLookaheadLane:
         predictions = []
         target_positions = committed_lens + 1
         for layer_id, draft_query in output.draft_queries.items():
-            if (
-                output.normal_sparse_locations[layer_id]
-                is not output.draft_sparse_locations[layer_id]
+            if not _same_sparse_locations(
+                output.normal_sparse_locations[layer_id],
+                output.draft_sparse_locations[layer_id],
             ):
                 raise RuntimeError(
                     "OasisKV draft lane selected a different sparse working set"
@@ -296,3 +370,16 @@ class OasisKVLookaheadLane:
         ):
             self.features.put(slot, generation, feature)
         return output.normal_output, predictions
+
+
+def _same_sparse_locations(normal: Any, draft: Any) -> bool:
+    """Compare selected pages by value, including independently-built tensors."""
+    if isinstance(normal, torch.Tensor) and isinstance(draft, torch.Tensor):
+        return normal.shape == draft.shape and torch.equal(normal, draft)
+    try:
+        equal = normal == draft
+        return (
+            bool(equal.all().item()) if isinstance(equal, torch.Tensor) else bool(equal)
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False

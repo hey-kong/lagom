@@ -12,6 +12,8 @@ from sglang.srt.speculative.oasiskv_lookahead import (
     OasisKVPairedBatch,
     OasisKVPairedOutput,
     OasisKVPairedTargetExecutor,
+    OasisKVScratchState,
+    OasisKVStateTransaction,
     paired_causal_mask,
 )
 from sglang.srt.managers.hisparse_coordinator import OasisKVPrefetchTask
@@ -129,6 +131,7 @@ def test_missing_feature_skips_draft_and_slot_reuse_clears_stale_feature():
     store.put(3, 2, "new")
     assert store.get(3, 1) is None
     paired_calls = []
+    normal_calls = []
     lane = OasisKVLookaheadLane(
         eagle3_draft_one=lambda **_: pytest.fail("must not synthesize a draft"),
         paired_target_forward=lambda batch: paired_calls.append(batch),
@@ -136,6 +139,8 @@ def test_missing_feature_skips_draft_and_slot_reuse_clears_stale_feature():
         submit_prefetch=lambda **_: None,
         snapshot_draft_state=lambda: (),
         feature_store=store,
+        normal_target_forward=lambda **kwargs: normal_calls.append(kwargs)
+        or ("normal-output", ["fresh-3", "fresh-9"]),
     )
     output, predictions = lane.run(
         normal_tokens=[1, 2],
@@ -146,7 +151,10 @@ def test_missing_feature_skips_draft_and_slot_reuse_clears_stale_feature():
         generations=[2, 0],
         request_metadata={},
     )
-    assert output is None and predictions == [] and paired_calls == []
+    assert output == "normal-output" and predictions == [] and paired_calls == []
+    assert len(normal_calls) == 1
+    assert store.get(3, 2) == "fresh-3"
+    assert store.get(9, 0) == "fresh-9"
 
 
 def test_different_draft_sparse_pages_are_rejected():
@@ -170,6 +178,45 @@ def test_different_draft_sparse_pages_are_rejected():
             generations=[0],
             request_metadata={},
         )
+
+
+def test_equal_independently_constructed_sparse_tensors_are_accepted():
+    store = OasisKVFeatureStore()
+    store.put(0, 0, "feature")
+    lane = OasisKVLookaheadLane(
+        eagle3_draft_one=lambda **_: [2],
+        paired_target_forward=lambda _: OasisKVPairedOutput(
+            "normal",
+            ["next"],
+            {0: torch.tensor([[4]])},
+            {0: torch.tensor([[1, 3]])},
+            {0: torch.tensor([[1, 3]])},
+        ),
+        target_c4_predict=lambda _, query: query,
+        submit_prefetch=lambda **_: None,
+        snapshot_draft_state=lambda: (),
+        feature_store=store,
+    )
+    output, predictions = lane.run(
+        normal_tokens=[1],
+        attention_view=OasisKVAttentionView(None, None, None, None, 4),
+        request_slots=[0],
+        generations=[0],
+        request_metadata={},
+    )
+    assert output == "normal" and len(predictions) == 1
+
+
+def test_state_transaction_rejects_authoritative_target_layer_writes():
+    authoritative = {"kv": [], "c4": [], "pages": [], "host": [], "lens": [4]}
+    transaction = OasisKVStateTransaction(
+        scratch=OasisKVScratchState([], [], [], [], [5], []),
+        snapshot_authoritative=lambda: repr(authoritative),
+        commit_normal=lambda state, **_: state,
+    )
+    authoritative["kv"].append("draft-write")
+    with pytest.raises(RuntimeError, match="authoritative state"):
+        transaction.commit_normal("normal", batch=None)
 
 
 def test_reference_causal_mask_and_single_layer_traversal():

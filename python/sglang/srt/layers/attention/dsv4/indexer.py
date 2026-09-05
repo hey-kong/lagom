@@ -958,16 +958,40 @@ class C4IndexerBackendMixin:
                         )
                     )
                 else:
-                    core_metadata.c4_sparse_page_indices = (
-                        hisparse_coordinator.swap_in_selected_pages(
-                            req_pool_indices=forward_batch.req_pool_indices,
-                            compressed_seq_lens=indexer_metadata.c4_seq_lens,
-                            top_k_result=raw_indices,
-                            layer_id=compress_layer_id,
-                            prefetch_candidates=prefetch_candidates,
-                            req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
-                            committed_lens_cpu=forward_batch.seq_lens_cpu,
+                    is_oasiskv_paired = getattr(
+                        forward_batch, "is_oasiskv_paired", False
+                    )
+                    top_k_result = raw_indices
+                    compressed_seq_lens = indexer_metadata.c4_seq_lens
+                    if is_oasiskv_paired:
+                        expected = 2 * int(forward_batch.oasiskv_num_requests)
+                        if raw_indices.shape[0] != expected:
+                            raise RuntimeError(
+                                "OasisKV C4 Indexer rows do not match paired batch"
+                            )
+                        # Both lanes ran the full C4 Indexer.  Preserve the odd
+                        # rows as next-step predictions, but load history only
+                        # from the normal query's even-row selection.
+                        if forward_batch.oasiskv_c4_predictions is None:
+                            forward_batch.oasiskv_c4_predictions = {}
+                        forward_batch.oasiskv_c4_predictions[compress_layer_id] = (
+                            raw_indices[1::2].clone()
                         )
+                        top_k_result = raw_indices[0::2]
+                        compressed_seq_lens = indexer_metadata.c4_seq_lens[0::2]
+                    selected_locations = hisparse_coordinator.swap_in_selected_pages(
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        compressed_seq_lens=compressed_seq_lens,
+                        top_k_result=top_k_result,
+                        layer_id=compress_layer_id,
+                        prefetch_candidates=prefetch_candidates,
+                        req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
+                        committed_lens_cpu=forward_batch.seq_lens_cpu,
+                    )
+                    core_metadata.c4_sparse_page_indices = (
+                        selected_locations.repeat_interleave(2, dim=0)
+                        if is_oasiskv_paired
+                        else selected_locations
                     )
             else:
                 # flash_mla C4 attention requires int32 page indices.

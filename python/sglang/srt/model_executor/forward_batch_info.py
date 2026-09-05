@@ -488,6 +488,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
     reuse_dsa_topk_indices: Optional[bool] = False
 
+    # OasisKV is deliberately independent of speculative decoding.  An eager
+    # DeepSeek-V4 adapter sets this for a request-major [normal, draft] batch.
+    is_oasiskv_paired: bool = False
+    oasiskv_num_requests: int = 0
+    oasiskv_draft_queries: Optional[dict[int, torch.Tensor]] = None
+    oasiskv_c4_predictions: Optional[dict[int, torch.Tensor]] = None
+    oasiskv_layer_traversals: int = 0
+
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
