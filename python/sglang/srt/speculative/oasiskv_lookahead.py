@@ -78,10 +78,11 @@ def configure_oasiskv_forward_batch(
 ) -> None:
     """Install paired geometry on the real :class:`ForwardBatch`.
 
-    The batch must already have been prepared as a two-token extend for every
-    request.  That existing attention representation supplies the kernel-level
-    ``history -> normal -> draft`` causal relation; no detached Python mask is
-    used by production.
+    Production decode arrives through ``eagle_prepare_for_verify`` and therefore
+    carries tree/position metadata in ``spec_info`` rather than the
+    ``extend_prefix_lens``/``extend_start_loc`` fields used by a plain EXTEND.
+    Either representation supplies the kernel-level ``history -> normal ->
+    draft`` causal relation; no detached Python mask is used by production.
     """
     if forward_batch.batch_size != paired.batch_size:
         raise ValueError("OasisKV request count differs from ForwardBatch")
@@ -95,11 +96,18 @@ def configure_oasiskv_forward_batch(
     )
     if not extend_is_paired and verify_width != 2:
         raise ValueError("OasisKV paired forward requires two tokens per request")
-    required_2b = {
-        "out_cache_loc": forward_batch.out_cache_loc,
-        "extend_prefix_lens": forward_batch.extend_prefix_lens,
-        "extend_start_loc": forward_batch.extend_start_loc,
-    }
+    required_2b = {"out_cache_loc": forward_batch.out_cache_loc}
+    if extend_is_paired:
+        required_2b.update(
+            extend_prefix_lens=getattr(forward_batch, "extend_prefix_lens", None),
+            extend_start_loc=getattr(forward_batch, "extend_start_loc", None),
+        )
+    else:
+        spec_info = forward_batch.spec_info
+        required_2b.update(
+            verify_draft_token=getattr(spec_info, "draft_token", None),
+            verify_positions=getattr(spec_info, "positions", None),
+        )
     missing = [name for name, value in required_2b.items() if value is None]
     if missing:
         raise ValueError(f"OasisKV ForwardBatch lacks metadata: {', '.join(missing)}")

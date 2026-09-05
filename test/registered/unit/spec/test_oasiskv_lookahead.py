@@ -105,6 +105,28 @@ def test_eagle_verify_tensors_are_adopted_without_copy_or_reprojection():
     assert paired.draft_rows.tolist() == [1, 3]
 
 
+def test_eagle_verify_forward_batch_does_not_require_extend_only_metadata():
+    tokens = torch.tensor([10, 11, 20, 21])
+    positions = torch.tensor([7, 8, 13, 14])
+    verify = SimpleNamespace(draft_token_num=2, draft_token=tokens, positions=positions)
+    paired = paired_batch_from_eagle_verify(verify, 2)
+    forward_batch = SimpleNamespace(
+        batch_size=2,
+        input_ids=tokens,
+        positions=positions,
+        extend_seq_lens_cpu=None,
+        out_cache_loc=torch.arange(4),
+        seq_lens=torch.tensor([7, 13]),
+        seq_lens_cpu=torch.tensor([7, 13]),
+        spec_info=verify,
+    )
+
+    configure_oasiskv_forward_batch(forward_batch, paired)
+
+    assert forward_batch.is_oasiskv_paired
+    assert forward_batch.oasiskv_normal_rows.tolist() == [0, 2]
+
+
 def test_prefetch_identity_rejects_slot_generation_and_position_reuse():
     task = OasisKVPrefetchTask(
         layer_id=3,
