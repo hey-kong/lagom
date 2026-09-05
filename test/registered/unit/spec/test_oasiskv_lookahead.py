@@ -5,12 +5,9 @@ import torch
 
 from sglang.srt.arg_groups.speculative_hook import _handle_oasiskv_lookahead
 from sglang.srt.speculative.oasiskv_lookahead import (
-    OasisKVAttentionView,
     OasisKVFeatureStore,
-    OasisKVPairedForward,
-    OasisKVScratch,
     build_oasiskv_paired_batch,
-    submit_oasiskv_prediction,
+    configure_oasiskv_forward_batch,
 )
 from sglang.srt.managers.hisparse_coordinator import OasisKVPrefetchTask
 from sglang.srt.managers.hisparse_prefetcher import HiSparsePrefetchStats
@@ -48,7 +45,7 @@ def test_oasiskv_requires_draft_path_and_rejects_spec_verification():
         _handle_oasiskv_lookahead(_args(speculative_num_steps=2))
 
 
-def test_paired_row_mapping_positions_and_causal_relation():
+def test_paired_row_mapping_and_positions():
     paired = build_oasiskv_paired_batch(
         torch.tensor([10, 20]), torch.tensor([11, 21]), torch.tensor([7, 13])
     )
@@ -56,56 +53,22 @@ def test_paired_row_mapping_positions_and_causal_relation():
     assert paired.positions.tolist() == [7, 8, 13, 14]
     assert paired.normal_rows.tolist() == [0, 2]
     assert paired.draft_rows.tolist() == [1, 3]
-    assert paired.causal_mask().tolist() == [
-        [True, False, False, False],
-        [True, True, False, False],
-        [False, False, True, False],
-        [False, False, True, True],
-    ]
 
 
-def test_real_layer_objects_run_once_over_2b_and_draft_is_scratch_only():
-    class Layer(torch.nn.Module):
-        def __init__(self, value):
-            super().__init__()
-            self.value = value
-            self.calls = 0
-
-        def forward(self, hidden):
-            self.calls += 1
-            assert hidden.shape[0] == 4
-            return hidden + self.value
-
-    layers = [(3, Layer(1)), (4, Layer(2))]
-    submitted = []
-    scratch_refs = []
+def test_real_forward_batch_receives_two_token_extend_geometry():
     paired = build_oasiskv_paired_batch(
         torch.tensor([10, 20]), torch.tensor([11, 21]), torch.tensor([7, 13])
     )
-    view = OasisKVAttentionView("normal-c4", None, None, None, torch.tensor([7, 13]))
-
-    def layer_forward(layer, hidden, metadata, attention_view, scratch):
-        assert attention_view.c4_sparse_locations == "normal-c4"
-        assert isinstance(scratch, OasisKVScratch)
-        scratch_refs.append(scratch)
-        return layer(hidden), hidden[metadata.draft_rows].clone()
-
-    normal, predictions = OasisKVPairedForward(
-        lambda **kw: submitted.append(kw)
-    ).run(
-        paired=paired,
-        hidden_states=torch.arange(4.0)[:, None],
-        layers=layers,
-        layer_forward=layer_forward,
-        project_draft_q=lambda layer, hidden, positions: hidden + positions[:, None],
-        scan_c4=lambda query, attention_view: query.topk(1, dim=0).indices.T,
-        attention_view=view,
-        request_metadata={"slots": [2, 7]},
+    forward_batch = SimpleNamespace(
+        batch_size=2,
+        input_ids=torch.empty(4, dtype=torch.long),
+        positions=None,
+        extend_seq_lens_cpu=[2, 2],
     )
-    assert [layer.calls for _, layer in layers] == [1, 1]
-    assert normal[:, 0].tolist() == [3, 5]
-    assert len(predictions) == len(submitted) == 2
-    assert all(ref.released and not ref.kv and not ref.c4 for ref in scratch_refs)
+    configure_oasiskv_forward_batch(forward_batch, paired)
+    assert forward_batch.is_oasiskv_paired
+    assert forward_batch.input_ids.tolist() == [10, 11, 20, 21]
+    assert forward_batch.positions.tolist() == [7, 8, 13, 14]
 
 
 def test_feature_fallback_dynamic_batch_and_slot_reuse():
@@ -119,30 +82,6 @@ def test_feature_fallback_dynamic_batch_and_slot_reuse():
     assert store.get(4, 2) == "new"
     store.finish(4, 2)
     assert store.get(4, 2) is None
-
-
-def test_draft_c4_is_submitted_to_real_ring_api_with_fallback_filtered():
-    coordinator = SimpleNamespace(submit_oasiskv_prefetch=lambda **kw: calls.append(kw))
-    calls = []
-    prediction = SimpleNamespace(
-        layer_id=6,
-        source_committed_sequence_lengths=torch.tensor([10, 20]),
-        c4_entries=torch.tensor([[1, 2], [3, 4]]),
-    )
-    submit_oasiskv_prediction(
-        coordinator,
-        prediction=prediction,
-        request_metadata={
-            "req_pool_indices": torch.tensor([5, 8]),
-            "req_pool_indices_cpu": torch.tensor([5, 8]),
-            "compressed_seq_lens": torch.tensor([2, 4]),
-        },
-        draft_valid=torch.tensor([False, True]),
-    )
-    assert len(calls) == 1
-    assert calls[0]["layer_id"] == 6
-    assert calls[0]["req_pool_indices_cpu"].tolist() == [8]
-    assert calls[0]["predicted_c4_entries"].tolist() == [[3, 4]]
 
 
 def test_prefetch_identity_rejects_slot_generation_and_position_reuse():

@@ -841,9 +841,16 @@ class C4IndexerBackendMixin:
             hisparse_coordinator is not None
             and forward_batch.forward_mode.is_target_verify()
         )
+        hisparse_paired = (
+            hisparse_coordinator is not None
+            and getattr(forward_batch, "is_oasiskv_paired", False)
+        )
 
         raw_indices = None
         if capture_enabled:
+            raw_indices = torch.empty_like(c4_sparse_page_indices)
+        elif hisparse_paired:
+            # Paired has 2B rows, larger than the coordinator's decode B buffer.
             raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif hisparse_decode:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
@@ -905,7 +912,60 @@ class C4IndexerBackendMixin:
                 raw_indices,
                 candidate_output,
             )
-        if hisparse_coordinator is not None:
+        if hisparse_paired:
+            normal_rows = forward_batch.oasiskv_normal_rows
+            draft_rows = forward_batch.oasiskv_draft_rows
+            valid = forward_batch.oasiskv_draft_valid
+            if normal_rows is None or draft_rows is None or valid is None:
+                raise RuntimeError("OasisKV paired ForwardBatch is incomplete")
+            if normal_rows.numel() != forward_batch.req_pool_indices.numel():
+                raise RuntimeError("OasisKV paired rows must map one pair per request")
+
+            # Only the normal Top-K drives current-round I/O.  Replicate its
+            # resolved device working set onto the draft rows after swap-in, so
+            # history is identical for both queries.  The draft Top-K is kept
+            # separately and can only affect the next-round prefetch ring.
+            compress_layer_id = token_to_kv_pool.layer_mapping[
+                c4_indexer.layer_id
+            ].compress_layer_id
+            normal_raw = raw_indices[normal_rows]
+            normal_lens = indexer_metadata.c4_seq_lens[normal_rows]
+            normal_device_locs = hisparse_coordinator.swap_in_selected_pages(
+                req_pool_indices=forward_batch.req_pool_indices,
+                compressed_seq_lens=normal_lens,
+                top_k_result=normal_raw,
+                layer_id=compress_layer_id,
+                req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
+                committed_lens_cpu=forward_batch.seq_lens_cpu,
+            )
+            core_metadata.c4_sparse_page_indices[normal_rows] = normal_device_locs
+            core_metadata.c4_sparse_page_indices[draft_rows] = normal_device_locs
+
+            keep = valid.to(torch.bool)
+            if torch.any(keep):
+                # Submission must happen after this layer's attention has read
+                # normal_device_locs.  The decoder layer drains this record
+                # immediately after self_attn returns, before entering FFN.
+                pending = getattr(forward_batch, "_oasiskv_pending_prefetch", None)
+                if pending is None:
+                    pending = {}
+                    forward_batch._oasiskv_pending_prefetch = pending
+                pending[c4_indexer.layer_id] = (
+                    hisparse_coordinator,
+                    dict(
+                        req_pool_indices=forward_batch.req_pool_indices[keep],
+                        req_pool_indices_cpu=forward_batch.req_pool_indices_cpu[
+                            keep.to("cpu")
+                        ],
+                        compressed_seq_lens=normal_lens[keep],
+                        source_committed_lens_cpu=forward_batch.seq_lens_cpu[
+                            keep.to("cpu")
+                        ],
+                        predicted_c4_entries=raw_indices[draft_rows][keep],
+                        layer_id=compress_layer_id,
+                    ),
+                )
+        elif hisparse_coordinator is not None:
             if hisparse_decode or hisparse_verify:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
                     c4_indexer.layer_id

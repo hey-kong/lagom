@@ -533,6 +533,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     hidden_states: torch.Tensor = None
     residual: torch.Tensor = None
     model_specific_states: Dict[str, any] = None
+    # OasisKV synchronous correctness path.  A paired batch has request-major
+    # [normal, draft] rows and is represented as a two-token extend per request.
+    # The DSV4 indexer consumes these fields directly; they are deliberately
+    # absent from ordinary decode and speculative-verify batches.
+    is_oasiskv_paired: bool = False
+    oasiskv_normal_rows: Optional[torch.Tensor] = None
+    oasiskv_draft_rows: Optional[torch.Tensor] = None
+    oasiskv_draft_valid: Optional[torch.Tensor] = None
     # current split index of layer
     split_index: int = 0
 

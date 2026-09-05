@@ -8,59 +8,10 @@ have to infer ownership from tensor shapes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping, Optional
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import torch
-
-
-@dataclass(frozen=True)
-class OasisKVAttentionView:
-    """Immutable sparse history selected by the normal query."""
-
-    c4_sparse_locations: Any
-    c128_metadata: Any
-    swa_metadata: Any
-    local_window_metadata: Any
-    committed_sequence_lengths: Any
-
-
-@dataclass(frozen=True)
-class OasisKVPrediction:
-    layer_id: int
-    source_committed_sequence_lengths: Any
-    target_token_positions: Any
-    c4_entries: Any
-
-
-@dataclass
-class OasisKVScratch:
-    """Per-forward storage for draft KV/C4; deliberately has no commit API."""
-
-    kv: dict[int, Any] = field(default_factory=dict)
-    c4: dict[int, Any] = field(default_factory=dict)
-    released: bool = False
-
-    def put_kv(self, layer_id: int, value: Any) -> None:
-        if self.released:
-            raise RuntimeError("OasisKV scratch has been released")
-        self.kv[layer_id] = value
-
-    def put_c4(self, layer_id: int, value: Any) -> None:
-        if self.released:
-            raise RuntimeError("OasisKV scratch has been released")
-        self.c4[layer_id] = value
-
-    def release(self) -> None:
-        self.kv.clear()
-        self.c4.clear()
-        self.released = True
-
-    def __enter__(self) -> "OasisKVScratch":
-        return self
-
-    def __exit__(self, *_: Any) -> None:
-        self.release()
 
 
 @dataclass(frozen=True)
@@ -76,23 +27,6 @@ class OasisKVPairedBatch:
     @property
     def batch_size(self) -> int:
         return self.normal_rows.numel()
-
-    def causal_mask(self) -> torch.Tensor:
-        """Inline-token visibility; history is supplied by the sparse backend.
-
-        Rows are independent requests. Normal sees itself only, while draft sees
-        normal and itself. No row may see another request.
-        """
-        mask = torch.zeros(
-            (2 * self.batch_size, 2 * self.batch_size),
-            dtype=torch.bool,
-            device=self.input_ids.device,
-        )
-        mask[self.normal_rows, self.normal_rows] = True
-        mask[self.draft_rows, self.normal_rows] = True
-        mask[self.draft_rows, self.draft_rows] = True
-        return mask
-
 
 def build_oasiskv_paired_batch(
     normal_tokens: torch.Tensor,
@@ -136,97 +70,25 @@ class OasisKVFeatureStore:
             del self._features[slot]
 
 
-class OasisKVPairedForward:
-    """Execute each real target layer once over the request-major 2B tensor.
-
-    ``layer_forward`` is the model's actual decoder-layer call (not a second
-    target callback). ``project_draft_q`` runs the layer's real C4 Q projection.
-    The same normal-selected attention view is passed to every layer; draft C4
-    is only used to prefetch the *next* step.
-    """
-
-    def __init__(self, submit_prefetch: Callable[..., None]):
-        self.submit_prefetch = submit_prefetch
-
-    def run(
-        self,
-        *,
-        paired: OasisKVPairedBatch,
-        hidden_states: torch.Tensor,
-        layers: Iterable[tuple[int, Any]],
-        layer_forward: Callable[..., tuple[torch.Tensor, Any]],
-        project_draft_q: Callable[[Any, torch.Tensor, torch.Tensor], Any],
-        scan_c4: Callable[[Any, OasisKVAttentionView], Any],
-        attention_view: OasisKVAttentionView,
-        request_metadata: Mapping[str, Any],
-    ) -> tuple[torch.Tensor, list[OasisKVPrediction]]:
-        if hidden_states.shape[0] != paired.input_ids.shape[0]:
-            raise ValueError("paired target hidden state must contain exactly 2B rows")
-        predictions: list[OasisKVPrediction] = []
-        with OasisKVScratch() as scratch:
-            for layer_id, layer in layers:
-                # One invocation is essential: it owns QKV, attention and FFN/MoE
-                # for both lanes and writes odd-row KV only to scratch.
-                hidden_states, draft_kv = layer_forward(
-                    layer,
-                    hidden_states,
-                    paired,
-                    attention_view,
-                    scratch,
-                )
-                scratch.put_kv(layer_id, draft_kv)
-                draft_q = project_draft_q(layer, hidden_states[paired.draft_rows], paired.positions[paired.draft_rows])
-                entries = scan_c4(draft_q, attention_view)
-                scratch.put_c4(layer_id, entries)
-                prediction = OasisKVPrediction(
-                    layer_id,
-                    attention_view.committed_sequence_lengths,
-                    paired.positions[paired.draft_rows],
-                    entries,
-                )
-                self.submit_prefetch(
-                    prediction=prediction,
-                    request_metadata=request_metadata,
-                    draft_valid=paired.draft_valid,
-                )
-                predictions.append(prediction)
-        return hidden_states[paired.normal_rows], predictions
-
-
-def submit_oasiskv_prediction(
-    coordinator: Any,
-    *,
-    prediction: OasisKVPrediction,
-    request_metadata: Mapping[str, Any],
-    draft_valid: torch.Tensor,
+def configure_oasiskv_forward_batch(
+    forward_batch: Any, paired: OasisKVPairedBatch
 ) -> None:
-    """Submit valid draft C4 rows to PR10's real per-layer prefetch ring.
+    """Install paired geometry on the real :class:`ForwardBatch`.
 
-    Requests without a previous EAGLE feature still execute the normal lane,
-    but are omitted from this prediction.  Tensor filtering is applied to all
-    identities together so dynamic batching cannot associate a prediction with
-    another scheduler slot.
+    The batch must already have been prepared as a two-token extend for every
+    request.  That existing attention representation supplies the kernel-level
+    ``history -> normal -> draft`` causal relation; no detached Python mask is
+    used by production.
     """
-    keep = draft_valid.to(dtype=torch.bool)
-    gpu_slots = request_metadata["req_pool_indices"][keep]
-    cpu_slots = request_metadata["req_pool_indices_cpu"][keep.cpu()]
-    compressed_lens = request_metadata["compressed_seq_lens"][keep]
-    source_lens = prediction.source_committed_sequence_lengths[keep.cpu()]
-    entries = prediction.c4_entries[keep]
-    if gpu_slots.numel() == 0:
-        return
-    coordinator.submit_oasiskv_prefetch(
-        req_pool_indices=gpu_slots,
-        req_pool_indices_cpu=cpu_slots,
-        compressed_seq_lens=compressed_lens,
-        source_committed_lens_cpu=source_lens,
-        predicted_c4_entries=entries,
-        layer_id=prediction.layer_id,
-    )
-
-
-# Kept as an explicit error instead of silently retaining PR11's two-forward
-# callback abstraction. Production callers must use OasisKVPairedForward.
-class OasisKVLookaheadLane:
-    def __init__(self, **_: Any):
-        raise RuntimeError("OasisKVLookaheadLane was replaced by shared 2B paired forward")
+    if forward_batch.batch_size != paired.batch_size:
+        raise ValueError("OasisKV request count differs from ForwardBatch")
+    if forward_batch.input_ids.numel() != 2 * paired.batch_size:
+        raise ValueError("OasisKV ForwardBatch must contain two tokens per request")
+    if list(forward_batch.extend_seq_lens_cpu or ()) != [2] * paired.batch_size:
+        raise ValueError("OasisKV paired forward requires a two-token extend layout")
+    forward_batch.input_ids = paired.input_ids
+    forward_batch.positions = paired.positions
+    forward_batch.is_oasiskv_paired = True
+    forward_batch.oasiskv_normal_rows = paired.normal_rows
+    forward_batch.oasiskv_draft_rows = paired.draft_rows
+    forward_batch.oasiskv_draft_valid = paired.draft_valid
