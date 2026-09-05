@@ -922,32 +922,6 @@ class Scheduler(
 
     def maybe_init_draft_worker(self):
         if self.spec_algorithm.is_none():
-            if self.server_args.is_oasiskv_lookahead:
-                # OasisKV owns no speculative scheduler state, but it still
-                # needs the production EAGLE-3 network and its TP-aware model
-                # runner.  Construct the established draft worker with a
-                # private algorithm view; the scheduler itself remains NONE,
-                # so verify/accept/reject dispatch is unreachable.
-                from copy import copy
-
-                from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
-
-                draft_args = copy(self.server_args)
-                draft_args.speculative_algorithm = "EAGLE3"
-                self.draft_worker = EagleDraftWorker(
-                    draft_args,
-                    self.ps.gpu_id,
-                    self.ps,
-                    self.nccl_port,
-                    self.tp_worker,
-                )
-                self.oasiskv_draft_worker = self.draft_worker
-                self.external_corpus_manager = None
-                logger.info(
-                    "OasisKV loaded EAGLE-3 lookahead worker; speculative "
-                    "verification remains disabled"
-                )
-                return
             self.draft_worker = None
             self.external_corpus_manager = None
             return

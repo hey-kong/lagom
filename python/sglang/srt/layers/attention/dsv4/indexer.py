@@ -841,9 +841,8 @@ class C4IndexerBackendMixin:
             hisparse_coordinator is not None
             and forward_batch.forward_mode.is_target_verify()
         )
-        hisparse_paired = (
-            hisparse_coordinator is not None
-            and getattr(forward_batch, "is_oasiskv_paired", False)
+        hisparse_paired = hisparse_coordinator is not None and getattr(
+            forward_batch, "is_oasiskv_paired", False
         )
 
         raw_indices = None
@@ -930,13 +929,24 @@ class C4IndexerBackendMixin:
             ].compress_layer_id
             normal_raw = raw_indices[normal_rows]
             normal_lens = indexer_metadata.c4_seq_lens[normal_rows]
-            normal_device_locs = hisparse_coordinator.swap_in_selected_pages(
+            logical_normal = c4_sparse_page_indices[normal_rows].clone()
+            speculative_normal = (
+                token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
+                    logical_normal
+                ).to(torch.int32)
+            )
+            swapped_normal = hisparse_coordinator.swap_in_selected_pages_spec(
                 req_pool_indices=forward_batch.req_pool_indices,
                 compressed_seq_lens=normal_lens,
                 top_k_result=normal_raw,
                 layer_id=compress_layer_id,
-                req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
-                committed_lens_cpu=forward_batch.seq_lens_cpu,
+                verify_lens_cpu=[1] * normal_rows.numel(),
+                output_buffer=c4_sparse_page_indices[normal_rows].contiguous(),
+            )
+            normal_device_locs = hisparse_coordinator.select_dspark_scratch_locs(
+                logical_normal,
+                swapped_normal,
+                speculative_normal,
             )
             core_metadata.c4_sparse_page_indices[normal_rows] = normal_device_locs
             core_metadata.c4_sparse_page_indices[draft_rows] = normal_device_locs
@@ -958,9 +968,10 @@ class C4IndexerBackendMixin:
                             keep.to("cpu")
                         ],
                         compressed_seq_lens=normal_lens[keep],
-                        # Paired seq_lens includes both inline tokens.  Only
-                        # normal commits, hence the ring source is one shorter.
-                        source_committed_lens_cpu=(forward_batch.seq_lens_cpu - 1)[
+                        # TARGET_VERIFY keeps prefix lengths (before its inline
+                        # root) in seq_lens_cpu.  After root-only commit the next
+                        # batch is exactly source+1, matching PR10's identity.
+                        source_committed_lens_cpu=forward_batch.seq_lens_cpu[
                             keep.to("cpu")
                         ],
                         predicted_c4_entries=raw_indices[draft_rows][keep],

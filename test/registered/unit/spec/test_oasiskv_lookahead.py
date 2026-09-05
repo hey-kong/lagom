@@ -5,9 +5,9 @@ import torch
 
 from sglang.srt.arg_groups.speculative_hook import _handle_oasiskv_lookahead
 from sglang.srt.speculative.oasiskv_lookahead import (
-    OasisKVFeatureStore,
     build_oasiskv_paired_batch,
     configure_oasiskv_forward_batch,
+    paired_batch_from_eagle_verify,
 )
 from sglang.srt.managers.hisparse_coordinator import OasisKVPrefetchTask
 from sglang.srt.managers.hisparse_prefetcher import HiSparsePrefetchStats
@@ -32,8 +32,9 @@ def test_oasiskv_resolves_dedicated_lookahead_mode():
     args = _args()
     _handle_oasiskv_lookahead(args)
     assert args.is_oasiskv_lookahead
-    assert args.speculative_algorithm is None
+    assert args.speculative_algorithm == "EAGLE3"
     assert (args.speculative_num_steps, args.speculative_eagle_topk) == (1, 1)
+    assert args.speculative_num_draft_tokens == 2
 
 
 def test_oasiskv_requires_draft_path_and_rejects_spec_verification():
@@ -76,17 +77,17 @@ def test_real_forward_batch_receives_two_token_extend_geometry():
     assert forward_batch.positions.tolist() == [7, 8, 13, 14]
 
 
-def test_feature_fallback_dynamic_batch_and_slot_reuse():
-    store = OasisKVFeatureStore()
-    store.update(4, 1, "old")
-    assert store.get(4, 1) == "old"
-    assert store.get(4, 2) is None  # reused scheduler slot cannot inherit feature
-    store.update(4, 2, "new")
-    store.update(9, 0, "dynamic-batch-peer")
-    store.finish(4, 1)  # stale completion must not delete the new owner
-    assert store.get(4, 2) == "new"
-    store.finish(4, 2)
-    assert store.get(4, 2) is None
+def test_eagle_verify_tensors_are_adopted_without_copy_or_reprojection():
+    tokens = torch.tensor([10, 11, 20, 21])
+    positions = torch.tensor([7, 8, 13, 14])
+    paired = paired_batch_from_eagle_verify(
+        SimpleNamespace(draft_token_num=2, draft_token=tokens, positions=positions),
+        2,
+    )
+    assert paired.input_ids is tokens
+    assert paired.positions is positions
+    assert paired.normal_rows.tolist() == [0, 2]
+    assert paired.draft_rows.tolist() == [1, 3]
 
 
 def test_prefetch_identity_rejects_slot_generation_and_position_reuse():

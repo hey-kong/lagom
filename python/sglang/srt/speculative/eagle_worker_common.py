@@ -471,6 +471,7 @@ def run_eagle_verify(
     device: str,
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
+    oasiskv_lookahead: bool = False,
     grammar_barrier=None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
@@ -500,6 +501,16 @@ def run_eagle_verify(
             batch,
             target_worker,
         )
+        if oasiskv_lookahead and not batch.forward_mode.is_idle():
+            from sglang.srt.speculative.oasiskv_lookahead import (
+                configure_oasiskv_forward_batch,
+                paired_batch_from_eagle_verify,
+            )
+
+            configure_oasiskv_forward_batch(
+                verify_forward_batch,
+                paired_batch_from_eagle_verify(verify_input, bs),
+            )
 
     # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
     record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
@@ -611,11 +622,23 @@ def run_eagle_verify(
         # grammar masking, diagnostics, or sampling must restore C4 mappings.
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-        (
-            predict,
-            accept_lens,
-            accept_index,
-        ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+        if oasiskv_lookahead:
+            # Root/normal rows alone determine generated output.  Draft logits
+            # are target probes and never enter accept/reject sampling.
+            normal_rows = verify_forward_batch.oasiskv_normal_rows
+            normal_logits = logits_output.next_token_logits[normal_rows]
+            logits_output.next_token_logits = normal_logits
+            predict = target_worker.model_runner.sample(
+                logits_output, verify_forward_batch
+            ).reshape(-1)
+            accept_lens = torch.ones(bs, dtype=torch.int32, device=device)
+            accept_index = normal_rows.reshape(bs, 1)
+        else:
+            (
+                predict,
+                accept_lens,
+                accept_index,
+            ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
         if hisparse_window is not None:
             # Grammar is rejected above, so accept_lens cannot subsequently be
             # shortened by the scheduler's grammar result processing.
@@ -649,7 +672,9 @@ def run_eagle_verify(
         num_draft_tokens,
     )
 
-    if not batch.forward_mode.is_idle():
+    if not batch.forward_mode.is_idle() and oasiskv_lookahead:
+        bonus_tokens = predict.to(torch.int32)
+    elif not batch.forward_mode.is_idle():
         accept_tokens = predict[accept_index]
         bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
         # stride = accept_tokens per-req width = accept_index.shape[1]

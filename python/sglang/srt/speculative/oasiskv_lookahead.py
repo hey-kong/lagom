@@ -28,6 +28,7 @@ class OasisKVPairedBatch:
     def batch_size(self) -> int:
         return self.normal_rows.numel()
 
+
 def build_oasiskv_paired_batch(
     normal_tokens: torch.Tensor,
     draft_tokens: torch.Tensor,
@@ -52,22 +53,24 @@ def build_oasiskv_paired_batch(
     return OasisKVPairedBatch(input_ids, positions, rows[0::2], rows[1::2], draft_valid)
 
 
-class OasisKVFeatureStore:
-    """Generation-tagged EAGLE feature state safe against scheduler slot reuse."""
-
-    def __init__(self):
-        self._features: dict[int, tuple[int, Any]] = {}
-
-    def get(self, slot: int, generation: int) -> Any | None:
-        item = self._features.get(slot)
-        return item[1] if item is not None and item[0] == generation else None
-
-    def update(self, slot: int, generation: int, feature: Any) -> None:
-        self._features[slot] = (generation, feature)
-
-    def finish(self, slot: int, generation: int) -> None:
-        if slot in self._features and self._features[slot][0] == generation:
-            del self._features[slot]
+def paired_batch_from_eagle_verify(
+    verify_input: Any, batch_size: int
+) -> OasisKVPairedBatch:
+    """Adopt EAGLE's real root+one-draft verify tensors as an OasisKV pair."""
+    if verify_input.draft_token_num != 2:
+        raise ValueError("OasisKV requires exactly one normal and one draft token")
+    rows = torch.arange(2 * batch_size, device=verify_input.draft_token.device)
+    if verify_input.draft_token.numel() != rows.numel():
+        raise ValueError("EAGLE verify tokens do not have request-major 2B layout")
+    return OasisKVPairedBatch(
+        input_ids=verify_input.draft_token,
+        positions=verify_input.positions,
+        normal_rows=rows[0::2],
+        draft_rows=rows[1::2],
+        draft_valid=torch.ones(
+            batch_size, dtype=torch.bool, device=verify_input.draft_token.device
+        ),
+    )
 
 
 def configure_oasiskv_forward_batch(
@@ -84,8 +87,14 @@ def configure_oasiskv_forward_batch(
         raise ValueError("OasisKV request count differs from ForwardBatch")
     if forward_batch.input_ids.numel() != 2 * paired.batch_size:
         raise ValueError("OasisKV ForwardBatch must contain two tokens per request")
-    if list(forward_batch.extend_seq_lens_cpu or ()) != [2] * paired.batch_size:
-        raise ValueError("OasisKV paired forward requires a two-token extend layout")
+    verify_width = getattr(
+        getattr(forward_batch, "spec_info", None), "draft_token_num", None
+    )
+    extend_is_paired = (
+        list(forward_batch.extend_seq_lens_cpu or ()) == [2] * paired.batch_size
+    )
+    if not extend_is_paired and verify_width != 2:
+        raise ValueError("OasisKV paired forward requires two tokens per request")
     required_2b = {
         "out_cache_loc": forward_batch.out_cache_loc,
         "extend_prefix_lens": forward_batch.extend_prefix_lens,
