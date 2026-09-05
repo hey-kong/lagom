@@ -64,6 +64,11 @@ def test_real_forward_batch_receives_two_token_extend_geometry():
         input_ids=torch.empty(4, dtype=torch.long),
         positions=None,
         extend_seq_lens_cpu=[2, 2],
+        out_cache_loc=torch.arange(4),
+        extend_prefix_lens=torch.tensor([7, 13]),
+        extend_start_loc=torch.tensor([0, 2]),
+        seq_lens=torch.tensor([9, 15]),
+        seq_lens_cpu=torch.tensor([9, 15]),
     )
     configure_oasiskv_forward_batch(forward_batch, paired)
     assert forward_batch.is_oasiskv_paired

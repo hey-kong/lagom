@@ -958,7 +958,9 @@ class C4IndexerBackendMixin:
                             keep.to("cpu")
                         ],
                         compressed_seq_lens=normal_lens[keep],
-                        source_committed_lens_cpu=forward_batch.seq_lens_cpu[
+                        # Paired seq_lens includes both inline tokens.  Only
+                        # normal commits, hence the ring source is one shorter.
+                        source_committed_lens_cpu=(forward_batch.seq_lens_cpu - 1)[
                             keep.to("cpu")
                         ],
                         predicted_c4_entries=raw_indices[draft_rows][keep],

@@ -86,6 +86,18 @@ def configure_oasiskv_forward_batch(
         raise ValueError("OasisKV ForwardBatch must contain two tokens per request")
     if list(forward_batch.extend_seq_lens_cpu or ()) != [2] * paired.batch_size:
         raise ValueError("OasisKV paired forward requires a two-token extend layout")
+    required_2b = {
+        "out_cache_loc": forward_batch.out_cache_loc,
+        "extend_prefix_lens": forward_batch.extend_prefix_lens,
+        "extend_start_loc": forward_batch.extend_start_loc,
+    }
+    missing = [name for name, value in required_2b.items() if value is None]
+    if missing:
+        raise ValueError(f"OasisKV ForwardBatch lacks metadata: {', '.join(missing)}")
+    if forward_batch.out_cache_loc.numel() != 2 * paired.batch_size:
+        raise ValueError("OasisKV requires one normal and one scratch cache location")
+    if forward_batch.seq_lens is None or forward_batch.seq_lens_cpu is None:
+        raise ValueError("OasisKV requires GPU and CPU sequence lengths")
     forward_batch.input_ids = paired.input_ids
     forward_batch.positions = paired.positions
     forward_batch.is_oasiskv_paired = True
