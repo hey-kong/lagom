@@ -148,9 +148,9 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
     """Resolve OasisKV without enabling speculative verification.
 
-    ``speculative_*`` fields describe the embedded EAGLE-3 predictor, while
-    ``speculative_algorithm`` intentionally remains ``None`` so the regular
-    decode scheduler retains ownership of committed tokens and KV state.
+    The internal EAGLE-3 worker supplies model loading, feature relay and
+    scratch allocation.  Its verify forward is replaced by root-only OasisKV
+    sampling, so no draft token can be accepted.
     """
     try:
         config = json.loads(server_args.hisparse_config or "{}")
@@ -175,7 +175,7 @@ def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
         "--speculative-eagle-topk": (server_args.speculative_eagle_topk, 1),
         "--speculative-num-draft-tokens": (
             server_args.speculative_num_draft_tokens,
-            1,
+            2,
         ),
     }
     for flag, (value, required) in conflicts.items():
@@ -185,11 +185,17 @@ def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
             )
     server_args.speculative_num_steps = 1
     server_args.speculative_eagle_topk = 1
-    server_args.speculative_num_draft_tokens = 1
+    # Internally use EAGLE's allocation/metadata machinery, but the OasisKV
+    # verify path below hard-commits one root token and never accepts a draft.
+    server_args.speculative_num_draft_tokens = 2
+    server_args.speculative_algorithm = "EAGLE3"
+    # PR12 is the synchronous correctness baseline.  Paired metadata has a
+    # distinct 2B shape and intentionally does not enter decode/verify graphs.
+    server_args.disable_cuda_graph = True
     server_args.is_oasiskv_lookahead = True
     logger.info(
         "OasisKV LOOKAHEAD_ONLY enabled: EAGLE-3 steps=1 topk=1; "
-        "acceptance/verification disabled"
+        "draft acceptance/rejection disabled"
     )
 
 

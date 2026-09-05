@@ -1952,6 +1952,15 @@ class DeepseekV4DecoderLayer(nn.Module):
                 x_quant=x_quant,
             )
 
+        # The C4 indexer runs before attention so its normal Top-K can select
+        # the current working set.  Draft Top-K H2D is intentionally launched
+        # only now: overwriting a selected slot while attention reads it would
+        # race the current normal/draft pair.
+        pending = getattr(forward_batch, "_oasiskv_pending_prefetch", None)
+        if pending is not None and self.layer_id in pending:
+            coordinator, kwargs = pending.pop(self.layer_id)
+            coordinator.submit_oasiskv_prefetch(**kwargs)
+
         if use_fused:
             fused_mhc = try_fused_hc_post_pre(
                 hidden_states,
