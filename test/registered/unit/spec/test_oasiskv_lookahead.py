@@ -6,7 +6,13 @@ import torch
 from sglang.srt.arg_groups.speculative_hook import _handle_oasiskv_lookahead
 from sglang.srt.speculative.oasiskv_lookahead import (
     OasisKVAttentionView,
+    OasisKVFeatureStore,
+    OasisKVLayerOutput,
     OasisKVLookaheadLane,
+    OasisKVPairedBatch,
+    OasisKVPairedOutput,
+    OasisKVPairedTargetExecutor,
+    paired_causal_mask,
 )
 from sglang.srt.managers.hisparse_coordinator import OasisKVPrefetchTask
 from sglang.srt.managers.hisparse_prefetcher import HiSparsePrefetchStats
@@ -44,52 +50,158 @@ def test_oasiskv_requires_draft_path_and_rejects_spec_verification():
         _handle_oasiskv_lookahead(_args(speculative_num_steps=2))
 
 
-def test_draft_query_is_target_generated_and_state_is_not_committed():
-    state = {"tokens": [7], "kv": [11], "page_table": [3]}
+def test_paired_forward_generates_target_query_and_commits_no_draft_state():
+    draft_state = {"scratch": []}
     calls = []
     submitted = []
+    shared_pages = object()
+    store = OasisKVFeatureStore()
+    store.put(2, 8, "prefill-normal-features")
 
-    def target_no_commit(**kwargs):
-        calls.append(kwargs)
-        return {5: "target-layer-5-query"}
+    def paired_forward(batch):
+        calls.append(batch)
+        assert batch.positions == (9, 10)
+        return OasisKVPairedOutput(
+            normal_output=43,
+            normal_features=["next-normal-features"],
+            draft_queries={5: "target-layer-5-draft-query"},
+            normal_sparse_locations={5: shared_pages},
+            draft_sparse_locations={5: shared_pages},
+        )
 
     lane = OasisKVLookaheadLane(
-        eagle3_draft_one=lambda **_: 42,
-        target_no_commit=target_no_commit,
+        eagle3_draft_one=lambda **_: [42],
+        paired_target_forward=paired_forward,
         target_c4_predict=lambda layer, query: [(layer, query)],
         submit_prefetch=lambda **kwargs: submitted.append(kwargs),
-        snapshot_committed_state=lambda: repr(state),
+        snapshot_draft_state=lambda: repr(draft_state),
+        feature_store=store,
     )
     view = OasisKVAttentionView("same-c4", "same-c128", "same-swa", "same-local", 9)
-    predictions = lane.run(
-        normal_hidden_states="normal",
+    normal_output, predictions = lane.run(
+        normal_tokens=[7],
         attention_view=view,
+        request_slots=[2],
+        generations=[8],
         request_metadata={"slot": 2, "generation": 8},
     )
-    assert calls[0]["token"] == 42
-    assert calls[0]["attention_view"] is view
-    assert calls[0]["commit"] is False and calls[0]["scratch_kv"] is True
-    assert predictions[0].c4_entries == [(5, "target-layer-5-query")]
+    assert normal_output == 43
+    assert calls[0].draft_tokens == [42]
+    assert calls[0].attention_view is view
+    assert predictions[0].c4_entries == [(5, "target-layer-5-draft-query")]
     assert predictions[0].target_token_positions == 10
-    assert state == {"tokens": [7], "kv": [11], "page_table": [3]}
+    assert draft_state == {"scratch": []}
+    assert store.get(2, 8) == "next-normal-features"
     assert submitted[0]["prediction"].layer_id == 5
+    assert lane.profile.paired_decode_steps == 1
+    assert lane.profile.draft_tokens_generated == 1
+    assert lane.profile.target_layer_traversals == 1
+    assert lane.profile.draft_c4_predictions == 1
+    assert lane.profile.speculative_acceptance == 0
 
 
-def test_mutating_draft_forward_is_rejected():
+def test_leaking_draft_scratch_is_rejected():
     state = []
+    store = OasisKVFeatureStore()
+    store.put(0, 0, "feature")
     lane = OasisKVLookaheadLane(
-        eagle3_draft_one=lambda **_: 1,
-        target_no_commit=lambda **_: state.append(1) or {},
+        eagle3_draft_one=lambda **_: [1],
+        paired_target_forward=lambda _: state.append(1)
+        or OasisKVPairedOutput(None, [None], {}, {}, {}),
         target_c4_predict=lambda *_: [],
         submit_prefetch=lambda **_: None,
-        snapshot_committed_state=lambda: tuple(state),
+        snapshot_draft_state=lambda: tuple(state),
+        feature_store=store,
     )
-    with pytest.raises(RuntimeError, match="mutated committed state"):
+    with pytest.raises(RuntimeError, match="leaked draft scratch"):
         lane.run(
-            normal_hidden_states=None,
+            normal_tokens=[1],
             attention_view=OasisKVAttentionView(None, None, None, None, 1),
+            request_slots=[0],
+            generations=[0],
             request_metadata={},
         )
+
+
+def test_missing_feature_skips_draft_and_slot_reuse_clears_stale_feature():
+    store = OasisKVFeatureStore()
+    store.put(3, 1, "old")
+    store.put(3, 2, "new")
+    assert store.get(3, 1) is None
+    paired_calls = []
+    lane = OasisKVLookaheadLane(
+        eagle3_draft_one=lambda **_: pytest.fail("must not synthesize a draft"),
+        paired_target_forward=lambda batch: paired_calls.append(batch),
+        target_c4_predict=lambda *_: [],
+        submit_prefetch=lambda **_: None,
+        snapshot_draft_state=lambda: (),
+        feature_store=store,
+    )
+    output, predictions = lane.run(
+        normal_tokens=[1, 2],
+        attention_view=OasisKVAttentionView(
+            None, None, None, None, torch.tensor([4, 8])
+        ),
+        request_slots=[3, 9],
+        generations=[2, 0],
+        request_metadata={},
+    )
+    assert output is None and predictions == [] and paired_calls == []
+
+
+def test_different_draft_sparse_pages_are_rejected():
+    store = OasisKVFeatureStore()
+    store.put(0, 0, "feature")
+    lane = OasisKVLookaheadLane(
+        eagle3_draft_one=lambda **_: [2],
+        paired_target_forward=lambda _: OasisKVPairedOutput(
+            None, ["f"], {0: "q"}, {0: object()}, {0: object()}
+        ),
+        target_c4_predict=lambda *_: [],
+        submit_prefetch=lambda **_: None,
+        snapshot_draft_state=lambda: (),
+        feature_store=store,
+    )
+    with pytest.raises(RuntimeError, match="different sparse working set"):
+        lane.run(
+            normal_tokens=[1],
+            attention_view=OasisKVAttentionView(None, None, None, None, 4),
+            request_slots=[0],
+            generations=[0],
+            request_metadata={},
+        )
+
+
+def test_reference_causal_mask_and_single_layer_traversal():
+    mask = paired_causal_mask([2, 4])
+    assert mask[0, 0].tolist() == [True, True, True, False, False, False]
+    assert mask[0, 1].tolist() == [True, True, True, True, False, False]
+    calls = []
+    shared = [object(), object()]
+
+    def run_layer(*, layer, hidden_states, batch, causal_mask):
+        calls.append((layer, hidden_states, causal_mask))
+        return OasisKVLayerOutput(hidden_states, f"target-q-{layer}", shared[layer])
+
+    executor = OasisKVPairedTargetExecutor(
+        layers=[0, 1],
+        run_layer=run_layer,
+        commit_normal=lambda hidden, **_: (hidden, ["a", "b"]),
+    )
+    output = executor(
+        OasisKVPairedBatch(
+            request_slots=[7, 9],
+            generations=[1, 3],
+            normal_tokens=[10, 11],
+            draft_tokens=[12, 13],
+            committed_lens=[2, 4],
+            positions=([2, 4], [3, 5]),
+            attention_view=OasisKVAttentionView(None, None, None, None, [2, 4]),
+        )
+    )
+    assert len(calls) == executor.layer_calls == 2
+    assert output.draft_queries == {0: "target-q-0", 1: "target-q-1"}
+    assert output.normal_sparse_locations[0] is output.draft_sparse_locations[0]
 
 
 def test_prefetch_identity_rejects_slot_generation_and_position_reuse():

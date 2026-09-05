@@ -134,6 +134,9 @@ class OasisKVPrefetchTask:
             and self.layer_id == layer_id
             and torch.equal(self.req_slots, req_slots)
             and torch.equal(self.generations, generations)
+            # The paired step starts with history length L.  It commits normal
+            # at position L, so the following step has committed length L+1
+            # and its normal token also occupies position L+1.
             and torch.equal(self.source_lens + 1, committed_lens)
             and torch.equal(self.target_positions, token_positions)
         )
@@ -1570,6 +1573,9 @@ class HiSparseCoordinator:
         task.source_lens = torch.as_tensor(
             source_committed_lens_cpu, dtype=torch.int64, device="cpu"
         ).clone()
+        # source_lens is the history before this paired normal.  The draft C4
+        # query predicts the following normal, whose zero-based position and
+        # pre-forward committed length are both source_lens + 1.
         task.target_positions = task.source_lens + 1
         task.submitted_entries = num_reqs * self.prefetcher.logical_entries
         task.valid = True
