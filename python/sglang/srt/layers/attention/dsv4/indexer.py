@@ -965,6 +965,8 @@ class C4IndexerBackendMixin:
                             top_k_result=raw_indices,
                             layer_id=compress_layer_id,
                             prefetch_candidates=prefetch_candidates,
+                            req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
+                            committed_lens_cpu=forward_batch.seq_lens_cpu,
                         )
                     )
             else:

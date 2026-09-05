@@ -2261,6 +2261,8 @@ class DeepseekSparseAttnBackend(
                 forward_batch.seq_lens,
                 topk_indices,
                 layer.layer_id,
+                req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
+                committed_lens_cpu=forward_batch.seq_lens_cpu,
             )
         elif self.use_fused_topk:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
