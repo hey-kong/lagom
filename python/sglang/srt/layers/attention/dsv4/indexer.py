@@ -927,6 +927,15 @@ class C4IndexerBackendMixin:
             compress_layer_id = token_to_kv_pool.layer_mapping[
                 c4_indexer.layer_id
             ].compress_layer_id
+            # The previous pair may already have installed resident/LRU
+            # mappings on the prefetch stream.  Join every writer event before
+            # planning fallback misses or exposing those slots to attention.
+            hisparse_coordinator.consume_oasiskv_prefetch(
+                req_pool_indices=forward_batch.req_pool_indices,
+                layer_id=compress_layer_id,
+                req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
+                committed_lens_cpu=forward_batch.seq_lens_cpu,
+            )
             normal_raw = raw_indices[normal_rows]
             normal_lens = indexer_metadata.c4_seq_lens[normal_rows]
             logical_normal = c4_sparse_page_indices[normal_rows].clone()

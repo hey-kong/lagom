@@ -9,7 +9,10 @@ from sglang.srt.speculative.oasiskv_lookahead import (
     configure_oasiskv_forward_batch,
     paired_batch_from_eagle_verify,
 )
-from sglang.srt.managers.hisparse_coordinator import OasisKVPrefetchTask
+from sglang.srt.managers.hisparse_coordinator import (
+    OasisKVPrefetchTask,
+    is_hisparse_prefetcher_mode_unsupported,
+)
 from sglang.srt.managers.hisparse_prefetcher import HiSparsePrefetchStats
 
 
@@ -44,6 +47,18 @@ def test_oasiskv_requires_draft_path_and_rejects_spec_verification():
         _handle_oasiskv_lookahead(_args(speculative_algorithm="EAGLE3"))
     with pytest.raises(ValueError, match="num-steps=1"):
         _handle_oasiskv_lookahead(_args(speculative_num_steps=2))
+
+
+def test_oasiskv_allows_internal_speculative_scratch_but_still_rejects_pp():
+    assert not is_hisparse_prefetcher_mode_unsupported(
+        "oasiskv", pp_size=1, is_speculative=True
+    )
+    assert is_hisparse_prefetcher_mode_unsupported(
+        "previous", pp_size=1, is_speculative=True
+    )
+    assert is_hisparse_prefetcher_mode_unsupported(
+        "oasiskv", pp_size=2, is_speculative=True
+    )
 
 
 def test_paired_row_mapping_and_positions():
@@ -173,9 +188,9 @@ def test_consume_finds_second_slot_and_waits_every_layer_writer(monkeypatch):
         coordinator_module.device_module, "current_stream", lambda: "compute"
     )
 
-    coordinator._consume_previous_prefetch(
-        torch.tensor([2], device="cpu"),
-        0,
+    coordinator.consume_oasiskv_prefetch(
+        req_pool_indices=torch.tensor([2], device="cpu"),
+        layer_id=0,
         req_pool_indices_cpu=torch.tensor([2]),
         committed_lens_cpu=torch.tensor([11]),
     )
@@ -183,6 +198,7 @@ def test_consume_finds_second_slot_and_waits_every_layer_writer(monkeypatch):
     assert calls == [("wait", "stale"), ("wait", "current")]
     assert not stale.valid and not current.valid
     assert coordinator.prefetcher.stats.completed_h2d_entries == 8
+    assert coordinator.prefetcher.stats.prefetch_hits == 1
     assert coordinator.prefetcher.stats.stale_tasks == 1
 
 
