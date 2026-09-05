@@ -9,6 +9,7 @@ from sglang.srt.speculative.oasiskv_lookahead import (
     OasisKVLookaheadLane,
 )
 from sglang.srt.managers.hisparse_coordinator import OasisKVPrefetchTask
+from sglang.srt.managers.hisparse_prefetcher import HiSparsePrefetchStats
 
 
 def _args(**overrides):
@@ -122,3 +123,89 @@ def test_prefetch_identity_rejects_slot_generation_and_position_reuse():
     assert not matches(slots=(7, 2))  # same batch size, different requests
     assert not matches(generations=(5, 9))  # scheduler slot was reused
     assert not matches(lens=(12, 21))  # decode advanced past the prediction
+
+
+class _FakeEvent:
+    def __init__(self, name, calls):
+        self.name = name
+        self.calls = calls
+
+    def wait(self, _stream):
+        self.calls.append(("wait", self.name))
+
+    def synchronize(self):
+        self.calls.append(("synchronize", self.name))
+
+
+def _task(name, calls, *, slots, generations, source_lens, ring_slot):
+    return OasisKVPrefetchTask(
+        layer_id=0,
+        ring_slot=ring_slot,
+        req_slots=torch.tensor(slots),
+        generations=torch.tensor(generations),
+        source_lens=torch.tensor(source_lens),
+        target_positions=torch.tensor(source_lens) + 1,
+        predicted_entries=None,
+        device_locs=None,
+        miss_src=None,
+        miss_dst=None,
+        miss_count=None,
+        event=_FakeEvent(name, calls),
+        submitted_entries=8,
+        valid=True,
+    )
+
+
+def test_consume_finds_second_slot_and_waits_every_layer_writer(monkeypatch):
+    import sglang.srt.managers.hisparse_coordinator as coordinator_module
+
+    calls = []
+    coordinator = object.__new__(coordinator_module.HiSparseCoordinator)
+    coordinator.prefetcher_name = "oasiskv"
+    coordinator.prefetcher = SimpleNamespace(stats=HiSparsePrefetchStats())
+    coordinator._prefetch_generation = torch.tensor([0, 0, 4])
+    stale = _task(
+        "stale", calls, slots=[1], generations=[0], source_lens=[10], ring_slot=0
+    )
+    current = _task(
+        "current", calls, slots=[2], generations=[4], source_lens=[10], ring_slot=1
+    )
+    coordinator._oasiskv_ring = [[stale, current]]
+    monkeypatch.setattr(
+        coordinator_module.device_module, "current_stream", lambda: "compute"
+    )
+
+    coordinator._consume_previous_prefetch(
+        torch.tensor([2], device="cpu"),
+        0,
+        req_pool_indices_cpu=torch.tensor([2]),
+        committed_lens_cpu=torch.tensor([11]),
+    )
+
+    assert calls == [("wait", "stale"), ("wait", "current")]
+    assert not stale.valid and not current.valid
+    assert coordinator.prefetcher.stats.completed_h2d_entries == 8
+    assert coordinator.prefetcher.stats.stale_tasks == 1
+
+
+def test_ring_rotation_and_request_drain_use_cpu_event_sync():
+    import sglang.srt.managers.hisparse_coordinator as coordinator_module
+
+    calls = []
+    coordinator = object.__new__(coordinator_module.HiSparseCoordinator)
+    coordinator.prefetcher = SimpleNamespace(stats=HiSparsePrefetchStats())
+    first = _task(
+        "first", calls, slots=[3], generations=[0], source_lens=[1], ring_slot=0
+    )
+    second = _task(
+        "second", calls, slots=[4], generations=[0], source_lens=[1], ring_slot=1
+    )
+    coordinator._oasiskv_ring = [[first, second]]
+    coordinator._oasiskv_next_slot = [0]
+
+    assert coordinator._acquire_oasiskv_ring_task(0) is first
+    assert coordinator._acquire_oasiskv_ring_task(0) is second
+    coordinator._drain_oasiskv_tasks_for_request(3)
+
+    assert calls == [("synchronize", "first")]
+    assert not first.valid and second.valid

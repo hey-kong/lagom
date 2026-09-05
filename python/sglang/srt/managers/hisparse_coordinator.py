@@ -1,7 +1,6 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-import time
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, NamedTuple, Optional, Tuple, Union
 
@@ -579,6 +578,24 @@ class HiSparseCoordinator:
                         )
                     self._oasiskv_ring.append(layer_slots)
                 self._oasiskv_next_slot = [0] * self.mem_pool_device.layer_num
+                ring_bytes = sum(
+                    tensor.numel() * tensor.element_size()
+                    for layer_slots in self._oasiskv_ring
+                    for task in layer_slots
+                    for tensor in (
+                        task.predicted_entries,
+                        task.device_locs,
+                        task.miss_src,
+                        task.miss_dst,
+                        task.miss_count,
+                    )
+                )
+                logger.info(
+                    "OasisKV: allocated %.2f MiB for %d C4 layers' "
+                    "two-slot prefetch rings",
+                    ring_bytes / (1024 * 1024),
+                    self.mem_pool_device.layer_num,
+                )
             logger.info(
                 "HiSparse Previous Prefetcher: %d-token coverage maps to %d "
                 "logical KV entries per request (entry span=%d tokens); Indexer "
@@ -1190,6 +1207,7 @@ class HiSparseCoordinator:
         ]
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
+        self._drain_oasiskv_tasks_for_request(req.req_pool_idx)
 
         prefill_len = req.extend_range.end
         allocated_locs = self.req_to_token_pool.req_to_token[
@@ -1216,11 +1234,31 @@ class HiSparseCoordinator:
         else:
             self.request_finished(req)
 
+    def _drain_oasiskv_tasks_for_request(self, req_pool_idx: int) -> None:
+        """CPU-block until DMA touching a request is safe to reclaim.
+
+        A CUDA ``event.wait(current_stream)`` only enqueues a dependency and is
+        insufficient here: the host allocator runs immediately on the CPU.
+        Request finish is a slow path, so synchronizing the few matching task
+        events is preferable to a global device/stream synchronization.
+        """
+        if getattr(self, "_oasiskv_ring", None) is None:
+            return
+        for layer_slots in self._oasiskv_ring:
+            for task in layer_slots:
+                if task.valid and bool((task.req_slots == req_pool_idx).any()):
+                    task.event.synchronize()
+                    task.valid = False
+                    self.prefetcher.stats.stale_tasks += 1
+
     def request_finished(self, req: Req):
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
         self.wait_for_pending_backup()
+        # This must precede *all* device mapping and host-page reclamation:
+        # OasisKV DMA reads the request's host pages and writes resident slots.
+        self._drain_oasiskv_tasks_for_request(req.req_pool_idx)
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
         # allocator can over-allocate beyond the committed seqlen, and those
@@ -1264,16 +1302,10 @@ class HiSparseCoordinator:
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
         if self.prefetcher is not None:
-            if self.prefetcher_name == "oasiskv" and self._oasiskv_ring is not None:
-                for layer_slots in self._oasiskv_ring:
-                    for task in layer_slots:
-                        if task.valid and bool(
-                            (task.req_slots == req.req_pool_idx).any()
-                        ):
-                            task.event.wait(device_module.current_stream())
-                            task.valid = False
-                            self.prefetcher.stats.stale_tasks += 1
-            elif self._previous_prefetch_pending_entries:
+            if (
+                self.prefetcher_name != "oasiskv"
+                and self._previous_prefetch_pending_entries
+            ):
                 self._previous_prefetch_event.wait(device_module.current_stream())
                 self._previous_prefetch_pending_entries = 0
                 self._previous_prefetch_target_layer = None
@@ -1352,14 +1384,14 @@ class HiSparseCoordinator:
         if self.prefetcher_name == "oasiskv":
             if self._oasiskv_ring is None:
                 return
-            slots = self._oasiskv_ring[layer_id]
-            task = next((item for item in slots if item.valid), None)
-            if task is None:
+            valid_tasks = [task for task in self._oasiskv_ring[layer_id] if task.valid]
+            if not valid_tasks:
                 return
             if req_pool_indices_cpu is None or committed_lens_cpu is None:
-                task.event.wait(device_module.current_stream())
-                task.valid = False
-                self.prefetcher.stats.stale_tasks += 1
+                for task in valid_tasks:
+                    task.event.wait(device_module.current_stream())
+                    task.valid = False
+                self.prefetcher.stats.stale_tasks += len(valid_tasks)
                 return
             cpu_slots = torch.as_tensor(
                 req_pool_indices_cpu, dtype=torch.int64, device="cpu"
@@ -1370,25 +1402,40 @@ class HiSparseCoordinator:
             generations = self._prefetch_generation[cpu_slots]
             # The real token at committed length L occupies position L.  The
             # prediction made with source length L-1 targets that exact row.
-            if not task.matches(
-                layer_id=layer_id,
-                req_slots=cpu_slots,
-                generations=generations,
-                committed_lens=cpu_lens,
-                token_positions=cpu_lens,
-            ):
-                # RESOLVE has already published resident mappings.  Order the
-                # fallback behind its copy before allowing those mappings to be
-                # observed, even though none of its hits are credited.
+            matching_task = next(
+                (
+                    task
+                    for task in valid_tasks
+                    if task.matches(
+                        layer_id=layer_id,
+                        req_slots=cpu_slots,
+                        generations=generations,
+                        committed_lens=cpu_lens,
+                        token_positions=cpu_lens,
+                    )
+                ),
+                None,
+            )
+            # Every valid task for this layer may have updated the same
+            # resident mapping/buffer.  Queue dependencies for all of them
+            # before either the real fallback or attention is allowed to run.
+            for task in valid_tasks:
                 task.event.wait(device_module.current_stream())
                 task.valid = False
-                self.prefetcher.stats.stale_tasks += 1
+                if task is not matching_task:
+                    self.prefetcher.stats.stale_tasks += 1
+
+            if matching_task is None:
+                # Real Top-K still runs its ordinary swap-in fallback.
+                self.prefetcher.stats.prefetch_misses += cpu_slots.numel()
                 return
-            start = time.perf_counter()
-            task.event.wait(device_module.current_stream())
-            self.prefetcher.stats.prefetch_wait_seconds += time.perf_counter() - start
-            self.prefetcher.stats.completed_h2d_entries += task.submitted_entries
-            task.valid = False
+
+            self.prefetcher.stats.completed_h2d_entries += (
+                matching_task.submitted_entries
+            )
+            # This is CPU enqueue time, not GPU wait duration.  CUDA stream
+            # dependencies intentionally remain asynchronous.
+            self.prefetcher.stats.prefetch_wait_submissions += 1
             return
         if (
             self.prefetcher is None
@@ -1483,8 +1530,7 @@ class HiSparseCoordinator:
         ):
             raise ValueError("OasisKV scheduler metadata must use CPU mirror tensors")
         slots = req_pool_indices_cpu.to(torch.int64).clone()
-        ring_slot = self._oasiskv_next_slot[layer_id]
-        task = self._oasiskv_ring[layer_id][ring_slot]
+        task = self._acquire_oasiskv_ring_task(layer_id)
         if task.valid:
             # Never rewrite a plan while the prefetch stream may still read it.
             task.event.wait(device_module.current_stream())
@@ -1527,8 +1573,13 @@ class HiSparseCoordinator:
         task.target_positions = task.source_lens + 1
         task.submitted_entries = num_reqs * self.prefetcher.logical_entries
         task.valid = True
-        self._oasiskv_next_slot[layer_id] = 1 - ring_slot
         self.prefetcher.stats.submitted_entries += task.submitted_entries
+
+    def _acquire_oasiskv_ring_task(self, layer_id: int) -> OasisKVPrefetchTask:
+        """Rotate one layer's ring without exposing a still-busy plan buffer."""
+        ring_slot = self._oasiskv_next_slot[layer_id]
+        self._oasiskv_next_slot[layer_id] = 1 - ring_slot
+        return self._oasiskv_ring[layer_id][ring_slot]
 
     def _submit_previous_prefetch_to_layer(
         self, req_pool_indices, compressed_seq_lens, candidates, target_layer
