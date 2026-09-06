@@ -952,13 +952,15 @@ class ModelRunner:
             # The candidate tensor and side-stream miss plan change every decode
             # step; capturing one would replay stale preceding-layer positions.
             if self.hisparse_coordinator.prefetcher_name == "oasiskv":
-                # OasisKV stages its per-replay identities before graph launch
-                # and publishes graph-produced draft candidates afterwards.
-                # Unlike the generic preceding-layer prefetcher, no Python
-                # miss-plan state is captured and replayed stale.
+                # OasisKV owns graph-stable prediction buffers and replaces
+                # their request identities around every replay. Previous H2D
+                # writers are joined before replay and graph-produced plans
+                # are published afterwards, so no stale Python descriptor is
+                # captured. Users can still select the eager layer-pipelined
+                # path with --disable-cuda-graph for direct A/B measurement.
                 logger.info(
-                    "OasisKV paired target verify is eligible for CUDA Graph "
-                    "with staged prefetch inputs and outputs."
+                    "OasisKV paired target verify is eligible for CUDA Graph; "
+                    "use --disable-cuda-graph to benchmark layer-local eager prefetch."
                 )
             else:
                 disable_decode_graph_reason = (

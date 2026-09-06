@@ -5,11 +5,13 @@ import torch
 
 from sglang.srt.arg_groups.speculative_hook import _handle_oasiskv_lookahead
 from sglang.srt.speculative.oasiskv_lookahead import (
+    build_oasiskv_commit,
     build_oasiskv_paired_batch,
     compute_oasiskv_logprobs,
     configure_oasiskv_forward_batch,
     paired_batch_from_eagle_verify,
     select_oasiskv_normal_rows,
+    submit_oasiskv_layer_prefetch,
     submit_oasiskv_pending_prefetches,
 )
 from sglang.srt.managers.hisparse_coordinator import (
@@ -142,6 +144,52 @@ def test_draft_extend_keeps_only_normal_target_features_and_cache_locs():
     assert select_oasiskv_normal_rows(cache_locs).tolist() == [100, 200]
 
 
+def test_commit_is_always_one_request_major_normal_row():
+    accept_lens, accept_index = build_oasiskv_commit(
+        torch.tensor([0, 2, 4]), batch_size=3, device="cpu"
+    )
+    assert accept_lens.tolist() == [1, 1, 1]
+    assert accept_index.tolist() == [[0], [2], [4]]
+
+    with pytest.raises(ValueError, match="pair roots"):
+        build_oasiskv_commit(torch.tensor([0, 1, 4]), batch_size=3, device="cpu")
+
+
+def test_logits_processor_selects_only_normal_rows_for_oasiskv():
+    from sglang.srt.layers.logits_processor import LogitsMetadata
+
+    normal_rows = torch.tensor([0, 2])
+    metadata = LogitsMetadata.from_forward_batch(
+        SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_extend=lambda: False,
+                is_target_verify=lambda: True,
+                is_draft_extend_v2=lambda: False,
+            ),
+            return_logprob=False,
+            capture_hidden_mode=0,
+            next_token_logits_buffer=None,
+            extend_seq_lens=None,
+            extend_seq_lens_cpu=None,
+            extend_logprob_start_lens_cpu=None,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            extend_input_logprob_token_ids_gpu=None,
+            is_prefill_only=False,
+            global_num_tokens_gpu=None,
+            dp_local_start_pos=None,
+            dp_local_num_tokens=None,
+            global_dp_buffer_len=None,
+            global_num_tokens_for_logprob_cpu=None,
+            global_num_tokens_for_logprob_gpu=None,
+            mm_input_embeds=None,
+            is_oasiskv_paired=True,
+            oasiskv_normal_rows=normal_rows,
+        )
+    )
+    assert metadata.output_select_index is normal_rows
+
+
 def test_logprobs_use_compacted_normal_rows_not_verify_pair_indices():
     batch = SimpleNamespace(
         seq_lens=torch.tensor([7, 13]),
@@ -180,6 +228,38 @@ def test_pending_prefetch_is_drained_once_after_verify_transaction():
 
     assert calls == [3, 7]
     assert forward_batch._oasiskv_pending_prefetch == {}
+
+
+def test_eager_layer_prefetch_launches_immediately_without_c4_transaction():
+    calls = []
+    coordinator = SimpleNamespace(
+        _active_dspark_window=None,
+        submit_oasiskv_prefetch=lambda **kwargs: calls.append(kwargs["layer_id"]),
+    )
+    forward_batch = SimpleNamespace(
+        is_oasiskv_graph_capture=False,
+        _oasiskv_pending_prefetch={3: (coordinator, {"layer_id": 3})},
+    )
+
+    assert submit_oasiskv_layer_prefetch(forward_batch, 3)
+    assert calls == [3]
+    assert forward_batch._oasiskv_pending_prefetch == {}
+
+
+def test_layer_prefetch_defers_while_c4_commit_owns_destinations():
+    calls = []
+    coordinator = SimpleNamespace(
+        _active_dspark_window=object(),
+        submit_oasiskv_prefetch=lambda **kwargs: calls.append(kwargs),
+    )
+    pending = {3: (coordinator, {"layer_id": 3})}
+    forward_batch = SimpleNamespace(
+        is_oasiskv_graph_capture=False, _oasiskv_pending_prefetch=pending
+    )
+
+    assert not submit_oasiskv_layer_prefetch(forward_batch, 3)
+    assert not calls
+    assert forward_batch._oasiskv_pending_prefetch is pending
 
 
 def test_cuda_graph_replay_joins_all_layers_and_publishes_live_batch_metadata():
@@ -228,6 +308,31 @@ def test_cuda_graph_replay_joins_all_layers_and_publishes_live_batch_metadata():
     assert submitted["source_committed_lens_cpu"] is forward_batch.seq_lens_cpu
     assert submitted["compressed_seq_lens"].tolist() == [7, 13]
     assert submitted["predicted_c4_entries"].tolist() == predicted[:2].tolist()
+
+
+def test_oasiskv_graph_logits_and_hidden_states_have_different_live_widths():
+    """Graph padding must use B for logits but 2B for paired hidden states."""
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        DecodeCudaGraphRunner,
+    )
+
+    runner = object.__new__(DecodeCudaGraphRunner)
+    runner.is_dllm = False
+    runner.raw_num_token = 4
+    runner.bs = 4
+    graph_output = LogitsProcessorOutput(
+        next_token_logits=torch.arange(24).view(6, 4),
+        hidden_states=torch.arange(32).view(8, 4),
+    )
+    forward_batch = SimpleNamespace(is_oasiskv_paired=True, batch_size=2)
+
+    # Exercise the same output-compaction block without constructing a CUDA
+    # graph backend: the helper is deliberately factored for CPU regression.
+    compact = runner._slice_replay_output(graph_output, forward_batch)
+
+    assert compact.next_token_logits.shape == (2, 4)
+    assert compact.hidden_states.shape == (4, 4)
 
 
 def test_prefetch_identity_rejects_slot_generation_and_position_reuse():

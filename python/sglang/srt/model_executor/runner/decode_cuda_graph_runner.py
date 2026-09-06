@@ -1485,6 +1485,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.POST_REPLAY:
                 self._publish_read_done(in_graph=False)
 
+        return self._slice_replay_output(output, forward_batch)
+
+    def _slice_replay_output(self, output, forward_batch: ForwardBatch):
+        """Remove graph-bucket padding while preserving output row semantics."""
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None
@@ -1495,8 +1499,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             else:
                 full_logits = None
+                # OasisKV prunes the paired 2B hidden rows to B normal rows
+                # before the LM head. ``raw_num_token`` still describes the
+                # paired hidden-state output, so using it for logits preserves
+                # graph-bucket padding and violates the root-only contract.
+                raw_num_logits = (
+                    forward_batch.batch_size
+                    if getattr(forward_batch, "is_oasiskv_paired", False)
+                    else self.raw_num_token
+                )
                 next_token_logits = (
-                    output.next_token_logits[: self.raw_num_token]
+                    output.next_token_logits[:raw_num_logits]
                     if output.next_token_logits is not None
                     else None
                 )
