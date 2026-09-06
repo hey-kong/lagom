@@ -38,6 +38,23 @@ def select_oasiskv_normal_rows(
     return tensor[::pair_width].contiguous()
 
 
+def compute_oasiskv_logprobs(
+    batch: Any, logits_output: Any, predict: torch.Tensor
+) -> None:
+    """Compute logprobs for the one committed token in each paired request.
+
+    ``run_eagle_verify`` has already compacted both ``next_token_logits`` and
+    ``predict`` to B normal rows by the time this is called.  EAGLE's usual
+    ``accept_index`` still contains indices into the original 2B verify tensor
+    (``[0, 2, ...]``), so using it here would either select another request's
+    row or read past the compacted tensors.  A width-one chain describes the
+    committed output layout directly and deliberately excludes every draft.
+    """
+    from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+
+    compute_spec_logprobs(batch, logits_output, predict, chain_stride=1)
+
+
 def submit_oasiskv_pending_prefetches(forward_batch: Any) -> None:
     """Launch draft predictions after target attention and C4 commit complete."""
     pending = getattr(forward_batch, "_oasiskv_pending_prefetch", None)

@@ -6,6 +6,7 @@ import torch
 from sglang.srt.arg_groups.speculative_hook import _handle_oasiskv_lookahead
 from sglang.srt.speculative.oasiskv_lookahead import (
     build_oasiskv_paired_batch,
+    compute_oasiskv_logprobs,
     configure_oasiskv_forward_batch,
     paired_batch_from_eagle_verify,
     select_oasiskv_normal_rows,
@@ -27,6 +28,8 @@ def _args(**overrides):
         speculative_num_steps=None,
         speculative_eagle_topk=None,
         speculative_num_draft_tokens=None,
+        enforce_disable_flashinfer_allreduce_fusion=False,
+        disable_cuda_graph=False,
         is_oasiskv_lookahead=False,
     )
     values.update(overrides)
@@ -40,6 +43,8 @@ def test_oasiskv_resolves_dedicated_lookahead_mode():
     assert args.speculative_algorithm == "EAGLE3"
     assert (args.speculative_num_steps, args.speculative_eagle_topk) == (1, 1)
     assert args.speculative_num_draft_tokens == 2
+    assert args.enforce_disable_flashinfer_allreduce_fusion
+    assert not args.disable_cuda_graph
 
 
 def test_oasiskv_requires_draft_path_and_rejects_spec_verification():
@@ -137,6 +142,27 @@ def test_draft_extend_keeps_only_normal_target_features_and_cache_locs():
     assert select_oasiskv_normal_rows(cache_locs).tolist() == [100, 200]
 
 
+def test_logprobs_use_compacted_normal_rows_not_verify_pair_indices():
+    batch = SimpleNamespace(
+        seq_lens=torch.tensor([7, 13]),
+        sampling_info=SimpleNamespace(is_all_greedy=True),
+        top_logprobs_nums=None,
+        token_ids_logprobs=None,
+    )
+    logits_output = SimpleNamespace(
+        # These are already the compacted normal rows for requests 0 and 1.
+        next_token_logits=torch.tensor([[2.0, 0.0], [0.0, 3.0]])
+    )
+
+    compute_oasiskv_logprobs(batch, logits_output, torch.tensor([0, 1]))
+
+    expected = torch.log_softmax(logits_output.next_token_logits, dim=-1)[
+        torch.arange(2), torch.tensor([0, 1])
+    ]
+    assert logits_output.next_token_logprobs.shape == (2, 1)
+    torch.testing.assert_close(logits_output.next_token_logprobs[:, 0], expected)
+
+
 def test_pending_prefetch_is_drained_once_after_verify_transaction():
     calls = []
     coordinator = SimpleNamespace(
@@ -154,6 +180,54 @@ def test_pending_prefetch_is_drained_once_after_verify_transaction():
 
     assert calls == [3, 7]
     assert forward_batch._oasiskv_pending_prefetch == {}
+
+
+def test_cuda_graph_replay_joins_all_layers_and_publishes_live_batch_metadata():
+    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        DecodeCudaGraphRunner,
+    )
+
+    consume_calls = []
+    coordinator = SimpleNamespace(
+        prefetcher_name="oasiskv",
+        mem_pool_device=SimpleNamespace(layer_num=2),
+        consume_oasiskv_prefetch=lambda **kwargs: consume_calls.append(kwargs),
+    )
+    runner = object.__new__(DecodeCudaGraphRunner)
+    runner.model_runner = SimpleNamespace(hisparse_coordinator=coordinator)
+    runner._replay_graph_key = "bs2"
+    predicted = torch.arange(12).view(3, 4)
+    compressed_lens = torch.tensor([7, 13, 0])
+    runner._oasiskv_graph_prefetch = {
+        "bs2": {
+            3: (
+                coordinator,
+                {
+                    "compressed_seq_lens": compressed_lens,
+                    "predicted_c4_entries": predicted,
+                    "layer_id": 1,
+                },
+            )
+        }
+    }
+    forward_batch = SimpleNamespace(
+        is_oasiskv_paired=True,
+        batch_size=2,
+        req_pool_indices=torch.tensor([4, 9]),
+        req_pool_indices_cpu=torch.tensor([4, 9]),
+        seq_lens_cpu=torch.tensor([7, 13]),
+    )
+
+    runner._prepare_oasiskv_graph_replay(forward_batch)
+    runner._publish_oasiskv_graph_prefetch(forward_batch)
+
+    assert [call["layer_id"] for call in consume_calls] == [0, 1]
+    _, submitted = forward_batch._oasiskv_pending_prefetch[3]
+    assert submitted["req_pool_indices"] is forward_batch.req_pool_indices
+    assert submitted["req_pool_indices_cpu"] is forward_batch.req_pool_indices_cpu
+    assert submitted["source_committed_lens_cpu"] is forward_batch.seq_lens_cpu
+    assert submitted["compressed_seq_lens"].tolist() == [7, 13]
+    assert submitted["predicted_c4_entries"].tolist() == predicted[:2].tolist()
 
 
 def test_prefetch_identity_rejects_slot_generation_and_position_reuse():
