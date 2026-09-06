@@ -1912,9 +1912,29 @@ class HiSparseCoordinator:
                 empty, empty, empty, [], req_cpu, [], prefix_cpu
             )
         full_locs = torch.stack(full_locs).to(torch.int64)
+        # ``translate_loc_from_full_to_compressed`` intentionally drops full
+        # locations which are not C4 endpoints.  Keep the CPU ownership arrays
+        # in exactly the same filtered geometry; otherwise accepted indices can
+        # address past ``device_locs`` and trigger an asynchronous CUDA indexing
+        # assert during commit.
+        is_c4_loc = (full_locs + 1) % self.compress_ratio == 0
+        if not bool(torch.all(is_c4_loc)):
+            keep_cpu = is_c4_loc.to("cpu").tolist()
+            full_locs = full_locs[is_c4_loc]
+            req_offsets = [x for x, keep in zip(req_offsets, keep_cpu) if keep]
+            c4_positions = [x for x, keep in zip(c4_positions, keep_cpu) if keep]
+        if full_locs.numel() == 0:
+            empty = torch.empty(0, dtype=torch.int64, device=self.device)
+            return HiSparseDSparkWindow(
+                empty, empty, empty, [], req_cpu, [], prefix_cpu
+            )
         compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
             full_locs
         )
+        if compressed_locs.numel() != len(req_offsets):
+            raise RuntimeError(
+                "HiSparse C4 scratch translation changed verify ownership geometry"
+            )
         mapping = self.mem_pool_device.full_to_hisparse_device_index_mapping
         previous_device_mapping = mapping[compressed_locs].clone()
         if self._dspark_scratch_device_locs is None:
