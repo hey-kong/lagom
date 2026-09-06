@@ -6,6 +6,7 @@ import torch
 from sglang.srt.arg_groups.speculative_hook import _handle_oasiskv_lookahead
 from sglang.srt.speculative.oasiskv_lookahead import (
     build_oasiskv_paired_batch,
+    compute_oasiskv_logprobs,
     configure_oasiskv_forward_batch,
     paired_batch_from_eagle_verify,
     select_oasiskv_normal_rows,
@@ -135,6 +136,27 @@ def test_draft_extend_keeps_only_normal_target_features_and_cache_locs():
 
     assert select_oasiskv_normal_rows(features).tolist() == [[10], [20]]
     assert select_oasiskv_normal_rows(cache_locs).tolist() == [100, 200]
+
+
+def test_logprobs_use_compacted_normal_rows_not_verify_pair_indices():
+    batch = SimpleNamespace(
+        seq_lens=torch.tensor([7, 13]),
+        sampling_info=SimpleNamespace(is_all_greedy=True),
+        top_logprobs_nums=None,
+        token_ids_logprobs=None,
+    )
+    logits_output = SimpleNamespace(
+        # These are already the compacted normal rows for requests 0 and 1.
+        next_token_logits=torch.tensor([[2.0, 0.0], [0.0, 3.0]])
+    )
+
+    compute_oasiskv_logprobs(batch, logits_output, torch.tensor([0, 1]))
+
+    expected = torch.log_softmax(logits_output.next_token_logits, dim=-1)[
+        torch.arange(2), torch.tensor([0, 1])
+    ]
+    assert logits_output.next_token_logprobs.shape == (2, 1)
+    torch.testing.assert_close(logits_output.next_token_logprobs[:, 0], expected)
 
 
 def test_pending_prefetch_is_drained_once_after_verify_transaction():

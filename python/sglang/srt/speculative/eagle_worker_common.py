@@ -698,7 +698,16 @@ def run_eagle_verify(
         bonus_tokens = torch.empty((0,), device=device, dtype=torch.int32)
 
     if batch.return_logprob and not batch.forward_mode.is_idle():
-        compute_spec_logprobs(batch, logits_output, predict, accept_index=accept_index)
+        if oasiskv_lookahead:
+            from sglang.srt.speculative.oasiskv_lookahead import (
+                compute_oasiskv_logprobs,
+            )
+
+            compute_oasiskv_logprobs(batch, logits_output, predict)
+        else:
+            compute_spec_logprobs(
+                batch, logits_output, predict, accept_index=accept_index
+            )
 
     if finalize_tree_path and not batch.forward_mode.is_idle() and topk > 1:
         # topk == 1 needs nothing here: the accepted path is already the front
