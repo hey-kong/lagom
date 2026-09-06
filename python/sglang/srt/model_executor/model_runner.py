@@ -951,10 +951,17 @@ class ModelRunner:
         if self.hisparse_coordinator.prefetcher is not None:
             # The candidate tensor and side-stream miss plan change every decode
             # step; capturing one would replay stale preceding-layer positions.
-            disable_decode_graph_reason = (
-                "HiSparse previous prefetch currently requires eager decode; "
-                "decode CUDA graph capture has been disabled."
-            )
+            if self.hisparse_coordinator.prefetcher_name == "oasiskv":
+                disable_decode_graph_reason = (
+                    "OasisKV paired target verify requires eager decode because "
+                    "its 2B row metadata and side-stream miss plans change each "
+                    "step; EAGLE draft CUDA graphs remain enabled."
+                )
+            else:
+                disable_decode_graph_reason = (
+                    "HiSparse previous prefetch currently requires eager decode; "
+                    "decode CUDA graph capture has been disabled."
+                )
         if disable_decode_graph_reason is not None:
             # ServerArgs is immutable after runtime-context publication. Update
             # both the convenience leaf and the canonical phase config through
