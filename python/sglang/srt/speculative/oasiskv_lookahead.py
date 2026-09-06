@@ -38,6 +38,18 @@ def select_oasiskv_normal_rows(
     return tensor[::pair_width].contiguous()
 
 
+def submit_oasiskv_pending_prefetches(forward_batch: Any) -> None:
+    """Launch draft predictions after target attention and C4 commit complete."""
+    pending = getattr(forward_batch, "_oasiskv_pending_prefetch", None)
+    if not pending:
+        return
+    # Dict insertion order is target-layer execution order. Clear ownership
+    # first so exception cleanup cannot submit any task twice.
+    forward_batch._oasiskv_pending_prefetch = {}
+    for coordinator, kwargs in pending.values():
+        coordinator.submit_oasiskv_prefetch(**kwargs)
+
+
 def build_oasiskv_paired_batch(
     normal_tokens: torch.Tensor,
     draft_tokens: torch.Tensor,

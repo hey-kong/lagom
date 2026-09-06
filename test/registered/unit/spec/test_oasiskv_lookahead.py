@@ -9,6 +9,7 @@ from sglang.srt.speculative.oasiskv_lookahead import (
     configure_oasiskv_forward_batch,
     paired_batch_from_eagle_verify,
     select_oasiskv_normal_rows,
+    submit_oasiskv_pending_prefetches,
 )
 from sglang.srt.managers.hisparse_coordinator import (
     OasisKVPrefetchTask,
@@ -134,6 +135,25 @@ def test_draft_extend_keeps_only_normal_target_features_and_cache_locs():
 
     assert select_oasiskv_normal_rows(features).tolist() == [[10], [20]]
     assert select_oasiskv_normal_rows(cache_locs).tolist() == [100, 200]
+
+
+def test_pending_prefetch_is_drained_once_after_verify_transaction():
+    calls = []
+    coordinator = SimpleNamespace(
+        submit_oasiskv_prefetch=lambda **kwargs: calls.append(kwargs["layer_id"])
+    )
+    forward_batch = SimpleNamespace(
+        _oasiskv_pending_prefetch={
+            3: (coordinator, {"layer_id": 3}),
+            7: (coordinator, {"layer_id": 7}),
+        }
+    )
+
+    submit_oasiskv_pending_prefetches(forward_batch)
+    submit_oasiskv_pending_prefetches(forward_batch)
+
+    assert calls == [3, 7]
+    assert forward_batch._oasiskv_pending_prefetch == {}
 
 
 def test_prefetch_identity_rejects_slot_generation_and_position_reuse():

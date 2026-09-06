@@ -962,9 +962,10 @@ class C4IndexerBackendMixin:
 
             keep = valid.to(torch.bool)
             if torch.any(keep):
-                # Submission must happen after this layer's attention has read
-                # normal_device_locs.  The decoder layer drains this record
-                # immediately after self_attn returns, before entering FFN.
+                # Keep this as data until root-only C4 commit/rollback finishes.
+                # Starting H2D after this layer alone would let the prefetch
+                # stream mutate resident/LRU mappings concurrently with the
+                # still-active verify transaction used by later layers.
                 pending = getattr(forward_batch, "_oasiskv_pending_prefetch", None)
                 if pending is None:
                     pending = {}

@@ -646,6 +646,14 @@ def run_eagle_verify(
                 hisparse_window, accept_lens
             )
             hisparse_committed = True
+        if oasiskv_lookahead:
+            # The verify transaction owns temporary C4 mappings. It must finish
+            # before prefetch updates the same resident/LRU tables.
+            from sglang.srt.speculative.oasiskv_lookahead import (
+                submit_oasiskv_pending_prefetches,
+            )
+
+            submit_oasiskv_pending_prefetches(verify_forward_batch)
     finally:
         if hisparse_window is not None and not hisparse_committed:
             hisparse_coordinator.rollback_dspark_verify_window(hisparse_window)
