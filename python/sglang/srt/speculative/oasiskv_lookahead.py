@@ -55,6 +55,26 @@ def compute_oasiskv_logprobs(
     compute_spec_logprobs(batch, logits_output, predict, chain_stride=1)
 
 
+def build_oasiskv_commit(
+    normal_rows: torch.Tensor, batch_size: int, device: Any
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the fixed-width, root-only commit used by OasisKV.
+
+    Keeping this separate from EAGLE acceptance is an important safety
+    boundary: the lookahead row is useful for its indexer prediction only and
+    must not become committed merely because its token happens to match.
+    """
+    if normal_rows.ndim != 1 or normal_rows.numel() != batch_size:
+        raise ValueError("OasisKV requires exactly one normal row per request")
+    expected = torch.arange(
+        0, 2 * batch_size, 2, dtype=normal_rows.dtype, device=normal_rows.device
+    )
+    if not torch.equal(normal_rows, expected):
+        raise ValueError("OasisKV normal rows must be request-major pair roots")
+    accept_lens = torch.ones(batch_size, dtype=torch.int32, device=device)
+    return accept_lens, normal_rows.reshape(batch_size, 1)
+
+
 def submit_oasiskv_pending_prefetches(forward_batch: Any) -> None:
     """Launch draft predictions after target attention and C4 commit complete."""
     pending = getattr(forward_batch, "_oasiskv_pending_prefetch", None)

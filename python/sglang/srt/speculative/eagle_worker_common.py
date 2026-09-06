@@ -625,14 +625,17 @@ def run_eagle_verify(
         if oasiskv_lookahead:
             # Root/normal rows alone determine generated output.  Draft logits
             # are target probes and never enter accept/reject sampling.
+            from sglang.srt.speculative.oasiskv_lookahead import (
+                build_oasiskv_commit,
+            )
+
             normal_rows = verify_forward_batch.oasiskv_normal_rows
             normal_logits = logits_output.next_token_logits[normal_rows]
             logits_output.next_token_logits = normal_logits
             predict = target_worker.model_runner.sample(
                 logits_output, verify_forward_batch
             ).reshape(-1)
-            accept_lens = torch.ones(bs, dtype=torch.int32, device=device)
-            accept_index = normal_rows.reshape(bs, 1)
+            accept_lens, accept_index = build_oasiskv_commit(normal_rows, bs, device)
         else:
             (
                 predict,

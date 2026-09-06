@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.arg_groups.speculative_hook import _handle_oasiskv_lookahead
 from sglang.srt.speculative.oasiskv_lookahead import (
+    build_oasiskv_commit,
     build_oasiskv_paired_batch,
     compute_oasiskv_logprobs,
     configure_oasiskv_forward_batch,
@@ -140,6 +141,17 @@ def test_draft_extend_keeps_only_normal_target_features_and_cache_locs():
 
     assert select_oasiskv_normal_rows(features).tolist() == [[10], [20]]
     assert select_oasiskv_normal_rows(cache_locs).tolist() == [100, 200]
+
+
+def test_commit_is_always_one_request_major_normal_row():
+    accept_lens, accept_index = build_oasiskv_commit(
+        torch.tensor([0, 2, 4]), batch_size=3, device="cpu"
+    )
+    assert accept_lens.tolist() == [1, 1, 1]
+    assert accept_index.tolist() == [[0], [2], [4]]
+
+    with pytest.raises(ValueError, match="pair roots"):
+        build_oasiskv_commit(torch.tensor([0, 1, 4]), batch_size=3, device="cpu")
 
 
 def test_logprobs_use_compacted_normal_rows_not_verify_pair_indices():
