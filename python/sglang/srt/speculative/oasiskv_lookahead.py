@@ -87,6 +87,31 @@ def submit_oasiskv_pending_prefetches(forward_batch: Any) -> None:
         coordinator.submit_oasiskv_prefetch(**kwargs)
 
 
+def submit_oasiskv_layer_prefetch(forward_batch: Any, layer_id: int) -> bool:
+    """Launch one eager layer's prefetch as soon as its attention is done.
+
+    Most decode steps do not complete a new C4 group and therefore have no
+    transactional scratch mapping to commit.  On those steps, retaining every
+    layer task until the end of the model destroys OasisKV's layer pipeline.
+    C4-boundary steps remain deferred until the root-only commit because their
+    fixed destination slots must not race prefetch eviction or H2D writes.
+
+    CUDA-graph replay publishes its captured task descriptors only after the
+    graph returns, so it naturally continues to use the post-commit drain.
+    """
+    if getattr(forward_batch, "is_oasiskv_graph_capture", False):
+        return False
+    pending = getattr(forward_batch, "_oasiskv_pending_prefetch", None)
+    if not pending or layer_id not in pending:
+        return False
+    coordinator, kwargs = pending[layer_id]
+    if getattr(coordinator, "_active_dspark_window", None) is not None:
+        return False
+    pending.pop(layer_id)
+    coordinator.submit_oasiskv_prefetch(**kwargs)
+    return True
+
+
 def build_oasiskv_paired_batch(
     normal_tokens: torch.Tensor,
     draft_tokens: torch.Tensor,

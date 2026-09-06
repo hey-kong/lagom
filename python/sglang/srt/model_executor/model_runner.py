@@ -952,13 +952,17 @@ class ModelRunner:
             # The candidate tensor and side-stream miss plan change every decode
             # step; capturing one would replay stale preceding-layer positions.
             if self.hisparse_coordinator.prefetcher_name == "oasiskv":
-                # OasisKV stages its per-replay identities before graph launch
-                # and publishes graph-produced draft candidates afterwards.
-                # Unlike the generic preceding-layer prefetcher, no Python
-                # miss-plan state is captured and replayed stale.
-                logger.info(
-                    "OasisKV paired target verify is eligible for CUDA Graph "
-                    "with staged prefetch inputs and outputs."
+                # A monolithic target graph can only join all previous-layer
+                # transfers before replay and publish every new prediction
+                # after replay. That turns the paper's layer-local pipeline
+                # into two step-wide barriers and was observed to make
+                # lookahead substantially slower than synchronous HiSparse.
+                # Keep the target eager so each decoder layer can consume and
+                # launch its own transfer; the EAGLE workers retain graphs.
+                disable_decode_graph_reason = (
+                    "OasisKV requires eager paired target forward for "
+                    "layer-local asynchronous prefetch; EAGLE draft CUDA "
+                    "graphs remain enabled."
                 )
             else:
                 disable_decode_graph_reason = (

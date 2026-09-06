@@ -11,6 +11,7 @@ from sglang.srt.speculative.oasiskv_lookahead import (
     configure_oasiskv_forward_batch,
     paired_batch_from_eagle_verify,
     select_oasiskv_normal_rows,
+    submit_oasiskv_layer_prefetch,
     submit_oasiskv_pending_prefetches,
 )
 from sglang.srt.managers.hisparse_coordinator import (
@@ -227,6 +228,38 @@ def test_pending_prefetch_is_drained_once_after_verify_transaction():
 
     assert calls == [3, 7]
     assert forward_batch._oasiskv_pending_prefetch == {}
+
+
+def test_eager_layer_prefetch_launches_immediately_without_c4_transaction():
+    calls = []
+    coordinator = SimpleNamespace(
+        _active_dspark_window=None,
+        submit_oasiskv_prefetch=lambda **kwargs: calls.append(kwargs["layer_id"]),
+    )
+    forward_batch = SimpleNamespace(
+        is_oasiskv_graph_capture=False,
+        _oasiskv_pending_prefetch={3: (coordinator, {"layer_id": 3})},
+    )
+
+    assert submit_oasiskv_layer_prefetch(forward_batch, 3)
+    assert calls == [3]
+    assert forward_batch._oasiskv_pending_prefetch == {}
+
+
+def test_layer_prefetch_defers_while_c4_commit_owns_destinations():
+    calls = []
+    coordinator = SimpleNamespace(
+        _active_dspark_window=object(),
+        submit_oasiskv_prefetch=lambda **kwargs: calls.append(kwargs),
+    )
+    pending = {3: (coordinator, {"layer_id": 3})}
+    forward_batch = SimpleNamespace(
+        is_oasiskv_graph_capture=False, _oasiskv_pending_prefetch=pending
+    )
+
+    assert not submit_oasiskv_layer_prefetch(forward_batch, 3)
+    assert not calls
+    assert forward_batch._oasiskv_pending_prefetch is pending
 
 
 def test_cuda_graph_replay_joins_all_layers_and_publishes_live_batch_metadata():
