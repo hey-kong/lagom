@@ -154,6 +154,41 @@ def test_commit_is_always_one_request_major_normal_row():
         build_oasiskv_commit(torch.tensor([0, 1, 4]), batch_size=3, device="cpu")
 
 
+def test_logits_processor_selects_only_normal_rows_for_oasiskv():
+    from sglang.srt.layers.logits_processor import LogitsMetadata
+
+    normal_rows = torch.tensor([0, 2])
+    metadata = LogitsMetadata.from_forward_batch(
+        SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_extend=lambda: False,
+                is_target_verify=lambda: True,
+                is_draft_extend_v2=lambda: False,
+            ),
+            return_logprob=False,
+            capture_hidden_mode=0,
+            next_token_logits_buffer=None,
+            extend_seq_lens=None,
+            extend_seq_lens_cpu=None,
+            extend_logprob_start_lens_cpu=None,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            extend_input_logprob_token_ids_gpu=None,
+            is_prefill_only=False,
+            global_num_tokens_gpu=None,
+            dp_local_start_pos=None,
+            dp_local_num_tokens=None,
+            global_dp_buffer_len=None,
+            global_num_tokens_for_logprob_cpu=None,
+            global_num_tokens_for_logprob_gpu=None,
+            mm_input_embeds=None,
+            is_oasiskv_paired=True,
+            oasiskv_normal_rows=normal_rows,
+        )
+    )
+    assert metadata.output_select_index is normal_rows
+
+
 def test_logprobs_use_compacted_normal_rows_not_verify_pair_indices():
     batch = SimpleNamespace(
         seq_lens=torch.tensor([7, 13]),

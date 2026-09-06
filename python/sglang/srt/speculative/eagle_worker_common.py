@@ -630,8 +630,13 @@ def run_eagle_verify(
             )
 
             normal_rows = verify_forward_batch.oasiskv_normal_rows
-            normal_logits = logits_output.next_token_logits[normal_rows]
-            logits_output.next_token_logits = normal_logits
+            # LogitsProcessor has already restricted the expensive LM head to
+            # the B normal rows. The 2B hidden states remain available for the
+            # EAGLE feature relay, but draft logits are intentionally absent.
+            if logits_output.next_token_logits.shape[0] != bs:
+                raise RuntimeError(
+                    "OasisKV LM head must return one normal row per request"
+                )
             predict = target_worker.model_runner.sample(
                 logits_output, verify_forward_batch
             ).reshape(-1)
