@@ -28,6 +28,7 @@ def _args(**overrides):
         speculative_num_steps=None,
         speculative_eagle_topk=None,
         speculative_num_draft_tokens=None,
+        enforce_disable_flashinfer_allreduce_fusion=False,
         is_oasiskv_lookahead=False,
     )
     values.update(overrides)
@@ -41,6 +42,7 @@ def test_oasiskv_resolves_dedicated_lookahead_mode():
     assert args.speculative_algorithm == "EAGLE3"
     assert (args.speculative_num_steps, args.speculative_eagle_topk) == (1, 1)
     assert args.speculative_num_draft_tokens == 2
+    assert args.enforce_disable_flashinfer_allreduce_fusion
 
 
 def test_oasiskv_requires_draft_path_and_rejects_spec_verification():

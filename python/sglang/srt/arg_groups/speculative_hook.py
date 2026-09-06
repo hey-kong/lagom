@@ -192,6 +192,14 @@ def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
     # PR12 is the synchronous correctness baseline.  Paired metadata has a
     # distinct 2B shape and intentionally does not enter decode/verify graphs.
     server_args.disable_cuda_graph = True
+    # DeepSeek-V4 enables FlashInfer all-reduce fusion automatically on H100.
+    # Its workspace performs a separate NCCL rendezvous while the internal
+    # target and EAGLE workers are being initialized.  That optional rendezvous
+    # is unnecessary for the paired eager path and can fail independently on
+    # one TP rank, causing the remaining peers to report ncclRemoteError.
+    # Force the ordinary TP all-reduce path instead of relying on the
+    # workspace's per-rank exception fallback.
+    server_args.enforce_disable_flashinfer_allreduce_fusion = True
     server_args.is_oasiskv_lookahead = True
     logger.info(
         "OasisKV LOOKAHEAD_ONLY enabled: EAGLE-3 steps=1 topk=1; "
