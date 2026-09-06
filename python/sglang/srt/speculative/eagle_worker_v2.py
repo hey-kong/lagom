@@ -861,22 +861,37 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
+        oasiskv = self.server_args.is_oasiskv_lookahead
+        draft_extend_width = 1 if oasiskv else self.speculative_num_draft_tokens
+        if oasiskv:
+            from sglang.srt.speculative.oasiskv_lookahead import (
+                select_oasiskv_normal_rows,
+            )
+        target_hidden_states = batch_result.logits_output.hidden_states
+        if oasiskv and target_hidden_states is not None:
+            # Target verify is request-major [normal, draft].  Only the normal
+            # feature is a valid recurrent EAGLE input; feeding both rows makes
+            # DRAFT_EXTEND_V2 advertise width=2 while its sampled token tensor
+            # has width=1 (and also carries the disposable draft state forward).
+            target_hidden_states = select_oasiskv_normal_rows(
+                target_hidden_states, self.speculative_num_draft_tokens
+            )
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
-            hidden_states=batch_result.logits_output.hidden_states,
+            hidden_states=target_hidden_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
             num_correct_drafts=batch_result.accept_lens - 1,
             num_accept_tokens=batch_result.accept_lens,
             # Draft-extend fills the whole tree width (num_draft_tokens) per req,
             # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
-            num_tokens_per_req=self.speculative_num_draft_tokens,
-            num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
+            num_tokens_per_req=draft_extend_width,
+            num_tokens_for_logprob_per_req=draft_extend_width,
         )
         select_index = (
             torch.arange(
                 0,
-                len(batch.seq_lens) * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
+                len(batch.seq_lens) * draft_extend_width,
+                draft_extend_width,
                 device=self.device,
             )
             + batch_result.accept_lens
@@ -888,16 +903,38 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         next_token_ids = batch_result.next_token_ids.to(torch.int64)
 
         # Prepare for draft extend in a separate stream
-        with self.plan_stream_ctx:
-            forward_batch = prepare_for_draft_extend(
-                draft_extend_input,
-                batch,
-                next_token_ids,
-                self.speculative_num_draft_tokens,
-                self.draft_runner,
-                self.cuda_graph_runner_for_draft_extend,
-                return_hidden_states_before_norm=False,
+        original_out_cache_loc = batch.out_cache_loc
+        if oasiskv and not batch.forward_mode.is_idle():
+            batch.out_cache_loc = select_oasiskv_normal_rows(
+                original_out_cache_loc, self.speculative_num_draft_tokens
             )
+        try:
+            with self.plan_stream_ctx:
+                forward_batch = prepare_for_draft_extend(
+                    draft_extend_input,
+                    batch,
+                    next_token_ids,
+                    draft_extend_width,
+                    self.draft_runner,
+                    self.cuda_graph_runner_for_draft_extend,
+                    return_hidden_states_before_norm=False,
+                )
+        finally:
+            batch.out_cache_loc = original_out_cache_loc
+
+        if oasiskv and not batch.forward_mode.is_idle():
+            expected_rows = len(batch.seq_lens)
+            if (
+                forward_batch.input_ids.shape[0] != expected_rows
+                or forward_batch.out_cache_loc.shape[0] != expected_rows
+                or (
+                    forward_batch.spec_info.hidden_states is not None
+                    and forward_batch.spec_info.hidden_states.shape[0] != expected_rows
+                )
+            ):
+                raise RuntimeError(
+                    "OasisKV draft-extend must contain one committed row per request"
+                )
 
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(

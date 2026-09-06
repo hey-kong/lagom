@@ -8,6 +8,7 @@ from sglang.srt.speculative.oasiskv_lookahead import (
     build_oasiskv_paired_batch,
     configure_oasiskv_forward_batch,
     paired_batch_from_eagle_verify,
+    select_oasiskv_normal_rows,
 )
 from sglang.srt.managers.hisparse_coordinator import (
     OasisKVPrefetchTask,
@@ -125,6 +126,14 @@ def test_eagle_verify_forward_batch_does_not_require_extend_only_metadata():
 
     assert forward_batch.is_oasiskv_paired
     assert forward_batch.oasiskv_normal_rows.tolist() == [0, 2]
+
+
+def test_draft_extend_keeps_only_normal_target_features_and_cache_locs():
+    features = torch.tensor([[10], [11], [20], [21]])
+    cache_locs = torch.tensor([100, 101, 200, 201])
+
+    assert select_oasiskv_normal_rows(features).tolist() == [[10], [20]]
+    assert select_oasiskv_normal_rows(cache_locs).tolist() == [100, 200]
 
 
 def test_prefetch_identity_rejects_slot_generation_and_position_reuse():

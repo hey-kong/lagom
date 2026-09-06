@@ -29,6 +29,15 @@ class OasisKVPairedBatch:
         return self.normal_rows.numel()
 
 
+def select_oasiskv_normal_rows(
+    tensor: torch.Tensor, pair_width: int = 2
+) -> torch.Tensor:
+    """Select committed roots from a request-major target pair."""
+    if pair_width != 2 or tensor.shape[0] % pair_width:
+        raise ValueError("OasisKV expects a request-major normal/draft tensor")
+    return tensor[::pair_width].contiguous()
+
+
 def build_oasiskv_paired_batch(
     normal_tokens: torch.Tensor,
     draft_tokens: torch.Tensor,
