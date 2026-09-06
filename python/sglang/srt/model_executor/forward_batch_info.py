@@ -538,6 +538,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The DSV4 indexer consumes these fields directly; they are deliberately
     # absent from ordinary decode and speculative-verify batches.
     is_oasiskv_paired: bool = False
+    # Capture-time batches use fixed all-valid paired rows.  This prevents the
+    # indexer from performing data-dependent GPU->CPU masking while recording.
+    is_oasiskv_graph_capture: bool = False
     oasiskv_normal_rows: Optional[torch.Tensor] = None
     oasiskv_draft_rows: Optional[torch.Tensor] = None
     oasiskv_draft_valid: Optional[torch.Tensor] = None
@@ -1407,9 +1410,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # branch handles decode rows padded to a 1-token extend.
                 if hybrid_ssm or self.seq_lens.shape[0] == 0:
                     dev = self.seq_lens.device
-                    assert (
-                        self.seq_lens.shape[0] == 0
-                    ), "extend-idle conversion expects an empty rank"
+                    assert self.seq_lens.shape[0] == 0, (
+                        "extend-idle conversion expects an empty rank"
+                    )
                     self.extend_num_tokens = num_tokens
                     self.extend_seq_lens = torch.tensor(
                         [num_tokens], dtype=torch.int32, device=dev

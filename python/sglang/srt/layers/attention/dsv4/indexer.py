@@ -949,7 +949,10 @@ class C4IndexerBackendMixin:
                 compressed_seq_lens=normal_lens,
                 top_k_result=normal_raw,
                 layer_id=compress_layer_id,
-                verify_lens_cpu=[1] * normal_rows.numel(),
+                # Normal rows are a fixed width-one request-major chain.  Use
+                # the static verify path so CUDA Graph captures only stable
+                # buffers and kernels, never a Python ragged-row plan.
+                verify_lens_cpu=None,
                 output_buffer=c4_sparse_page_indices[normal_rows].contiguous(),
             )
             normal_device_locs = hisparse_coordinator.select_dspark_scratch_locs(
@@ -960,8 +963,9 @@ class C4IndexerBackendMixin:
             core_metadata.c4_sparse_page_indices[normal_rows] = normal_device_locs
             core_metadata.c4_sparse_page_indices[draft_rows] = normal_device_locs
 
-            keep = valid.to(torch.bool)
-            if torch.any(keep):
+            graph_capture = getattr(forward_batch, "is_oasiskv_graph_capture", False)
+            keep = None if graph_capture else valid.to(torch.bool)
+            if graph_capture or torch.any(keep):
                 # Keep this as data until root-only C4 commit/rollback finishes.
                 # Starting H2D after this layer alone would let the prefetch
                 # stream mutate resident/LRU mappings concurrently with the
@@ -973,18 +977,32 @@ class C4IndexerBackendMixin:
                 pending[c4_indexer.layer_id] = (
                     hisparse_coordinator,
                     dict(
-                        req_pool_indices=forward_batch.req_pool_indices[keep],
-                        req_pool_indices_cpu=forward_batch.req_pool_indices_cpu[
-                            keep.to("cpu")
-                        ],
-                        compressed_seq_lens=normal_lens[keep],
+                        req_pool_indices=(
+                            forward_batch.req_pool_indices
+                            if graph_capture
+                            else forward_batch.req_pool_indices[keep]
+                        ),
+                        req_pool_indices_cpu=(
+                            forward_batch.req_pool_indices_cpu
+                            if graph_capture
+                            else forward_batch.req_pool_indices_cpu[keep.to("cpu")]
+                        ),
+                        compressed_seq_lens=(
+                            normal_lens if graph_capture else normal_lens[keep]
+                        ),
                         # TARGET_VERIFY keeps prefix lengths (before its inline
                         # root) in seq_lens_cpu.  After root-only commit the next
                         # batch is exactly source+1, matching PR10's identity.
-                        source_committed_lens_cpu=forward_batch.seq_lens_cpu[
-                            keep.to("cpu")
-                        ],
-                        predicted_c4_entries=raw_indices[draft_rows][keep],
+                        source_committed_lens_cpu=(
+                            forward_batch.seq_lens_cpu
+                            if graph_capture
+                            else forward_batch.seq_lens_cpu[keep.to("cpu")]
+                        ),
+                        predicted_c4_entries=(
+                            raw_indices[draft_rows]
+                            if graph_capture
+                            else raw_indices[draft_rows][keep]
+                        ),
                         layer_id=compress_layer_id,
                     ),
                 )

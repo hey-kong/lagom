@@ -182,6 +182,54 @@ def test_pending_prefetch_is_drained_once_after_verify_transaction():
     assert forward_batch._oasiskv_pending_prefetch == {}
 
 
+def test_cuda_graph_replay_joins_all_layers_and_publishes_live_batch_metadata():
+    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        DecodeCudaGraphRunner,
+    )
+
+    consume_calls = []
+    coordinator = SimpleNamespace(
+        prefetcher_name="oasiskv",
+        mem_pool_device=SimpleNamespace(layer_num=2),
+        consume_oasiskv_prefetch=lambda **kwargs: consume_calls.append(kwargs),
+    )
+    runner = object.__new__(DecodeCudaGraphRunner)
+    runner.model_runner = SimpleNamespace(hisparse_coordinator=coordinator)
+    runner._replay_graph_key = "bs2"
+    predicted = torch.arange(12).view(3, 4)
+    compressed_lens = torch.tensor([7, 13, 0])
+    runner._oasiskv_graph_prefetch = {
+        "bs2": {
+            3: (
+                coordinator,
+                {
+                    "compressed_seq_lens": compressed_lens,
+                    "predicted_c4_entries": predicted,
+                    "layer_id": 1,
+                },
+            )
+        }
+    }
+    forward_batch = SimpleNamespace(
+        is_oasiskv_paired=True,
+        batch_size=2,
+        req_pool_indices=torch.tensor([4, 9]),
+        req_pool_indices_cpu=torch.tensor([4, 9]),
+        seq_lens_cpu=torch.tensor([7, 13]),
+    )
+
+    runner._prepare_oasiskv_graph_replay(forward_batch)
+    runner._publish_oasiskv_graph_prefetch(forward_batch)
+
+    assert [call["layer_id"] for call in consume_calls] == [0, 1]
+    _, submitted = forward_batch._oasiskv_pending_prefetch[3]
+    assert submitted["req_pool_indices"] is forward_batch.req_pool_indices
+    assert submitted["req_pool_indices_cpu"] is forward_batch.req_pool_indices_cpu
+    assert submitted["source_committed_lens_cpu"] is forward_batch.seq_lens_cpu
+    assert submitted["compressed_seq_lens"].tolist() == [7, 13]
+    assert submitted["predicted_c4_entries"].tolist() == predicted[:2].tolist()
+
+
 def test_prefetch_identity_rejects_slot_generation_and_position_reuse():
     task = OasisKVPrefetchTask(
         layer_id=3,
