@@ -189,10 +189,9 @@ def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
     # verify path below hard-commits one root token and never accepts a draft.
     server_args.speculative_num_draft_tokens = 2
     server_args.speculative_algorithm = "EAGLE3"
-    # Keep global CUDA graphs enabled.  The target ModelRunner applies a
-    # decode-only graph gate because paired 2B verify metadata and the
-    # side-stream miss plan are dynamic; the independent EAGLE draft and
-    # draft-extend runners can still use their CUDA graphs.
+    # Keep CUDA graphs enabled. OasisKV stages request identities before target
+    # replay and publishes graph-stable draft prediction tensors afterwards.
+    # Passing --disable-cuda-graph remains an explicit eager/pipelined A/B mode.
     # DeepSeek-V4 enables FlashInfer all-reduce fusion automatically on H100.
     # Its workspace performs a separate NCCL rendezvous while the internal
     # target and EAGLE workers are being initialized.  That optional rendezvous
@@ -204,7 +203,7 @@ def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
     server_args.is_oasiskv_lookahead = True
     logger.info(
         "OasisKV LOOKAHEAD_ONLY enabled: EAGLE-3 steps=1 topk=1; "
-        "draft acceptance/rejection disabled; target verify eager, draft graphs enabled"
+        "draft acceptance/rejection disabled; target and draft graphs enabled"
     )
 
 
