@@ -220,7 +220,7 @@ def test_dspark_prepare_translates_with_coordinator_device_pool():
     coordinator.device = "cpu"
     coordinator._has_pending_dspark_commit = False
     coordinator.req_to_token_pool = SimpleNamespace(
-        req_to_token=torch.tensor([[0, 1, 2, 12]], dtype=torch.int64)
+        req_to_token=torch.tensor([[0, 1, 2, 15]], dtype=torch.int64)
     )
     mapping = torch.zeros(16, dtype=torch.int64)
     translate = MagicMock(return_value=torch.tensor([5], dtype=torch.int64))

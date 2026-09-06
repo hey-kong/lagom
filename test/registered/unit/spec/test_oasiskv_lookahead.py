@@ -5,10 +5,16 @@ import torch
 
 from sglang.srt.arg_groups.speculative_hook import _handle_oasiskv_lookahead
 from sglang.srt.speculative.oasiskv_lookahead import (
-    OasisKVAttentionView,
-    OasisKVLookaheadLane,
+    build_oasiskv_paired_batch,
+    configure_oasiskv_forward_batch,
+    paired_batch_from_eagle_verify,
+    select_oasiskv_normal_rows,
+    submit_oasiskv_pending_prefetches,
 )
-from sglang.srt.managers.hisparse_coordinator import OasisKVPrefetchTask
+from sglang.srt.managers.hisparse_coordinator import (
+    OasisKVPrefetchTask,
+    is_hisparse_prefetcher_mode_unsupported,
+)
 from sglang.srt.managers.hisparse_prefetcher import HiSparsePrefetchStats
 
 
@@ -31,8 +37,9 @@ def test_oasiskv_resolves_dedicated_lookahead_mode():
     args = _args()
     _handle_oasiskv_lookahead(args)
     assert args.is_oasiskv_lookahead
-    assert args.speculative_algorithm is None
+    assert args.speculative_algorithm == "EAGLE3"
     assert (args.speculative_num_steps, args.speculative_eagle_topk) == (1, 1)
+    assert args.speculative_num_draft_tokens == 2
 
 
 def test_oasiskv_requires_draft_path_and_rejects_spec_verification():
@@ -44,52 +51,109 @@ def test_oasiskv_requires_draft_path_and_rejects_spec_verification():
         _handle_oasiskv_lookahead(_args(speculative_num_steps=2))
 
 
-def test_draft_query_is_target_generated_and_state_is_not_committed():
-    state = {"tokens": [7], "kv": [11], "page_table": [3]}
+def test_oasiskv_allows_internal_speculative_scratch_but_still_rejects_pp():
+    assert not is_hisparse_prefetcher_mode_unsupported(
+        "oasiskv", pp_size=1, is_speculative=True
+    )
+    assert is_hisparse_prefetcher_mode_unsupported(
+        "previous", pp_size=1, is_speculative=True
+    )
+    assert is_hisparse_prefetcher_mode_unsupported(
+        "oasiskv", pp_size=2, is_speculative=True
+    )
+
+
+def test_paired_row_mapping_and_positions():
+    paired = build_oasiskv_paired_batch(
+        torch.tensor([10, 20]), torch.tensor([11, 21]), torch.tensor([7, 13])
+    )
+    assert paired.input_ids.tolist() == [10, 11, 20, 21]
+    assert paired.positions.tolist() == [7, 8, 13, 14]
+    assert paired.normal_rows.tolist() == [0, 2]
+    assert paired.draft_rows.tolist() == [1, 3]
+
+
+def test_real_forward_batch_receives_two_token_extend_geometry():
+    paired = build_oasiskv_paired_batch(
+        torch.tensor([10, 20]), torch.tensor([11, 21]), torch.tensor([7, 13])
+    )
+    forward_batch = SimpleNamespace(
+        batch_size=2,
+        input_ids=torch.empty(4, dtype=torch.long),
+        positions=None,
+        extend_seq_lens_cpu=[2, 2],
+        out_cache_loc=torch.arange(4),
+        extend_prefix_lens=torch.tensor([7, 13]),
+        extend_start_loc=torch.tensor([0, 2]),
+        seq_lens=torch.tensor([9, 15]),
+        seq_lens_cpu=torch.tensor([9, 15]),
+    )
+    configure_oasiskv_forward_batch(forward_batch, paired)
+    assert forward_batch.is_oasiskv_paired
+    assert forward_batch.input_ids.tolist() == [10, 11, 20, 21]
+    assert forward_batch.positions.tolist() == [7, 8, 13, 14]
+
+
+def test_eagle_verify_tensors_are_adopted_without_copy_or_reprojection():
+    tokens = torch.tensor([10, 11, 20, 21])
+    positions = torch.tensor([7, 8, 13, 14])
+    paired = paired_batch_from_eagle_verify(
+        SimpleNamespace(draft_token_num=2, draft_token=tokens, positions=positions),
+        2,
+    )
+    assert paired.input_ids is tokens
+    assert paired.positions is positions
+    assert paired.normal_rows.tolist() == [0, 2]
+    assert paired.draft_rows.tolist() == [1, 3]
+
+
+def test_eagle_verify_forward_batch_does_not_require_extend_only_metadata():
+    tokens = torch.tensor([10, 11, 20, 21])
+    positions = torch.tensor([7, 8, 13, 14])
+    verify = SimpleNamespace(draft_token_num=2, draft_token=tokens, positions=positions)
+    paired = paired_batch_from_eagle_verify(verify, 2)
+    forward_batch = SimpleNamespace(
+        batch_size=2,
+        input_ids=tokens,
+        positions=positions,
+        extend_seq_lens_cpu=None,
+        out_cache_loc=torch.arange(4),
+        seq_lens=torch.tensor([7, 13]),
+        seq_lens_cpu=torch.tensor([7, 13]),
+        spec_info=verify,
+    )
+
+    configure_oasiskv_forward_batch(forward_batch, paired)
+
+    assert forward_batch.is_oasiskv_paired
+    assert forward_batch.oasiskv_normal_rows.tolist() == [0, 2]
+
+
+def test_draft_extend_keeps_only_normal_target_features_and_cache_locs():
+    features = torch.tensor([[10], [11], [20], [21]])
+    cache_locs = torch.tensor([100, 101, 200, 201])
+
+    assert select_oasiskv_normal_rows(features).tolist() == [[10], [20]]
+    assert select_oasiskv_normal_rows(cache_locs).tolist() == [100, 200]
+
+
+def test_pending_prefetch_is_drained_once_after_verify_transaction():
     calls = []
-    submitted = []
-
-    def target_no_commit(**kwargs):
-        calls.append(kwargs)
-        return {5: "target-layer-5-query"}
-
-    lane = OasisKVLookaheadLane(
-        eagle3_draft_one=lambda **_: 42,
-        target_no_commit=target_no_commit,
-        target_c4_predict=lambda layer, query: [(layer, query)],
-        submit_prefetch=lambda **kwargs: submitted.append(kwargs),
-        snapshot_committed_state=lambda: repr(state),
+    coordinator = SimpleNamespace(
+        submit_oasiskv_prefetch=lambda **kwargs: calls.append(kwargs["layer_id"])
     )
-    view = OasisKVAttentionView("same-c4", "same-c128", "same-swa", "same-local", 9)
-    predictions = lane.run(
-        normal_hidden_states="normal",
-        attention_view=view,
-        request_metadata={"slot": 2, "generation": 8},
+    forward_batch = SimpleNamespace(
+        _oasiskv_pending_prefetch={
+            3: (coordinator, {"layer_id": 3}),
+            7: (coordinator, {"layer_id": 7}),
+        }
     )
-    assert calls[0]["token"] == 42
-    assert calls[0]["attention_view"] is view
-    assert calls[0]["commit"] is False and calls[0]["scratch_kv"] is True
-    assert predictions[0].c4_entries == [(5, "target-layer-5-query")]
-    assert predictions[0].target_token_positions == 10
-    assert state == {"tokens": [7], "kv": [11], "page_table": [3]}
-    assert submitted[0]["prediction"].layer_id == 5
 
+    submit_oasiskv_pending_prefetches(forward_batch)
+    submit_oasiskv_pending_prefetches(forward_batch)
 
-def test_mutating_draft_forward_is_rejected():
-    state = []
-    lane = OasisKVLookaheadLane(
-        eagle3_draft_one=lambda **_: 1,
-        target_no_commit=lambda **_: state.append(1) or {},
-        target_c4_predict=lambda *_: [],
-        submit_prefetch=lambda **_: None,
-        snapshot_committed_state=lambda: tuple(state),
-    )
-    with pytest.raises(RuntimeError, match="mutated committed state"):
-        lane.run(
-            normal_hidden_states=None,
-            attention_view=OasisKVAttentionView(None, None, None, None, 1),
-            request_metadata={},
-        )
+    assert calls == [3, 7]
+    assert forward_batch._oasiskv_pending_prefetch == {}
 
 
 def test_prefetch_identity_rejects_slot_generation_and_position_reuse():
@@ -175,9 +239,9 @@ def test_consume_finds_second_slot_and_waits_every_layer_writer(monkeypatch):
         coordinator_module.device_module, "current_stream", lambda: "compute"
     )
 
-    coordinator._consume_previous_prefetch(
-        torch.tensor([2], device="cpu"),
-        0,
+    coordinator.consume_oasiskv_prefetch(
+        req_pool_indices=torch.tensor([2], device="cpu"),
+        layer_id=0,
         req_pool_indices_cpu=torch.tensor([2]),
         committed_lens_cpu=torch.tensor([11]),
     )
@@ -185,6 +249,7 @@ def test_consume_finds_second_slot_and_waits_every_layer_writer(monkeypatch):
     assert calls == [("wait", "stale"), ("wait", "current")]
     assert not stale.valid and not current.valid
     assert coordinator.prefetcher.stats.completed_h2d_entries == 8
+    assert coordinator.prefetcher.stats.prefetch_hits == 1
     assert coordinator.prefetcher.stats.stale_tasks == 1
 
 

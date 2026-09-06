@@ -222,6 +222,18 @@ def _build_prefetch_groups(
     return groups, slot
 
 
+def is_hisparse_prefetcher_mode_unsupported(
+    name: Optional[str], *, pp_size: int, is_speculative: bool
+) -> bool:
+    """Whether execution geometry prevents activating a named prefetcher.
+
+    OasisKV deliberately uses EAGLE's speculative scratch allocator, while its
+    root-only commit policy prevents speculative acceptance.  It is therefore
+    the one named prefetcher allowed with ``is_speculative``.
+    """
+    return pp_size != 1 or (is_speculative and (name or "").lower() != "oasiskv")
+
+
 class HiSparseCoordinator:
     def __init__(
         self,
@@ -462,12 +474,11 @@ class HiSparseCoordinator:
                     "shared-index prefetch has higher priority for this model.",
                     prefetcher_name,
                 )
-        elif prefetcher_name is not None and (pp_size != 1 or is_speculative):
+        elif prefetcher_name is not None and is_hisparse_prefetcher_mode_unsupported(
+            self.prefetcher_name, pp_size=pp_size, is_speculative=is_speculative
+        ):
             if self.prefetcher_name == "oasiskv":
-                raise ValueError(
-                    "OasisKV LOOKAHEAD_ONLY requires pp_size=1 and cannot run "
-                    "with speculative verification"
-                )
+                raise ValueError("OasisKV LOOKAHEAD_ONLY requires pp_size=1")
             logger.warning(
                 'HiSparse prefetcher "%s" is disabled under pipeline parallelism '
                 "or speculative decoding; HiSparse prefetch mode: disabled",
@@ -1433,6 +1444,7 @@ class HiSparseCoordinator:
             self.prefetcher.stats.completed_h2d_entries += (
                 matching_task.submitted_entries
             )
+            self.prefetcher.stats.prefetch_hits += cpu_slots.numel()
             # This is CPU enqueue time, not GPU wait duration.  CUDA stream
             # dependencies intentionally remain asynchronous.
             self.prefetcher.stats.prefetch_wait_submissions += 1
@@ -1448,6 +1460,24 @@ class HiSparseCoordinator:
             self._previous_prefetch_pending_entries
         )
         self._previous_prefetch_pending_entries = 0
+
+    def consume_oasiskv_prefetch(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        layer_id: int,
+        req_pool_indices_cpu: torch.Tensor,
+        committed_lens_cpu: torch.Tensor,
+    ) -> None:
+        """Join the prior OasisKV H2D before paired attention reads its slots."""
+        if self.prefetcher_name != "oasiskv":
+            raise RuntimeError("consume_oasiskv_prefetch requires OasisKV mode")
+        self._consume_previous_prefetch(
+            req_pool_indices,
+            layer_id,
+            req_pool_indices_cpu,
+            committed_lens_cpu,
+        )
 
     def _submit_previous_prefetch(
         self,
@@ -1882,9 +1912,29 @@ class HiSparseCoordinator:
                 empty, empty, empty, [], req_cpu, [], prefix_cpu
             )
         full_locs = torch.stack(full_locs).to(torch.int64)
+        # ``translate_loc_from_full_to_compressed`` intentionally drops full
+        # locations which are not C4 endpoints.  Keep the CPU ownership arrays
+        # in exactly the same filtered geometry; otherwise accepted indices can
+        # address past ``device_locs`` and trigger an asynchronous CUDA indexing
+        # assert during commit.
+        is_c4_loc = (full_locs + 1) % self.compress_ratio == 0
+        if not bool(torch.all(is_c4_loc)):
+            keep_cpu = is_c4_loc.to("cpu").tolist()
+            full_locs = full_locs[is_c4_loc]
+            req_offsets = [x for x, keep in zip(req_offsets, keep_cpu) if keep]
+            c4_positions = [x for x, keep in zip(c4_positions, keep_cpu) if keep]
+        if full_locs.numel() == 0:
+            empty = torch.empty(0, dtype=torch.int64, device=self.device)
+            return HiSparseDSparkWindow(
+                empty, empty, empty, [], req_cpu, [], prefix_cpu
+            )
         compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
             full_locs
         )
+        if compressed_locs.numel() != len(req_offsets):
+            raise RuntimeError(
+                "HiSparse C4 scratch translation changed verify ownership geometry"
+            )
         mapping = self.mem_pool_device.full_to_hisparse_device_index_mapping
         previous_device_mapping = mapping[compressed_locs].clone()
         if self._dspark_scratch_device_locs is None:
