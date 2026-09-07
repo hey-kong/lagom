@@ -15,7 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode  # no
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2  # noqa: E402
 from sglang.srt.speculative.eagle_info import EagleDraftInput  # noqa: E402
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_req(req_pool_idx, origin_input_ids, output_ids):
