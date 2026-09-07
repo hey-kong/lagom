@@ -203,31 +203,6 @@ def test_ema_defaults_and_c4_token_coverage():
     assert (prefetcher.alpha, prefetcher.beta, prefetcher.gamma) == (0.6, 0.2, 0.25)
 
 
-def test_ema_top_level_smoothing_config():
-    config = _config(
-        '{"prefetcher":"ema","ema_alpha":0.7,"ema_beta":0.3,'
-        '"ema_gamma":0.1,"top_k":2048,"device_buffer_size":4096}'
-    )
-    assert config.prefetcher_config == {"alpha": 0.7, "beta": 0.3, "gamma": 0.1}
-    prefetcher = create_hisparse_prefetcher(
-        config.prefetcher,
-        config.prefetcher_config,
-        effective_top_k=512,
-        device_buffer_size=config.device_buffer_size,
-        entry_token_span=4,
-    )
-    assert (prefetcher.alpha, prefetcher.beta, prefetcher.gamma) == (0.7, 0.3, 0.1)
-
-
-def test_ema_top_level_config_rejects_ambiguity_and_wrong_prefetcher():
-    with pytest.raises(ValueError, match="not both"):
-        _config(
-            '{"prefetcher":"ema","ema_alpha":0.7,"prefetcher_config":{"alpha":0.6}}'
-        )
-    with pytest.raises(ValueError, match='require prefetcher="ema"'):
-        _config('{"prefetcher":"previous","ema_alpha":0.7}')
-
-
 def test_ema_first_observation_skips_then_updates_level_and_trend():
     prefetcher = EMAPrefetcher(logical_entries=2)
     first = torch.tensor([[1.0, 4.0, 2.0]])

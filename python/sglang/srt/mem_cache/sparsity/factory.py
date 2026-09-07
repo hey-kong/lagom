@@ -81,11 +81,6 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     swap_in_block_size = extra_config.pop("swap_in_block_size", 960)
     prefetcher = extra_config.pop("prefetcher", None)
     prefetcher_config = extra_config.pop("prefetcher_config", {})
-    ema_config = {
-        name.removeprefix("ema_"): extra_config.pop(name)
-        for name in ("ema_alpha", "ema_beta", "ema_gamma")
-        if name in extra_config
-    }
 
     if device_buffer_size < top_k:
         raise ValueError(
@@ -105,19 +100,6 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         raise ValueError(
             f"prefetcher_config must be an object, got {prefetcher_config!r}"
         )
-    if ema_config:
-        if not isinstance(prefetcher, str) or prefetcher.lower() != "ema":
-            raise ValueError(
-                'ema_alpha, ema_beta, and ema_gamma require prefetcher="ema"'
-            )
-        duplicates = set(ema_config) & set(prefetcher_config)
-        if duplicates:
-            fields = ", ".join(f"ema_{name}" for name in sorted(duplicates))
-            raise ValueError(
-                f"Configure {fields} either at the top level or in "
-                "prefetcher_config, not both"
-            )
-        prefetcher_config = {**prefetcher_config, **ema_config}
 
     algorithm = extra_config.pop("algorithm", None)
     backend = extra_config.pop("backend", None)

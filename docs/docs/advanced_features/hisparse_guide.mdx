@@ -121,7 +121,7 @@ Pass as a JSON string via `--hisparse-config`:
     <tr>
       <td><code>prefetcher_config</code></td>
       <td>object / <code>{"{}"}</code></td>
-      <td>Optional algorithm-specific configuration. <code>size</code> is original-token coverage; EMA accepts <code>alpha</code>, <code>beta</code>, and <code>gamma</code>. You can alternatively set the top-level aliases <code>ema_alpha</code>, <code>ema_beta</code>, and <code>ema_gamma</code>.</td>
+      <td>Optional algorithm-specific configuration. <code>size</code> is original-token coverage; EMA also accepts <code>alpha</code>, <code>beta</code>, and <code>gamma</code>.</td>
     </tr>
   </tbody>
 </table>
@@ -164,16 +164,10 @@ DeepSeek-V4 decode can use a training-free PRR-style EMA of each request and lay
 
 ```bash
 --enable-hisparse \
---hisparse-config '{"prefetcher":"ema","top_k":2048,"device_buffer_size":4096,"host_to_device_ratio":5}'
+--hisparse-config '{"prefetcher":"ema","prefetcher_config":{"alpha":0.6,"beta":0.2,"gamma":0.25},"top_k":2048,"device_buffer_size":4096,"host_to_device_ratio":5}'
 ```
 
-For every logical C4 entry, EMA maintains level and trend across decode tokens and predicts the next score as `level + gamma × trend`. Defaults are `alpha=0.6`, `beta=0.2`, and `gamma=0.25`. Override them either with top-level `ema_alpha`, `ema_beta`, and `ema_gamma` fields or with `alpha`, `beta`, and `gamma` under `prefetcher_config`; do not specify the same parameter in both places. For example:
-
-```bash
---hisparse-config '{"prefetcher":"ema","ema_alpha":0.6,"ema_beta":0.2,"ema_gamma":0.25,"top_k":2048,"device_buffer_size":4096,"host_to_device_ratio":5}'
-```
-
-The first observation for each request/layer only initializes state and deliberately skips prefetch. State follows the request-pool identity across batch reorder and is deleted when that request finishes.
+For every logical C4 entry, EMA maintains level and trend across decode tokens and predicts the next score as `level + gamma × trend`. Defaults are `alpha=0.6`, `beta=0.2`, and `gamma=0.25`; override them under `prefetcher_config`. The first observation for each request/layer only initializes state and deliberately skips prefetch. State follows the request-pool identity across batch reorder and is deleted when that request finishes.
 
 The default `size` covers `top_k` original tokens. Because one DeepSeek-V4 C4 entry represents four tokens, the example warms 512 logical entries. Predictions never replace the current Indexer's real Top-K. HiSparse first resolves the real selection, then its existing page table, resident filtering, LRU miss plan, staging, and asynchronous copy path warm only nonresident predictions. The buffer must fit attention Top-K plus the EMA candidate count, which protects every slot current attention may read. Prediction misses still use normal RESOLVE/swap-in, while false positives only transfer extra KV data. EMA currently requires eager, non-speculative decode with pipeline parallel size 1.
 
