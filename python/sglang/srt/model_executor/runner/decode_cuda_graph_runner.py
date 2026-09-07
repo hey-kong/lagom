@@ -1314,11 +1314,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if not templates or coordinator is None or coordinator.prefetcher_name != "ema":
             return
         raw_bs = forward_batch.batch_size
+        if forward_batch.seq_lens_cpu is None:
+            raise RuntimeError("EMA CUDA Graph replay requires CPU sequence lengths")
+        c4_seq_lens_cpu = (forward_batch.seq_lens_cpu // 4).clamp_min(1)
         for captured in templates.values():
             coordinator.submit_ema_prefetch(
                 req_pool_indices=forward_batch.req_pool_indices,
                 req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
                 compressed_seq_lens=captured["compressed_seq_lens"][:raw_bs],
+                compressed_seq_lens_cpu=c4_seq_lens_cpu,
                 scores=captured["scores"][:raw_bs],
                 layer_id=captured["layer_id"],
             )

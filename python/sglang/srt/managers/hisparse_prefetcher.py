@@ -192,14 +192,14 @@ class EMAPrefetcher(HiSparsePrefetcher):
         """EMA consumes scores through :meth:`update`; indices are passed through."""
         if previous is None or previous.ndim != 2:
             raise ValueError("EMA candidates must be a two-dimensional tensor")
-        result = previous[:, : self.logical_entries]
-        self.stats.selected_entries += result.numel()
-        return result
+        # update() already accounts for valid, initialized rows without reading
+        # a GPU reduction back to the CPU.
+        return previous[:, : self.logical_entries]
 
     def update(
         self,
         scores: torch.Tensor,
-        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
         req_pool_indices,
         layer_id: int,
         out_indices: Optional[torch.Tensor] = None,
@@ -210,39 +210,71 @@ class EMAPrefetcher(HiSparsePrefetcher):
         no prediction. State follows request-pool identity, not batch row order.
         """
         slots = torch.as_tensor(req_pool_indices, device="cpu").tolist()
+        lengths = torch.as_tensor(seq_lens_cpu, device="cpu").tolist()
         if len(slots) != scores.shape[0]:
             raise ValueError("EMA request identities must match score rows")
-        predictions = []
-        all_initialized = True
-        for row, slot in enumerate(slots):
-            length = int(seq_lens[row])
-            current = scores[row, :length].detach().float()
+        if len(lengths) != scores.shape[0]:
+            raise ValueError("EMA CPU sequence lengths must match score rows")
+
+        width = scores.shape[1]
+        old_levels = []
+        old_trends = []
+        old_lengths = []
+        initialized = []
+        keys = []
+        for slot in slots:
             key = (int(slot), int(layer_id))
+            keys.append(key)
             old = self._state.get(key)
             if old is None:
-                self._state[key] = (current.clone(), torch.zeros_like(current))
-                all_initialized = False
-                predictions.append(None)
-                continue
-            old_level, old_trend = old
-            common = min(length, old_level.numel())
-            level = current.clone()
-            trend = torch.zeros_like(current)
-            if common:
-                previous_level = old_level[:common]
-                level[:common] = (
-                    self.alpha * current[:common] + (1.0 - self.alpha) * previous_level
-                )
-                trend[:common] = (
-                    self.beta * (current[:common] - previous_level)
-                    + (1.0 - self.beta) * old_trend[:common]
-                )
-            self._state[key] = (level, trend)
-            predictions.append(level + self.gamma * trend)
-        # Mixed first/subsequent rows are skipped as a batch. This avoids
-        # sentinel candidates and keeps the swap-in kernel's rectangular ABI.
-        if not all_initialized:
+                old_level = old_trend = scores.new_zeros(width, dtype=torch.float32)
+                old_length = 0
+                initialized.append(False)
+            else:
+                old_level, old_trend = old
+                old_length = min(old_level.numel(), width)
+                if old_length < width:
+                    old_level = torch.nn.functional.pad(
+                        old_level, (0, width - old_length)
+                    )
+                    old_trend = torch.nn.functional.pad(
+                        old_trend, (0, width - old_length)
+                    )
+                else:
+                    old_level = old_level[:width]
+                    old_trend = old_trend[:width]
+                initialized.append(True)
+            old_levels.append(old_level)
+            old_trends.append(old_trend)
+            old_lengths.append(old_length)
+
+        current = scores.detach().float()
+        previous_level = torch.stack(old_levels)
+        previous_trend = torch.stack(old_trends)
+        positions = torch.arange(width, device=scores.device).unsqueeze(0)
+        valid = positions < torch.as_tensor(lengths, device=scores.device).unsqueeze(1)
+        has_history = positions < torch.as_tensor(
+            old_lengths, device=scores.device
+        ).unsqueeze(1)
+        updated_level = self.alpha * current + (1.0 - self.alpha) * previous_level
+        updated_trend = (
+            self.beta * (current - previous_level) + (1.0 - self.beta) * previous_trend
+        )
+        level = torch.where(has_history, updated_level, current).masked_fill(~valid, 0)
+        trend = torch.where(
+            has_history, updated_trend, torch.zeros_like(updated_trend)
+        ).masked_fill(~valid, 0)
+        forecast = (level + self.gamma * trend).masked_fill(~valid, float("-inf"))
+
+        for row, (key, length) in enumerate(zip(keys, lengths)):
+            self._state[key] = (
+                level[row, :length].clone(),
+                trend[row, :length].clone(),
+            )
+
+        if not any(initialized):
             return None
+
         output = out_indices
         if output is None:
             output = torch.full(
@@ -252,12 +284,20 @@ class EMAPrefetcher(HiSparsePrefetcher):
                 device=scores.device,
             )
         output.fill_(-1)
-        for row, predicted in enumerate(predictions):
-            k = min(self.logical_entries, predicted.numel())
-            output[row, :k] = torch.topk(predicted, k, sorted=True).indices.to(
-                torch.int32
-            )
-        self.stats.selected_entries += int((output >= 0).sum())
+        actual_k = min(self.logical_entries, width)
+        values, indices = torch.topk(forecast, actual_k, dim=1, sorted=True)
+        row_initialized = torch.as_tensor(initialized, device=scores.device).unsqueeze(
+            1
+        )
+        selected = indices.to(torch.int32).masked_fill(
+            (values == float("-inf")) | ~row_initialized, -1
+        )
+        output[:, :actual_k].copy_(selected)
+        self.stats.selected_entries += sum(
+            min(self.logical_entries, length)
+            for length, ready in zip(lengths, initialized)
+            if ready
+        )
         return output
 
     def release_request(self, req_pool_idx: int) -> None:

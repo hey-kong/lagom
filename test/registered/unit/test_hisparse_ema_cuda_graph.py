@@ -66,6 +66,7 @@ def test_graph_replay_submits_live_batch_with_captured_scores():
         batch_size=2,
         req_pool_indices=torch.tensor([4, 9]),
         req_pool_indices_cpu=torch.tensor([4, 9]),
+        seq_lens_cpu=torch.tensor([24, 20]),
     )
 
     runner._prepare_ema_graph_replay()
@@ -77,4 +78,5 @@ def test_graph_replay_submits_live_batch_with_captured_scores():
     assert kwargs["req_pool_indices_cpu"] is batch.req_pool_indices_cpu
     assert torch.equal(kwargs["scores"], scores[:2])
     assert torch.equal(kwargs["compressed_seq_lens"], compressed_lens[:2])
+    assert torch.equal(kwargs["compressed_seq_lens_cpu"], torch.tensor([6, 5]))
     assert kwargs["layer_id"] == 2

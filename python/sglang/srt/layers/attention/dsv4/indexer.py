@@ -922,9 +922,20 @@ class C4IndexerBackendMixin:
                         layer_id=compress_layer_id,
                     )
                 else:
+                    seq_lens_cpu = forward_batch.seq_lens_cpu
+                    if seq_lens_cpu is None:
+                        raise RuntimeError(
+                            "EMA requires the decode CPU sequence lengths"
+                        )
+                    c4_seq_lens_cpu = getattr(
+                        forward_batch, "_ema_c4_seq_lens_cpu", None
+                    )
+                    if c4_seq_lens_cpu is None:
+                        c4_seq_lens_cpu = (seq_lens_cpu // 4).clamp_min(1)
+                        forward_batch._ema_c4_seq_lens_cpu = c4_seq_lens_cpu
                     prefetch_candidates = hisparse_coordinator.prefetcher.update(
                         logits,
-                        c4_seq_lens,
+                        c4_seq_lens_cpu,
                         forward_batch.req_pool_indices_cpu,
                         compress_layer_id,
                         candidate_output,

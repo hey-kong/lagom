@@ -246,6 +246,25 @@ def test_ema_state_isolated_by_request_and_layer_and_survives_batch_reorder():
     assert prefetcher.update(scores[:1], torch.tensor([2]), [3], 0) is None
 
 
+def test_ema_new_request_only_skips_its_own_batch_row():
+    prefetcher = EMAPrefetcher(logical_entries=2)
+    assert (
+        prefetcher.update(torch.tensor([[1.0, 3.0, 2.0]]), torch.tensor([3]), [4], 0)
+        is None
+    )
+
+    selected = prefetcher.update(
+        torch.tensor([[2.0, 4.0, 1.0], [9.0, 8.0, 7.0]]),
+        torch.tensor([3, 3]),
+        [4, 8],
+        0,
+    )
+
+    assert torch.equal(selected[0], torch.tensor([1, 0], dtype=torch.int32))
+    assert torch.equal(selected[1], torch.tensor([-1, -1], dtype=torch.int32))
+    assert prefetcher.stats.selected_entries == 2
+
+
 @pytest.mark.parametrize("field,value", [("alpha", -0.1), ("beta", 1.1), ("gamma", -1)])
 def test_ema_rejects_invalid_smoothing_parameters(field, value):
     with pytest.raises(ValueError, match=field):

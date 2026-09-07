@@ -1643,6 +1643,7 @@ class HiSparseCoordinator:
         req_pool_indices: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
         compressed_seq_lens: torch.Tensor,
+        compressed_seq_lens_cpu: torch.Tensor,
         scores: torch.Tensor,
         layer_id: int,
     ) -> None:
@@ -1651,7 +1652,7 @@ class HiSparseCoordinator:
             raise RuntimeError("submit_ema_prefetch requires EMA mode")
         candidates = self.prefetcher.update(
             scores,
-            compressed_seq_lens,
+            compressed_seq_lens_cpu,
             req_pool_indices_cpu,
             layer_id,
             self.indexer_prefetch_candidates_buffer[: scores.shape[0]],
