@@ -348,6 +348,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # target graph.  They have graph-pool-stable addresses and are turned
         # into live prefetch submissions only after replay and root commit.
         self._oasiskv_graph_prefetch: dict[object, dict] = {}
+        # Graph-keyed references to replayed EMA Indexer scores. EMA state and
+        # H2D task descriptors remain ordinary Python and are updated post-replay.
+        self._ema_graph_prefetch: dict[object, dict] = {}
         if self.ragged_verify_mode and (
             self.enable_two_batch_overlap
             or model_runner.server_args.enable_lora
@@ -990,6 +993,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
         if forward_batch.hisparse_coordinator is not None:
             forward_batch.hisparse_coordinator.num_real_reqs.fill_(bs)
+            forward_batch.is_ema_graph_capture = (
+                forward_batch.hisparse_coordinator.prefetcher_name == "ema"
+            )
 
         if (
             self.model_runner.server_args.is_oasiskv_lookahead
@@ -1253,6 +1259,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     # warmup-created descriptors have been overwritten by the
                     # capture invocation of run_once.
                     self._oasiskv_graph_prefetch[shape_key] = dict(pending)
+                ema_pending = getattr(forward_batch, "_ema_pending_prefetch", None)
+                if ema_pending:
+                    self._ema_graph_prefetch[shape_key] = dict(ema_pending)
 
     def _prepare_oasiskv_graph_replay(self, forward_batch: ForwardBatch) -> None:
         """Join prior H2D writers before the target graph reads C4 mappings."""
@@ -1291,6 +1300,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ),
             )
         forward_batch._oasiskv_pending_prefetch = pending
+
+    def _prepare_ema_graph_replay(self) -> None:
+        """Join the preceding token's EMA writes before graph cache reads."""
+        coordinator = self.model_runner.hisparse_coordinator
+        if coordinator is not None and coordinator.prefetcher_name == "ema":
+            coordinator.consume_ema_prefetch()
+
+    def _submit_ema_graph_prefetch(self, forward_batch: ForwardBatch) -> None:
+        """Use replayed Indexer scores to launch next-token EMA warmups."""
+        templates = self._ema_graph_prefetch.get(self._replay_graph_key)
+        coordinator = self.model_runner.hisparse_coordinator
+        if not templates or coordinator is None or coordinator.prefetcher_name != "ema":
+            return
+        raw_bs = forward_batch.batch_size
+        for captured in templates.values():
+            coordinator.submit_ema_prefetch(
+                req_pool_indices=forward_batch.req_pool_indices,
+                req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
+                compressed_seq_lens=captured["compressed_seq_lens"][:raw_bs],
+                scores=captured["scores"][:raw_bs],
+                layer_id=captured["layer_id"],
+            )
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
@@ -1459,6 +1490,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
             self._prepare_oasiskv_graph_replay(forward_batch)
+            self._prepare_ema_graph_replay()
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
                     "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",
@@ -1478,6 +1510,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             output = self.backend.replay(self._replay_graph_key, forward_batch)
             self._publish_oasiskv_graph_prefetch(forward_batch)
+            self._submit_ema_graph_prefetch(forward_batch)
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

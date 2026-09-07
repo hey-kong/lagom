@@ -1626,6 +1626,44 @@ class HiSparseCoordinator:
         self._oasiskv_next_slot[layer_id] = 1 - ring_slot
         return self._oasiskv_ring[layer_id][ring_slot]
 
+    def consume_ema_prefetch(self) -> None:
+        """Order decode-graph replay after the prior EMA side-stream writer."""
+        if self.prefetcher_name != "ema" or not self._previous_prefetch_pending_entries:
+            return
+        self._previous_prefetch_event.wait(device_module.current_stream())
+        self.prefetcher.stats.completed_h2d_entries += (
+            self._previous_prefetch_pending_entries
+        )
+        self._previous_prefetch_pending_entries = 0
+        self._previous_prefetch_target_layer = None
+
+    def submit_ema_prefetch(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        scores: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        """Update EMA and warm one layer after current graph attention finishes."""
+        if self.prefetcher_name != "ema" or self.prefetcher is None:
+            raise RuntimeError("submit_ema_prefetch requires EMA mode")
+        candidates = self.prefetcher.update(
+            scores,
+            compressed_seq_lens,
+            req_pool_indices_cpu,
+            layer_id,
+            self.indexer_prefetch_candidates_buffer[: scores.shape[0]],
+        )
+        if candidates is not None:
+            self._submit_previous_prefetch_to_layer(
+                req_pool_indices,
+                compressed_seq_lens,
+                candidates,
+                layer_id,
+            )
+
     def _submit_previous_prefetch_to_layer(
         self, req_pool_indices, compressed_seq_lens, candidates, target_layer
     ) -> None:

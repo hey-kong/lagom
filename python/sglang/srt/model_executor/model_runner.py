@@ -949,18 +949,17 @@ class ModelRunner:
                     "eager decode; static verify retains decode CUDA Graph."
                 )
         if self.hisparse_coordinator.prefetcher is not None:
-            # The candidate tensor and side-stream miss plan change every decode
-            # step; capturing one would replay stale preceding-layer positions.
-            if self.hisparse_coordinator.prefetcher_name == "oasiskv":
-                # OasisKV owns graph-stable prediction buffers and replaces
-                # their request identities around every replay. Previous H2D
-                # writers are joined before replay and graph-produced plans
-                # are published afterwards, so no stale Python descriptor is
-                # captured. Users can still select the eager layer-pipelined
-                # path with --disable-cuda-graph for direct A/B measurement.
+            # Candidate tensors and side-stream plans change each decode step.
+            # Graph-safe modes retain fixed graph outputs and publish dynamic
+            # Python/H2D work after replay instead of capturing its descriptors.
+            if self.hisparse_coordinator.prefetcher_name in ("oasiskv", "ema"):
+                # Previous H2D writers are joined before replay and graph-produced
+                # scores/predictions are published afterwards, so no stale Python
+                # descriptor is captured.
                 logger.info(
-                    "OasisKV paired target verify is eligible for CUDA Graph; "
-                    "use --disable-cuda-graph to benchmark layer-local eager prefetch."
+                    "%s HiSparse prefetch is eligible for CUDA Graph; "
+                    "graph-stable predictions are submitted after replay.",
+                    self.hisparse_coordinator.prefetcher_name,
                 )
             else:
                 disable_decode_graph_reason = (

@@ -909,13 +909,26 @@ class C4IndexerBackendMixin:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
                     c4_indexer.layer_id
                 ].compress_layer_id
-                prefetch_candidates = hisparse_coordinator.prefetcher.update(
-                    logits,
-                    c4_seq_lens,
-                    forward_batch.req_pool_indices_cpu,
-                    compress_layer_id,
-                    candidate_output,
-                )
+                if forward_batch.is_ema_graph_capture:
+                    # Python state mutation and side-stream submission cannot
+                    # be captured. Preserve graph-pool tensor references; the
+                    # decode runner consumes their replayed values afterwards.
+                    pending = getattr(forward_batch, "_ema_pending_prefetch", None)
+                    if pending is None:
+                        pending = forward_batch._ema_pending_prefetch = {}
+                    pending[compress_layer_id] = dict(
+                        scores=logits,
+                        compressed_seq_lens=c4_seq_lens,
+                        layer_id=compress_layer_id,
+                    )
+                else:
+                    prefetch_candidates = hisparse_coordinator.prefetcher.update(
+                        logits,
+                        c4_seq_lens,
+                        forward_batch.req_pool_indices_cpu,
+                        compress_layer_id,
+                        candidate_output,
+                    )
             else:
                 prefetch_candidates = get_prefetch_candidates(
                     logits,

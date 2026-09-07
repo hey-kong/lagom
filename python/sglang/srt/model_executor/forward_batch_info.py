@@ -541,6 +541,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Capture-time batches use fixed all-valid paired rows.  This prevents the
     # indexer from performing data-dependent GPU->CPU masking while recording.
     is_oasiskv_graph_capture: bool = False
+    # EMA capture records graph-stable Indexer score tensors. Python EMA state
+    # updates and side-stream H2D submission run after each graph replay.
+    is_ema_graph_capture: bool = False
     oasiskv_normal_rows: Optional[torch.Tensor] = None
     oasiskv_draft_rows: Optional[torch.Tensor] = None
     oasiskv_draft_valid: Optional[torch.Tensor] = None
