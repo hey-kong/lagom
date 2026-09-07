@@ -905,12 +905,24 @@ class C4IndexerBackendMixin:
             candidate_output = hisparse_coordinator.indexer_prefetch_candidates_buffer[
                 : c4_sparse_page_indices.size(0)
             ]
-            prefetch_candidates = get_prefetch_candidates(
-                logits,
-                c4_seq_lens,
-                raw_indices,
-                candidate_output,
-            )
+            if hisparse_coordinator.prefetcher_name == "ema":
+                compress_layer_id = token_to_kv_pool.layer_mapping[
+                    c4_indexer.layer_id
+                ].compress_layer_id
+                prefetch_candidates = hisparse_coordinator.prefetcher.update(
+                    logits,
+                    c4_seq_lens,
+                    forward_batch.req_pool_indices_cpu,
+                    compress_layer_id,
+                    candidate_output,
+                )
+            else:
+                prefetch_candidates = get_prefetch_candidates(
+                    logits,
+                    c4_seq_lens,
+                    raw_indices,
+                    candidate_output,
+                )
         if hisparse_paired:
             normal_rows = forward_batch.oasiskv_normal_rows
             draft_rows = forward_batch.oasiskv_draft_rows

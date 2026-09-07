@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Dict, Mapping, Optional
+from typing import Callable, Dict, Mapping, Optional, Tuple
+
+import torch
 
 
 @dataclass
@@ -79,8 +81,8 @@ def create_hisparse_prefetcher(
     )
     if resolved is None:
         return None
-    factory, logical_entries, size = resolved
-    return factory(logical_entries=logical_entries, size=size)
+    factory, logical_entries, size, algorithm_config = resolved
+    return factory(logical_entries=logical_entries, size=size, **algorithm_config)
 
 
 def validate_hisparse_prefetcher(
@@ -101,7 +103,8 @@ def validate_hisparse_prefetcher(
         raise ValueError(
             f"Unknown HiSparse prefetcher {name!r}; supported prefetchers: {supported}"
         )
-    unknown = set(config) - {"size"}
+    algorithm_fields = {"alpha", "beta", "gamma"} if normalized == "ema" else set()
+    unknown = set(config) - ({"size"} | algorithm_fields)
     if unknown:
         raise ValueError(
             f"Unknown {normalized} prefetcher_config field(s): "
@@ -119,7 +122,20 @@ def validate_hisparse_prefetcher(
             f"entries) exceeds device buffer capacity ({device_buffer_size} "
             "logical entries)"
         )
-    return factory, logical_entries, size
+    algorithm_config = {}
+    for key, default in (("alpha", 0.6), ("beta", 0.2), ("gamma", 0.25)):
+        if key not in algorithm_fields:
+            continue
+        value = config.get(key, default)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(f"prefetcher_config.{key} must be a number")
+        value = float(value)
+        if key != "gamma" and not 0.0 <= value <= 1.0:
+            raise ValueError(f"prefetcher_config.{key} must be in [0, 1]")
+        if key == "gamma" and value < 0.0:
+            raise ValueError("prefetcher_config.gamma must be non-negative")
+        algorithm_config[key] = value
+    return factory, logical_entries, size, algorithm_config
 
 
 @register_hisparse_prefetcher("previous")
@@ -154,3 +170,96 @@ class OasisKVPrefetcher(HiSparsePrefetcher):
         result = predicted[:, : self.logical_entries]
         self.stats.selected_entries += result.numel()
         return result
+
+
+@register_hisparse_prefetcher("ema")
+class EMAPrefetcher(HiSparsePrefetcher):
+    """PRR-style per-request, per-layer EMA prediction over Indexer scores."""
+
+    def __init__(
+        self,
+        logical_entries: int,
+        size: Optional[int] = None,
+        alpha: float = 0.6,
+        beta: float = 0.2,
+        gamma: float = 0.25,
+    ):
+        super().__init__(logical_entries, size)
+        self.alpha, self.beta, self.gamma = alpha, beta, gamma
+        self._state: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def select(self, previous):
+        """EMA consumes scores through :meth:`update`; indices are passed through."""
+        if previous is None or previous.ndim != 2:
+            raise ValueError("EMA candidates must be a two-dimensional tensor")
+        result = previous[:, : self.logical_entries]
+        self.stats.selected_entries += result.numel()
+        return result
+
+    def update(
+        self,
+        scores: torch.Tensor,
+        seq_lens: torch.Tensor,
+        req_pool_indices,
+        layer_id: int,
+        out_indices: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Update observations and predict the next decode token's score ranking.
+
+        The first observation for any request/layer initializes state and emits
+        no prediction. State follows request-pool identity, not batch row order.
+        """
+        slots = torch.as_tensor(req_pool_indices, device="cpu").tolist()
+        if len(slots) != scores.shape[0]:
+            raise ValueError("EMA request identities must match score rows")
+        predictions = []
+        all_initialized = True
+        for row, slot in enumerate(slots):
+            length = int(seq_lens[row])
+            current = scores[row, :length].detach().float()
+            key = (int(slot), int(layer_id))
+            old = self._state.get(key)
+            if old is None:
+                self._state[key] = (current.clone(), torch.zeros_like(current))
+                all_initialized = False
+                predictions.append(None)
+                continue
+            old_level, old_trend = old
+            common = min(length, old_level.numel())
+            level = current.clone()
+            trend = torch.zeros_like(current)
+            if common:
+                previous_level = old_level[:common]
+                level[:common] = (
+                    self.alpha * current[:common] + (1.0 - self.alpha) * previous_level
+                )
+                trend[:common] = (
+                    self.beta * (current[:common] - previous_level)
+                    + (1.0 - self.beta) * old_trend[:common]
+                )
+            self._state[key] = (level, trend)
+            predictions.append(level + self.gamma * trend)
+        # Mixed first/subsequent rows are skipped as a batch. This avoids
+        # sentinel candidates and keeps the swap-in kernel's rectangular ABI.
+        if not all_initialized:
+            return None
+        output = out_indices
+        if output is None:
+            output = torch.full(
+                (scores.shape[0], self.logical_entries),
+                -1,
+                dtype=torch.int32,
+                device=scores.device,
+            )
+        output.fill_(-1)
+        for row, predicted in enumerate(predictions):
+            k = min(self.logical_entries, predicted.numel())
+            output[row, :k] = torch.topk(predicted, k, sorted=True).indices.to(
+                torch.int32
+            )
+        self.stats.selected_entries += int((output >= 0).sum())
+        return output
+
+    def release_request(self, req_pool_idx: int) -> None:
+        for key in [key for key in self._state if key[0] == req_pool_idx]:
+            del self._state[key]

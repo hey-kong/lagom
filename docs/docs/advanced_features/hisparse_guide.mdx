@@ -116,12 +116,12 @@ Pass as a JSON string via `--hisparse-config`:
     <tr>
       <td><code>prefetcher</code></td>
       <td>string / unset</td>
-      <td>Optional HiSparse prefetch algorithm. When unset, preserves the existing model-specific automatic behavior. Currently supports <code>previous</code>.</td>
+      <td>Optional HiSparse prefetch algorithm. When unset, preserves the existing model-specific automatic behavior. Supports <code>previous</code>, <code>ema</code>, and <code>oasiskv</code> (speculative mode).</td>
     </tr>
     <tr>
       <td><code>prefetcher_config</code></td>
       <td>object / <code>{"{}"}</code></td>
-      <td>Optional algorithm-specific configuration. For <code>previous</code>, supports token-coverage <code>size</code>.</td>
+      <td>Optional algorithm-specific configuration. <code>size</code> is original-token coverage; EMA also accepts <code>alpha</code>, <code>beta</code>, and <code>gamma</code>.</td>
     </tr>
   </tbody>
 </table>
@@ -157,6 +157,19 @@ For ordinary DSA, one logical KV entry covers one token. For DeepSeek-V4-Flash C
 When no `prefetcher` is specified, existing behavior is unchanged: eligible GLM-5.2 shared-index layers use automatic cross-layer prefetch, while DeepSeek-V4 does not prefetch. Legacy shared-index prefetch has priority over `previous`; the two modes never operate on the same device buffer concurrently. `SGLANG_DISABLE_HISPARSE_PREFETCH=1` disables both modes.
 
 The initial implementation is disabled with pipeline parallelism or speculative decoding and uses eager decode rather than CUDA graphs. It allocates no additional KV staging buffer. A plan-only RESOLVE applies the preceding layer's positions to the next layer's existing resident table and LRU, then a low-footprint copy-only kernel replays the miss plan directly into that layer's device buffer on a side stream while the current layer computes.
+
+### EMA next-token prefetcher (experimental)
+
+DeepSeek-V4 decode can use a training-free PRR-style EMA of each request and layer's C4 Indexer scores:
+
+```bash
+--enable-hisparse \
+--hisparse-config '{"prefetcher":"ema","top_k":2048,"device_buffer_size":4096,"host_to_device_ratio":5}'
+```
+
+For every logical C4 entry, EMA maintains level and trend across decode tokens and predicts the next score as `level + gamma × trend`. Defaults are `alpha=0.6`, `beta=0.2`, and `gamma=0.25`; override them under `prefetcher_config`. The first observation for each request/layer only initializes state and deliberately skips prefetch. State follows the request-pool identity across batch reorder and is deleted when that request finishes.
+
+The default `size` covers `top_k` original tokens. Because one DeepSeek-V4 C4 entry represents four tokens, the example warms 512 logical entries. Predictions never replace the current Indexer's real Top-K. HiSparse first resolves the real selection, then its existing page table, resident filtering, LRU miss plan, staging, and asynchronous copy path warm only nonresident predictions. The buffer must fit attention Top-K plus the EMA candidate count, which protects every slot current attention may read. Prediction misses still use normal RESOLVE/swap-in, while false positives only transfer extra KV data. EMA currently requires eager, non-speculative decode with pipeline parallel size 1.
 
 ## Deployment
 

@@ -442,9 +442,10 @@ class HiSparseCoordinator:
         )
         self.prefetcher = None
         self.prefetcher_name = prefetcher_name.lower() if prefetcher_name else None
-        if self.prefetcher_name == "oasiskv" and not self.is_dsv4_hisparse:
+        if self.prefetcher_name in ("oasiskv", "ema") and not self.is_dsv4_hisparse:
             raise ValueError(
-                'HiSparse prefetcher "oasiskv" requires the DeepSeek-V4 C4 Indexer'
+                f'HiSparse prefetcher "{self.prefetcher_name}" requires the '
+                "DeepSeek-V4 C4 Indexer"
             )
         # Validate even when a higher-priority mode wins, so misspellings never
         # become silently dormant configuration.
@@ -496,6 +497,15 @@ class HiSparseCoordinator:
                 prefetcher_name.lower() if prefetcher_name is not None else "disabled",
             )
         if self.prefetcher is not None:
+            if (
+                self.prefetcher_name == "ema"
+                and self.prefetcher.logical_entries + self.top_k
+                > self.device_buffer_size
+            ):
+                raise ValueError(
+                    "EMA prefetch coverage plus attention Top-K must fit in "
+                    "device_buffer_size so prefetch cannot evict current attention slots"
+                )
             if not self.is_dsv4_hisparse and (
                 self.prefetcher.logical_entries != self.top_k
             ):
@@ -607,9 +617,10 @@ class HiSparseCoordinator:
                     self.mem_pool_device.layer_num,
                 )
             logger.info(
-                "HiSparse Previous Prefetcher: %d-token coverage maps to %d "
+                "HiSparse %s prefetcher: %d-token coverage maps to %d "
                 "logical KV entries per request (entry span=%d tokens); Indexer "
                 "selection is Top-%d and attention remains Top-%d.",
+                self.prefetcher_name,
                 self.prefetcher.size,
                 self.prefetcher.logical_entries,
                 self.prefetch_entry_token_span,
@@ -1316,10 +1327,15 @@ class HiSparseCoordinator:
                 self.prefetcher_name != "oasiskv"
                 and self._previous_prefetch_pending_entries
             ):
-                self._previous_prefetch_event.wait(device_module.current_stream())
+                # Host pages and resident slots are reclaimed synchronously
+                # below, so an enqueued stream dependency is not sufficient.
+                self._previous_prefetch_event.synchronize()
                 self._previous_prefetch_pending_entries = 0
                 self._previous_prefetch_target_layer = None
             self._prefetch_generation[req.req_pool_idx] += 1
+            release = getattr(self.prefetcher, "release_request", None)
+            if release is not None:
+                release(req.req_pool_idx)
 
     def _run_swap_in_kernel(
         self,
@@ -1613,6 +1629,15 @@ class HiSparseCoordinator:
     def _submit_previous_prefetch_to_layer(
         self, req_pool_indices, compressed_seq_lens, candidates, target_layer
     ) -> None:
+        # The plan buffers are shared across layers. Let the preceding layer's
+        # DMA finish before reusing them; its transfer still overlaps that
+        # layer's attention and its warmed entries remain resident next step.
+        if self._previous_prefetch_pending_entries:
+            self._previous_prefetch_event.wait(device_module.current_stream())
+            self.prefetcher.stats.completed_h2d_entries += (
+                self._previous_prefetch_pending_entries
+            )
+            self._previous_prefetch_pending_entries = 0
         selected = self.prefetcher.select(candidates)
         num_reqs = selected.size(0)
         self._prefetch_candidate_buffer[:num_reqs].copy_(selected)
@@ -1706,6 +1731,17 @@ class HiSparseCoordinator:
                     top_k_result
                     if prefetch_candidates is None
                     else prefetch_candidates,
+                    layer_id,
+                )
+            elif self.prefetcher_name == "ema" and prefetch_candidates is not None:
+                # The real Top-K was resolved first and is therefore MRU. The
+                # startup capacity check reserves enough other slots for every
+                # prediction, so this same-layer plan cannot evict locations
+                # about to be read by current attention.
+                self._submit_previous_prefetch_to_layer(
+                    req_pool_indices,
+                    compressed_seq_lens,
+                    prefetch_candidates,
                     layer_id,
                 )
             return result
