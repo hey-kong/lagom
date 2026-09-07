@@ -55,6 +55,26 @@ def compute_oasiskv_logprobs(
     compute_spec_logprobs(batch, logits_output, predict, chain_stride=1)
 
 
+def build_oasiskv_commit(
+    normal_rows: torch.Tensor, batch_size: int, device: Any
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the fixed-width, root-only commit used by OasisKV.
+
+    Keeping this separate from EAGLE acceptance is an important safety
+    boundary: the lookahead row is useful for its indexer prediction only and
+    must not become committed merely because its token happens to match.
+    """
+    if normal_rows.ndim != 1 or normal_rows.numel() != batch_size:
+        raise ValueError("OasisKV requires exactly one normal row per request")
+    expected = torch.arange(
+        0, 2 * batch_size, 2, dtype=normal_rows.dtype, device=normal_rows.device
+    )
+    if not torch.equal(normal_rows, expected):
+        raise ValueError("OasisKV normal rows must be request-major pair roots")
+    accept_lens = torch.ones(batch_size, dtype=torch.int32, device=device)
+    return accept_lens, normal_rows.reshape(batch_size, 1)
+
+
 def submit_oasiskv_pending_prefetches(forward_batch: Any) -> None:
     """Launch draft predictions after target attention and C4 commit complete."""
     pending = getattr(forward_batch, "_oasiskv_pending_prefetch", None)
@@ -65,6 +85,31 @@ def submit_oasiskv_pending_prefetches(forward_batch: Any) -> None:
     forward_batch._oasiskv_pending_prefetch = {}
     for coordinator, kwargs in pending.values():
         coordinator.submit_oasiskv_prefetch(**kwargs)
+
+
+def submit_oasiskv_layer_prefetch(forward_batch: Any, layer_id: int) -> bool:
+    """Launch one eager layer's prefetch as soon as its attention is done.
+
+    Most decode steps do not complete a new C4 group and therefore have no
+    transactional scratch mapping to commit.  On those steps, retaining every
+    layer task until the end of the model destroys OasisKV's layer pipeline.
+    C4-boundary steps remain deferred until the root-only commit because their
+    fixed destination slots must not race prefetch eviction or H2D writes.
+
+    CUDA-graph replay publishes its captured task descriptors only after the
+    graph returns, so it naturally continues to use the post-commit drain.
+    """
+    if getattr(forward_batch, "is_oasiskv_graph_capture", False):
+        return False
+    pending = getattr(forward_batch, "_oasiskv_pending_prefetch", None)
+    if not pending or layer_id not in pending:
+        return False
+    coordinator, kwargs = pending[layer_id]
+    if getattr(coordinator, "_active_dspark_window", None) is not None:
+        return False
+    pending.pop(layer_id)
+    coordinator.submit_oasiskv_prefetch(**kwargs)
+    return True
 
 
 def build_oasiskv_paired_batch(
