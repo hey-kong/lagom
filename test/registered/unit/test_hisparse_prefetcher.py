@@ -265,6 +265,22 @@ def test_ema_new_request_only_skips_its_own_batch_row():
     assert prefetcher.stats.selected_entries == 2
 
 
+def test_ema_uses_existing_device_lengths_for_gpu_masking():
+    prefetcher = EMAPrefetcher(logical_entries=2)
+    scores = torch.tensor([[1.0, 9.0, 8.0]])
+    assert prefetcher.update(scores, torch.tensor([3]), [2], 0) is None
+
+    selected = prefetcher.update(
+        scores,
+        torch.tensor([1]),
+        [2],
+        0,
+        seq_lens_device=torch.tensor([1]),
+    )
+
+    assert torch.equal(selected, torch.tensor([[0, -1]], dtype=torch.int32))
+
+
 @pytest.mark.parametrize("field,value", [("alpha", -0.1), ("beta", 1.1), ("gamma", -1)])
 def test_ema_rejects_invalid_smoothing_parameters(field, value):
     with pytest.raises(ValueError, match=field):

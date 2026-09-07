@@ -939,6 +939,7 @@ class C4IndexerBackendMixin:
                         forward_batch.req_pool_indices_cpu,
                         compress_layer_id,
                         candidate_output,
+                        seq_lens_device=c4_seq_lens,
                     )
             else:
                 prefetch_candidates = get_prefetch_candidates(

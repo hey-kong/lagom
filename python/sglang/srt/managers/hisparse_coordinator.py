@@ -1656,6 +1656,7 @@ class HiSparseCoordinator:
             req_pool_indices_cpu,
             layer_id,
             self.indexer_prefetch_candidates_buffer[: scores.shape[0]],
+            seq_lens_device=compressed_seq_lens,
         )
         if candidates is not None:
             self._submit_previous_prefetch_to_layer(

@@ -203,6 +203,7 @@ class EMAPrefetcher(HiSparsePrefetcher):
         req_pool_indices,
         layer_id: int,
         out_indices: Optional[torch.Tensor] = None,
+        seq_lens_device: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """Update observations and predict the next decode token's score ranking.
 
@@ -215,11 +216,16 @@ class EMAPrefetcher(HiSparsePrefetcher):
             raise ValueError("EMA request identities must match score rows")
         if len(lengths) != scores.shape[0]:
             raise ValueError("EMA CPU sequence lengths must match score rows")
+        if seq_lens_device is None:
+            if scores.device.type != "cpu":
+                raise ValueError("EMA CUDA scores require device sequence lengths")
+            seq_lens_device = torch.as_tensor(seq_lens_cpu, device="cpu")
+        if seq_lens_device.shape[0] != scores.shape[0]:
+            raise ValueError("EMA device sequence lengths must match score rows")
 
         width = scores.shape[1]
         old_levels = []
         old_trends = []
-        old_lengths = []
         initialized = []
         keys = []
         for slot in slots:
@@ -246,16 +252,29 @@ class EMAPrefetcher(HiSparsePrefetcher):
                 initialized.append(True)
             old_levels.append(old_level)
             old_trends.append(old_trend)
-            old_lengths.append(old_length)
 
         current = scores.detach().float()
         previous_level = torch.stack(old_levels)
         previous_trend = torch.stack(old_trends)
         positions = torch.arange(width, device=scores.device).unsqueeze(0)
-        valid = positions < torch.as_tensor(lengths, device=scores.device).unsqueeze(1)
-        has_history = positions < torch.as_tensor(
-            old_lengths, device=scores.device
-        ).unsqueeze(1)
+        valid = positions < seq_lens_device.unsqueeze(1)
+        # Every stored position has history. Build this mask from the already
+        # resident state tensors, avoiding Python-list -> CUDA metadata copies.
+        has_history = torch.stack(
+            [
+                torch.nn.functional.pad(
+                    torch.ones(
+                        min(self._state[key][0].numel(), width),
+                        dtype=torch.bool,
+                        device=scores.device,
+                    ),
+                    (0, max(0, width - self._state[key][0].numel())),
+                )[:width]
+                if key in self._state
+                else torch.zeros(width, dtype=torch.bool, device=scores.device)
+                for key in keys
+            ]
+        )
         updated_level = self.alpha * current + (1.0 - self.alpha) * previous_level
         updated_trend = (
             self.beta * (current - previous_level) + (1.0 - self.beta) * previous_trend
@@ -286,9 +305,7 @@ class EMAPrefetcher(HiSparsePrefetcher):
         output.fill_(-1)
         actual_k = min(self.logical_entries, width)
         values, indices = torch.topk(forecast, actual_k, dim=1, sorted=True)
-        row_initialized = torch.as_tensor(initialized, device=scores.device).unsqueeze(
-            1
-        )
+        row_initialized = has_history.any(dim=1, keepdim=True)
         selected = indices.to(torch.int32).masked_fill(
             (values == float("-inf")) | ~row_initialized, -1
         )
