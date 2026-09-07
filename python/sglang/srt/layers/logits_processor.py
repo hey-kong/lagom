@@ -219,8 +219,6 @@ class LogitsMetadata:
 
         if forward_batch.forward_mode.is_draft_extend_v2():
             output_select_index = forward_batch.spec_info.select_index
-        elif getattr(forward_batch, "is_oasiskv_paired", False):
-            output_select_index = forward_batch.oasiskv_normal_rows
         else:
             output_select_index = None
 

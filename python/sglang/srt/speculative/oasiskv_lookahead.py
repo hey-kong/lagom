@@ -1,10 +1,4 @@
-"""OasisKV normal/draft paired-forward primitives.
-
-OasisKV is look-ahead, not speculative decoding: the odd rows are disposable
-target-model probes and can never be accepted as output.  This module keeps the
-row/position/state contract in one place so model and attention backends do not
-have to infer ownership from tensor shapes.
-"""
+"""OasisKV helpers for a one-step, request-major EAGLE-3 verify batch."""
 
 from __future__ import annotations
 
@@ -38,43 +32,6 @@ def select_oasiskv_normal_rows(
     return tensor[::pair_width].contiguous()
 
 
-def compute_oasiskv_logprobs(
-    batch: Any, logits_output: Any, predict: torch.Tensor
-) -> None:
-    """Compute logprobs for the one committed token in each paired request.
-
-    ``run_eagle_verify`` has already compacted both ``next_token_logits`` and
-    ``predict`` to B normal rows by the time this is called.  EAGLE's usual
-    ``accept_index`` still contains indices into the original 2B verify tensor
-    (``[0, 2, ...]``), so using it here would either select another request's
-    row or read past the compacted tensors.  A width-one chain describes the
-    committed output layout directly and deliberately excludes every draft.
-    """
-    from sglang.srt.layers.logprob_processor import compute_spec_logprobs
-
-    compute_spec_logprobs(batch, logits_output, predict, chain_stride=1)
-
-
-def build_oasiskv_commit(
-    normal_rows: torch.Tensor, batch_size: int, device: Any
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build the fixed-width, root-only commit used by OasisKV.
-
-    Keeping this separate from EAGLE acceptance is an important safety
-    boundary: the lookahead row is useful for its indexer prediction only and
-    must not become committed merely because its token happens to match.
-    """
-    if normal_rows.ndim != 1 or normal_rows.numel() != batch_size:
-        raise ValueError("OasisKV requires exactly one normal row per request")
-    expected = torch.arange(
-        0, 2 * batch_size, 2, dtype=normal_rows.dtype, device=normal_rows.device
-    )
-    if not torch.equal(normal_rows, expected):
-        raise ValueError("OasisKV normal rows must be request-major pair roots")
-    accept_lens = torch.ones(batch_size, dtype=torch.int32, device=device)
-    return accept_lens, normal_rows.reshape(batch_size, 1)
-
-
 def submit_oasiskv_pending_prefetches(forward_batch: Any) -> None:
     """Launch draft predictions after target attention and C4 commit complete."""
     pending = getattr(forward_batch, "_oasiskv_pending_prefetch", None)
@@ -93,7 +50,7 @@ def submit_oasiskv_layer_prefetch(forward_batch: Any, layer_id: int) -> bool:
     Most decode steps do not complete a new C4 group and therefore have no
     transactional scratch mapping to commit.  On those steps, retaining every
     layer task until the end of the model destroys OasisKV's layer pipeline.
-    C4-boundary steps remain deferred until the root-only commit because their
+    C4-boundary steps remain deferred until speculative commit because their
     fixed destination slots must not race prefetch eviction or H2D writes.
 
     CUDA-graph replay publishes its captured task descriptors only after the

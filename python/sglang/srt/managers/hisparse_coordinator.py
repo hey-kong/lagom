@@ -227,9 +227,8 @@ def is_hisparse_prefetcher_mode_unsupported(
 ) -> bool:
     """Whether execution geometry prevents activating a named prefetcher.
 
-    OasisKV deliberately uses EAGLE's speculative scratch allocator, while its
-    root-only commit policy prevents speculative acceptance.  It is therefore
-    the one named prefetcher allowed with ``is_speculative``.
+    OasisKV is the one named prefetcher implemented directly on EAGLE-3 verify
+    batches, so it is allowed with ``is_speculative``.
     """
     return pp_size != 1 or (is_speculative and (name or "").lower() != "oasiskv")
 
@@ -478,7 +477,7 @@ class HiSparseCoordinator:
             self.prefetcher_name, pp_size=pp_size, is_speculative=is_speculative
         ):
             if self.prefetcher_name == "oasiskv":
-                raise ValueError("OasisKV LOOKAHEAD_ONLY requires pp_size=1")
+                raise ValueError("OasisKV EAGLE-3 verification requires pp_size=1")
             logger.warning(
                 'HiSparse prefetcher "%s" is disabled under pipeline parallelism '
                 "or speculative decoding; HiSparse prefetch mode: disabled",
