@@ -146,11 +146,13 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
 
 def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
-    """Resolve OasisKV without enabling speculative verification.
+    """Treat the experimental OasisKV spelling as regular EAGLE-3 + HiSparse.
 
-    The internal EAGLE-3 worker supplies model loading, feature relay and
-    scratch allocation.  Its verify forward is replaced by root-only OasisKV
-    sampling, so no draft token can be accepted.
+    The dedicated one-token lookahead path pays target-verify cost without
+    amortizing it over accepted draft tokens.  Keep accepting this paper-only
+    configuration spelling, but remove the active prefetcher and run lossless
+    EAGLE-3 verification instead.  Pages brought resident by verification stay
+    available to subsequent tokens through the ordinary HiSparse cache.
     """
     try:
         config = json.loads(server_args.hisparse_config or "{}")
@@ -165,45 +167,27 @@ def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
             'HiSparse prefetcher "oasiskv" requires '
             "--speculative-draft-model-path pointing to a compatible EAGLE-3 checkpoint."
         )
-    if server_args.speculative_algorithm is not None:
+    if (
+        server_args.speculative_algorithm is not None
+        and server_args.speculative_algorithm.upper() != "EAGLE3"
+    ):
         raise ValueError(
-            'HiSparse prefetcher "oasiskv" is LOOKAHEAD_ONLY and conflicts with '
-            "--speculative-algorithm; speculative acceptance/verification is disabled."
+            'HiSparse prefetcher "oasiskv" is a compatibility alias for EAGLE3 '
+            "and conflicts with a different --speculative-algorithm."
         )
-    conflicts = {
-        "--speculative-num-steps": (server_args.speculative_num_steps, 1),
-        "--speculative-eagle-topk": (server_args.speculative_eagle_topk, 1),
-        "--speculative-num-draft-tokens": (
-            server_args.speculative_num_draft_tokens,
-            2,
-        ),
-    }
-    for flag, (value, required) in conflicts.items():
-        if value is not None and int(value) != required:
-            raise ValueError(
-                f'HiSparse prefetcher "oasiskv" requires {flag}={required}, got {value}.'
-            )
-    server_args.speculative_num_steps = 1
-    server_args.speculative_eagle_topk = 1
-    # Internally use EAGLE's allocation/metadata machinery, but the OasisKV
-    # verify path below hard-commits one root token and never accepts a draft.
-    server_args.speculative_num_draft_tokens = 2
+
+    # Do not instantiate the OasisKV coordinator/ring or activate paired
+    # root-only verification.  The remaining HiSparse options are parsed by
+    # the canonical configuration path after this hook returns.
+    config.pop("prefetcher", None)
+    config.pop("prefetcher_config", None)
+    server_args.hisparse_config = json.dumps(config, separators=(",", ":"))
     server_args.speculative_algorithm = "EAGLE3"
-    # Keep CUDA graphs enabled. OasisKV stages request identities before target
-    # replay and publishes graph-stable draft prediction tensors afterwards.
-    # Passing --disable-cuda-graph remains an explicit eager/pipelined A/B mode.
-    # DeepSeek-V4 enables FlashInfer all-reduce fusion automatically on H100.
-    # Its workspace performs a separate NCCL rendezvous while the internal
-    # target and EAGLE workers are being initialized.  That optional rendezvous
-    # is unnecessary for the paired eager path and can fail independently on
-    # one TP rank, causing the remaining peers to report ncclRemoteError.
-    # Force the ordinary TP all-reduce path instead of relying on the
-    # workspace's per-rank exception fallback.
-    server_args.enforce_disable_flashinfer_allreduce_fusion = True
-    server_args.is_oasiskv_lookahead = True
+    server_args.is_oasiskv_lookahead = False
     logger.info(
-        "OasisKV LOOKAHEAD_ONLY enabled: EAGLE-3 steps=1 topk=1; "
-        "draft acceptance/rejection disabled; target and draft graphs enabled"
+        'HiSparse prefetcher "oasiskv" selected paper compatibility mode: '
+        "running regular EAGLE-3 acceptance with HiSparse; dedicated OasisKV "
+        "lookahead prefetch is disabled"
     )
 
 

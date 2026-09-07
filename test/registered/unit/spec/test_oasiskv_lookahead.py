@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -38,24 +39,48 @@ def _args(**overrides):
     return SimpleNamespace(**values)
 
 
-def test_oasiskv_resolves_dedicated_lookahead_mode():
+def test_oasiskv_resolves_to_regular_eagle3_hisparse():
     args = _args()
     _handle_oasiskv_lookahead(args)
-    assert args.is_oasiskv_lookahead
+    assert not args.is_oasiskv_lookahead
     assert args.speculative_algorithm == "EAGLE3"
-    assert (args.speculative_num_steps, args.speculative_eagle_topk) == (1, 1)
-    assert args.speculative_num_draft_tokens == 2
-    assert args.enforce_disable_flashinfer_allreduce_fusion
+    assert args.speculative_num_steps is None
+    assert args.speculative_eagle_topk is None
+    assert args.speculative_num_draft_tokens is None
+    assert not args.enforce_disable_flashinfer_allreduce_fusion
     assert not args.disable_cuda_graph
+    assert json.loads(args.hisparse_config) == {}
 
 
-def test_oasiskv_requires_draft_path_and_rejects_spec_verification():
+def test_oasiskv_requires_draft_path_and_rejects_other_algorithms():
     with pytest.raises(ValueError, match="draft-model-path"):
         _handle_oasiskv_lookahead(_args(speculative_draft_model_path=None))
-    with pytest.raises(ValueError, match="LOOKAHEAD_ONLY"):
-        _handle_oasiskv_lookahead(_args(speculative_algorithm="EAGLE3"))
-    with pytest.raises(ValueError, match="num-steps=1"):
-        _handle_oasiskv_lookahead(_args(speculative_num_steps=2))
+    with pytest.raises(ValueError, match="different --speculative-algorithm"):
+        _handle_oasiskv_lookahead(_args(speculative_algorithm="EAGLE"))
+
+
+def test_oasiskv_preserves_eagle3_shape_options_and_hisparse_config():
+    args = _args(
+        hisparse_config=(
+            '{"prefetcher":"oasiskv","prefetcher_config":{"size":128},'
+            '"top_k":2048,"device_buffer_size":4096,"host_to_device_ratio":5}'
+        ),
+        speculative_algorithm="eagle3",
+        speculative_num_steps=4,
+        speculative_eagle_topk=1,
+        speculative_num_draft_tokens=5,
+    )
+    _handle_oasiskv_lookahead(args)
+
+    assert args.speculative_algorithm == "EAGLE3"
+    assert args.speculative_num_steps == 4
+    assert args.speculative_eagle_topk == 1
+    assert args.speculative_num_draft_tokens == 5
+    assert json.loads(args.hisparse_config) == {
+        "top_k": 2048,
+        "device_buffer_size": 4096,
+        "host_to_device_ratio": 5,
+    }
 
 
 def test_oasiskv_allows_internal_speculative_scratch_but_still_rejects_pp():
