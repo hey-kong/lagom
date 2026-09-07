@@ -914,98 +914,40 @@ class C4IndexerBackendMixin:
         if hisparse_paired:
             normal_rows = forward_batch.oasiskv_normal_rows
             draft_rows = forward_batch.oasiskv_draft_rows
-            valid = forward_batch.oasiskv_draft_valid
-            if normal_rows is None or draft_rows is None or valid is None:
+            if normal_rows is None or draft_rows is None:
                 raise RuntimeError("OasisKV paired ForwardBatch is incomplete")
             if normal_rows.numel() != forward_batch.req_pool_indices.numel():
                 raise RuntimeError("OasisKV paired rows must map one pair per request")
 
-            # Only the normal Top-K drives current-round I/O.  Replicate its
-            # resolved device working set onto the draft rows after swap-in, so
-            # history is identical for both queries.  The draft Top-K is kept
-            # separately and can only affect the next-round prefetch ring.
+            # Unlike ordinary EAGLE-3, OasisKV makes the Indexer Top-K for every
+            # verification row resident in the request's fixed-size device
+            # buffer.  Process the root and draft steps in order so the draft
+            # attention uses its own selected working set rather than a copy of
+            # the root selection.
             compress_layer_id = token_to_kv_pool.layer_mapping[
                 c4_indexer.layer_id
             ].compress_layer_id
-            # The previous pair may already have installed resident/LRU
-            # mappings on the prefetch stream.  Join every writer event before
-            # planning fallback misses or exposing those slots to attention.
-            hisparse_coordinator.consume_oasiskv_prefetch(
-                req_pool_indices=forward_batch.req_pool_indices,
-                layer_id=compress_layer_id,
-                req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
-                committed_lens_cpu=forward_batch.seq_lens_cpu,
-            )
-            normal_raw = raw_indices[normal_rows]
-            normal_lens = indexer_metadata.c4_seq_lens[normal_rows]
-            logical_normal = c4_sparse_page_indices[normal_rows].clone()
-            speculative_normal = (
+            logical_indices = c4_sparse_page_indices.clone()
+            speculative_device_locs = (
                 token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
-                    logical_normal
+                    logical_indices
                 ).to(torch.int32)
             )
-            swapped_normal = hisparse_coordinator.swap_in_selected_pages_spec(
+            swapped_locs = hisparse_coordinator.swap_in_selected_pages_spec(
                 req_pool_indices=forward_batch.req_pool_indices,
-                compressed_seq_lens=normal_lens,
-                top_k_result=normal_raw,
+                compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                top_k_result=raw_indices,
                 layer_id=compress_layer_id,
-                # Normal rows are a fixed width-one request-major chain.  Use
-                # the static verify path so CUDA Graph captures only stable
-                # buffers and kernels, never a Python ragged-row plan.
                 verify_lens_cpu=None,
-                output_buffer=c4_sparse_page_indices[normal_rows].contiguous(),
+                output_buffer=c4_sparse_page_indices,
             )
-            normal_device_locs = hisparse_coordinator.select_dspark_scratch_locs(
-                logical_normal,
-                swapped_normal,
-                speculative_normal,
-            )
-            core_metadata.c4_sparse_page_indices[normal_rows] = normal_device_locs
-            core_metadata.c4_sparse_page_indices[draft_rows] = normal_device_locs
-
-            graph_capture = getattr(forward_batch, "is_oasiskv_graph_capture", False)
-            keep = None if graph_capture else valid.to(torch.bool)
-            if graph_capture or torch.any(keep):
-                # Keep this as data until root-only C4 commit/rollback finishes.
-                # Starting H2D after this layer alone would let the prefetch
-                # stream mutate resident/LRU mappings concurrently with the
-                # still-active verify transaction used by later layers.
-                pending = getattr(forward_batch, "_oasiskv_pending_prefetch", None)
-                if pending is None:
-                    pending = {}
-                    forward_batch._oasiskv_pending_prefetch = pending
-                pending[c4_indexer.layer_id] = (
-                    hisparse_coordinator,
-                    dict(
-                        req_pool_indices=(
-                            forward_batch.req_pool_indices
-                            if graph_capture
-                            else forward_batch.req_pool_indices[keep]
-                        ),
-                        req_pool_indices_cpu=(
-                            forward_batch.req_pool_indices_cpu
-                            if graph_capture
-                            else forward_batch.req_pool_indices_cpu[keep.to("cpu")]
-                        ),
-                        compressed_seq_lens=(
-                            normal_lens if graph_capture else normal_lens[keep]
-                        ),
-                        # TARGET_VERIFY keeps prefix lengths (before its inline
-                        # root) in seq_lens_cpu.  After root-only commit the next
-                        # batch is exactly source+1, matching PR10's identity.
-                        source_committed_lens_cpu=(
-                            forward_batch.seq_lens_cpu
-                            if graph_capture
-                            else forward_batch.seq_lens_cpu[keep.to("cpu")]
-                        ),
-                        predicted_c4_entries=(
-                            raw_indices[draft_rows]
-                            if graph_capture
-                            else raw_indices[draft_rows][keep]
-                        ),
-                        layer_id=compress_layer_id,
-                    ),
+            core_metadata.c4_sparse_page_indices = (
+                hisparse_coordinator.select_dspark_scratch_locs(
+                    logical_indices,
+                    swapped_locs,
+                    speculative_device_locs,
                 )
+            )
         elif hisparse_coordinator is not None:
             if hisparse_decode or hisparse_verify:
                 compress_layer_id = token_to_kv_pool.layer_mapping[

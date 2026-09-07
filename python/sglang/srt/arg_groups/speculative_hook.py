@@ -146,12 +146,7 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
 
 def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
-    """Resolve OasisKV without enabling speculative verification.
-
-    The internal EAGLE-3 worker supplies model loading, feature relay and
-    scratch allocation.  Its verify forward is replaced by root-only OasisKV
-    sampling, so no draft token can be accepted.
-    """
+    """Resolve OasisKV to its fixed, one-step EAGLE-3 configuration."""
     try:
         config = json.loads(server_args.hisparse_config or "{}")
     except json.JSONDecodeError:
@@ -167,8 +162,8 @@ def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
         )
     if server_args.speculative_algorithm is not None:
         raise ValueError(
-            'HiSparse prefetcher "oasiskv" is LOOKAHEAD_ONLY and conflicts with '
-            "--speculative-algorithm; speculative acceptance/verification is disabled."
+            'HiSparse prefetcher "oasiskv" selects EAGLE3 automatically and conflicts '
+            "with an explicit --speculative-algorithm."
         )
     conflicts = {
         "--speculative-num-steps": (server_args.speculative_num_steps, 1),
@@ -185,8 +180,6 @@ def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
             )
     server_args.speculative_num_steps = 1
     server_args.speculative_eagle_topk = 1
-    # Internally use EAGLE's allocation/metadata machinery, but the OasisKV
-    # verify path below hard-commits one root token and never accepts a draft.
     server_args.speculative_num_draft_tokens = 2
     server_args.speculative_algorithm = "EAGLE3"
     # Keep CUDA graphs enabled. OasisKV stages request identities before target
@@ -202,8 +195,8 @@ def _handle_oasiskv_lookahead(server_args: ServerArgs) -> None:
     server_args.enforce_disable_flashinfer_allreduce_fusion = True
     server_args.is_oasiskv_lookahead = True
     logger.info(
-        "OasisKV LOOKAHEAD_ONLY enabled: EAGLE-3 steps=1 topk=1; "
-        "draft acceptance/rejection disabled; target and draft graphs enabled"
+        "OasisKV enabled: EAGLE-3 steps=1 topk=1 draft_tokens=2; "
+        "verify Top-K KV is loaded into the HiSparse device buffer"
     )
 
 

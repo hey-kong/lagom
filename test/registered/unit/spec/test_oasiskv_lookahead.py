@@ -5,12 +5,9 @@ import torch
 
 from sglang.srt.arg_groups.speculative_hook import _handle_oasiskv_lookahead
 from sglang.srt.speculative.oasiskv_lookahead import (
-    build_oasiskv_commit,
     build_oasiskv_paired_batch,
-    compute_oasiskv_logprobs,
     configure_oasiskv_forward_batch,
     paired_batch_from_eagle_verify,
-    select_oasiskv_normal_rows,
     submit_oasiskv_layer_prefetch,
     submit_oasiskv_pending_prefetches,
 )
@@ -38,7 +35,7 @@ def _args(**overrides):
     return SimpleNamespace(**values)
 
 
-def test_oasiskv_resolves_dedicated_lookahead_mode():
+def test_oasiskv_resolves_fixed_eagle3_mode():
     args = _args()
     _handle_oasiskv_lookahead(args)
     assert args.is_oasiskv_lookahead
@@ -49,10 +46,10 @@ def test_oasiskv_resolves_dedicated_lookahead_mode():
     assert not args.disable_cuda_graph
 
 
-def test_oasiskv_requires_draft_path_and_rejects_spec_verification():
+def test_oasiskv_requires_draft_path_and_rejects_explicit_algorithm():
     with pytest.raises(ValueError, match="draft-model-path"):
         _handle_oasiskv_lookahead(_args(speculative_draft_model_path=None))
-    with pytest.raises(ValueError, match="LOOKAHEAD_ONLY"):
+    with pytest.raises(ValueError, match="selects EAGLE3 automatically"):
         _handle_oasiskv_lookahead(_args(speculative_algorithm="EAGLE3"))
     with pytest.raises(ValueError, match="num-steps=1"):
         _handle_oasiskv_lookahead(_args(speculative_num_steps=2))
@@ -136,26 +133,7 @@ def test_eagle_verify_forward_batch_does_not_require_extend_only_metadata():
     assert forward_batch.oasiskv_normal_rows.tolist() == [0, 2]
 
 
-def test_draft_extend_keeps_only_normal_target_features_and_cache_locs():
-    features = torch.tensor([[10], [11], [20], [21]])
-    cache_locs = torch.tensor([100, 101, 200, 201])
-
-    assert select_oasiskv_normal_rows(features).tolist() == [[10], [20]]
-    assert select_oasiskv_normal_rows(cache_locs).tolist() == [100, 200]
-
-
-def test_commit_is_always_one_request_major_normal_row():
-    accept_lens, accept_index = build_oasiskv_commit(
-        torch.tensor([0, 2, 4]), batch_size=3, device="cpu"
-    )
-    assert accept_lens.tolist() == [1, 1, 1]
-    assert accept_index.tolist() == [[0], [2], [4]]
-
-    with pytest.raises(ValueError, match="pair roots"):
-        build_oasiskv_commit(torch.tensor([0, 1, 4]), batch_size=3, device="cpu")
-
-
-def test_logits_processor_selects_only_normal_rows_for_oasiskv():
+def test_logits_processor_keeps_both_eagle_verify_rows_for_oasiskv():
     from sglang.srt.layers.logits_processor import LogitsMetadata
 
     normal_rows = torch.tensor([0, 2])
@@ -187,28 +165,7 @@ def test_logits_processor_selects_only_normal_rows_for_oasiskv():
             oasiskv_normal_rows=normal_rows,
         )
     )
-    assert metadata.output_select_index is normal_rows
-
-
-def test_logprobs_use_compacted_normal_rows_not_verify_pair_indices():
-    batch = SimpleNamespace(
-        seq_lens=torch.tensor([7, 13]),
-        sampling_info=SimpleNamespace(is_all_greedy=True),
-        top_logprobs_nums=None,
-        token_ids_logprobs=None,
-    )
-    logits_output = SimpleNamespace(
-        # These are already the compacted normal rows for requests 0 and 1.
-        next_token_logits=torch.tensor([[2.0, 0.0], [0.0, 3.0]])
-    )
-
-    compute_oasiskv_logprobs(batch, logits_output, torch.tensor([0, 1]))
-
-    expected = torch.log_softmax(logits_output.next_token_logits, dim=-1)[
-        torch.arange(2), torch.tensor([0, 1])
-    ]
-    assert logits_output.next_token_logprobs.shape == (2, 1)
-    torch.testing.assert_close(logits_output.next_token_logprobs[:, 0], expected)
+    assert metadata.output_select_index is None
 
 
 def test_pending_prefetch_is_drained_once_after_verify_transaction():
@@ -310,8 +267,8 @@ def test_cuda_graph_replay_joins_all_layers_and_publishes_live_batch_metadata():
     assert submitted["predicted_c4_entries"].tolist() == predicted[:2].tolist()
 
 
-def test_oasiskv_graph_logits_and_hidden_states_have_different_live_widths():
-    """Graph padding must use B for logits but 2B for paired hidden states."""
+def test_oasiskv_graph_keeps_full_eagle_verify_logits_and_hidden_states():
+    """Graph padding must keep both root and draft rows for EAGLE sampling."""
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
@@ -331,7 +288,7 @@ def test_oasiskv_graph_logits_and_hidden_states_have_different_live_widths():
     # graph backend: the helper is deliberately factored for CPU regression.
     compact = runner._slice_replay_output(graph_output, forward_batch)
 
-    assert compact.next_token_logits.shape == (2, 4)
+    assert compact.next_token_logits.shape == (4, 4)
     assert compact.hidden_states.shape == (4, 4)
 
 

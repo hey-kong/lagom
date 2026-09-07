@@ -622,31 +622,11 @@ def run_eagle_verify(
         # grammar masking, diagnostics, or sampling must restore C4 mappings.
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-        if oasiskv_lookahead:
-            # Root/normal rows alone determine generated output.  Draft logits
-            # are target probes and never enter accept/reject sampling.
-            from sglang.srt.speculative.oasiskv_lookahead import (
-                build_oasiskv_commit,
-            )
-
-            normal_rows = verify_forward_batch.oasiskv_normal_rows
-            # LogitsProcessor has already restricted the expensive LM head to
-            # the B normal rows. The 2B hidden states remain available for the
-            # EAGLE feature relay, but draft logits are intentionally absent.
-            if logits_output.next_token_logits.shape[0] != bs:
-                raise RuntimeError(
-                    "OasisKV LM head must return one normal row per request"
-                )
-            predict = target_worker.model_runner.sample(
-                logits_output, verify_forward_batch
-            ).reshape(-1)
-            accept_lens, accept_index = build_oasiskv_commit(normal_rows, bs, device)
-        else:
-            (
-                predict,
-                accept_lens,
-                accept_index,
-            ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+        (
+            predict,
+            accept_lens,
+            accept_index,
+        ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
         if hisparse_window is not None:
             # Grammar is rejected above, so accept_lens cannot subsequently be
             # shortened by the scheduler's grammar result processing.
@@ -688,9 +668,7 @@ def run_eagle_verify(
         num_draft_tokens,
     )
 
-    if not batch.forward_mode.is_idle() and oasiskv_lookahead:
-        bonus_tokens = predict.to(torch.int32)
-    elif not batch.forward_mode.is_idle():
+    if not batch.forward_mode.is_idle():
         accept_tokens = predict[accept_index]
         bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
         # stride = accept_tokens per-req width = accept_index.shape[1]
@@ -706,16 +684,7 @@ def run_eagle_verify(
         bonus_tokens = torch.empty((0,), device=device, dtype=torch.int32)
 
     if batch.return_logprob and not batch.forward_mode.is_idle():
-        if oasiskv_lookahead:
-            from sglang.srt.speculative.oasiskv_lookahead import (
-                compute_oasiskv_logprobs,
-            )
-
-            compute_oasiskv_logprobs(batch, logits_output, predict)
-        else:
-            compute_spec_logprobs(
-                batch, logits_output, predict, accept_index=accept_index
-            )
+        compute_spec_logprobs(batch, logits_output, predict, accept_index=accept_index)
 
     if finalize_tree_path and not batch.forward_mode.is_idle() and topk > 1:
         # topk == 1 needs nothing here: the accepted path is already the front

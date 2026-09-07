@@ -1499,17 +1499,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             else:
                 full_logits = None
-                # OasisKV prunes the paired 2B hidden rows to B normal rows
-                # before the LM head. ``raw_num_token`` still describes the
-                # paired hidden-state output, so using it for logits preserves
-                # graph-bucket padding and violates the root-only contract.
-                raw_num_logits = (
-                    forward_batch.batch_size
-                    if getattr(forward_batch, "is_oasiskv_paired", False)
-                    else self.raw_num_token
-                )
                 next_token_logits = (
-                    output.next_token_logits[:raw_num_logits]
+                    output.next_token_logits[: self.raw_num_token]
                     if output.next_token_logits is not None
                     else None
                 )
