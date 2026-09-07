@@ -549,6 +549,7 @@ class HiSparseCoordinator:
             self._previous_prefetch_target_layer = None
             self._previous_prefetch_num_reqs = 0
             self._previous_prefetch_pending_entries = 0
+            self._ema_graph_work_pending = False
             # A monotonically increasing incarnation prevents an async copy
             # planned for a finished request from being consumed after its
             # scheduler slot is reused.
@@ -1323,14 +1324,14 @@ class HiSparseCoordinator:
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
         if self.prefetcher is not None:
-            if (
-                self.prefetcher_name != "oasiskv"
-                and self._previous_prefetch_pending_entries
+            if self.prefetcher_name != "oasiskv" and (
+                self._previous_prefetch_pending_entries or self._ema_graph_work_pending
             ):
                 # Host pages and resident slots are reclaimed synchronously
                 # below, so an enqueued stream dependency is not sufficient.
                 self._previous_prefetch_event.synchronize()
                 self._previous_prefetch_pending_entries = 0
+                self._ema_graph_work_pending = False
                 self._previous_prefetch_target_layer = None
             self._prefetch_generation[req.req_pool_idx] += 1
             release = getattr(self.prefetcher, "release_request", None)
@@ -1628,7 +1629,7 @@ class HiSparseCoordinator:
 
     def consume_ema_prefetch(self) -> None:
         """Order decode-graph replay after the prior EMA side-stream writer."""
-        if self.prefetcher_name != "ema" or not self._previous_prefetch_pending_entries:
+        if self.prefetcher_name != "ema" or not self._ema_graph_work_pending:
             return
         self._previous_prefetch_event.wait(device_module.current_stream())
         self.prefetcher.stats.completed_h2d_entries += (
@@ -1636,6 +1637,7 @@ class HiSparseCoordinator:
         )
         self._previous_prefetch_pending_entries = 0
         self._previous_prefetch_target_layer = None
+        self._ema_graph_work_pending = False
 
     def submit_ema_prefetch(
         self,
@@ -1650,21 +1652,58 @@ class HiSparseCoordinator:
         """Update EMA and warm one layer after current graph attention finishes."""
         if self.prefetcher_name != "ema" or self.prefetcher is None:
             raise RuntimeError("submit_ema_prefetch requires EMA mode")
-        candidates = self.prefetcher.update(
-            scores,
-            compressed_seq_lens_cpu,
-            req_pool_indices_cpu,
-            layer_id,
-            self.indexer_prefetch_candidates_buffer[: scores.shape[0]],
-            seq_lens_device=compressed_seq_lens,
-        )
-        if candidates is not None:
-            self._submit_previous_prefetch_to_layer(
-                req_pool_indices,
-                compressed_seq_lens,
-                candidates,
+        num_reqs = scores.shape[0]
+        # Keep EMA math, Top-M, RESOLVE, and H2D off the compute stream. The
+        # replay pre-hook joins this event before graph-pool scores or resident
+        # mappings can be reused; consecutive layers serialize naturally on
+        # the same side stream and safely share their plan buffers.
+        self._previous_prefetch_stream.wait_stream(device_module.current_stream())
+        with device_module.stream(self._previous_prefetch_stream):
+            candidates = self.prefetcher.update(
+                scores,
+                compressed_seq_lens_cpu,
+                req_pool_indices_cpu,
                 layer_id,
+                self.indexer_prefetch_candidates_buffer[:num_reqs],
+                seq_lens_device=compressed_seq_lens,
             )
+            if candidates is not None:
+                selected = self.prefetcher.select(candidates)
+                self._prefetch_candidate_buffer[:num_reqs].copy_(selected)
+                self._run_swap_in_kernel(
+                    req_pool_indices,
+                    compressed_seq_lens,
+                    self._prefetch_candidate_buffer[:num_reqs],
+                    layer_id,
+                    record_plan=True,
+                    num_top_k=self.prefetcher.logical_entries,
+                    output_buffer=self._previous_prefetch_device_locs,
+                    miss_plan=(
+                        self._previous_miss_src,
+                        self._previous_miss_dst,
+                        self._previous_miss_count,
+                    ),
+                    skip_io=True,
+                )
+                copy_cache_planned_mla(
+                    miss_src=self._previous_miss_src[:num_reqs],
+                    miss_dst=self._previous_miss_dst[:num_reqs],
+                    miss_count=self._previous_miss_count[:num_reqs],
+                    num_real_reqs=self.num_real_reqs,
+                    host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                    device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                    item_size_bytes=self.item_size_bytes,
+                    num_blocks=4,
+                    is_dsv4_layout=self.is_dsv4_hisparse,
+                    skip_io=self.skip_io,
+                )
+                submitted = num_reqs * self.prefetcher.logical_entries
+                self._previous_prefetch_pending_entries += submitted
+                self.prefetcher.stats.submitted_entries += submitted
+            self._previous_prefetch_event.record(self._previous_prefetch_stream)
+        self._previous_prefetch_target_layer = layer_id
+        self._previous_prefetch_num_reqs = num_reqs
+        self._ema_graph_work_pending = True
 
     def _submit_previous_prefetch_to_layer(
         self, req_pool_indices, compressed_seq_lens, candidates, target_layer

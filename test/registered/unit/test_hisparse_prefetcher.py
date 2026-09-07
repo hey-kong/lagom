@@ -212,7 +212,9 @@ def test_ema_first_observation_skips_then_updates_level_and_trend():
     second = torch.tensor([[3.0, 2.0, 5.0]])
     predicted = prefetcher.update(second, torch.tensor([3]), [11], 2)
     # level=[2.2, 2.8, 3.8], trend=[.4, -.4, .6], forecast=[2.3,2.7,3.95]
-    assert torch.equal(predicted, torch.tensor([[2, 1]], dtype=torch.int32))
+    assert torch.equal(
+        predicted.sort(dim=1).values, torch.tensor([[1, 2]], dtype=torch.int32)
+    )
     # Predictions are side data: the current Indexer Top-K stays byte-for-byte intact.
     assert torch.equal(formal_top_k, torch.tensor([[7, 8]], dtype=torch.int32))
 
@@ -260,7 +262,9 @@ def test_ema_new_request_only_skips_its_own_batch_row():
         0,
     )
 
-    assert torch.equal(selected[0], torch.tensor([1, 0], dtype=torch.int32))
+    assert torch.equal(
+        selected[0].sort().values, torch.tensor([0, 1], dtype=torch.int32)
+    )
     assert torch.equal(selected[1], torch.tensor([-1, -1], dtype=torch.int32))
     assert prefetcher.stats.selected_entries == 2
 

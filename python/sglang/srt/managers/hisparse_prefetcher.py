@@ -186,7 +186,9 @@ class EMAPrefetcher(HiSparsePrefetcher):
     ):
         super().__init__(logical_entries, size)
         self.alpha, self.beta, self.gamma = alpha, beta, gamma
-        self._state: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._state: Dict[
+            Tuple[int, int], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
 
     def select(self, previous):
         """EMA consumes scores through :meth:`update`; indices are passed through."""
@@ -226,6 +228,7 @@ class EMAPrefetcher(HiSparsePrefetcher):
         width = scores.shape[1]
         old_levels = []
         old_trends = []
+        old_masks = []
         initialized = []
         keys = []
         for slot in slots:
@@ -234,10 +237,10 @@ class EMAPrefetcher(HiSparsePrefetcher):
             old = self._state.get(key)
             if old is None:
                 old_level = old_trend = scores.new_zeros(width, dtype=torch.float32)
-                old_length = 0
+                old_mask = torch.zeros(width, dtype=torch.bool, device=scores.device)
                 initialized.append(False)
             else:
-                old_level, old_trend = old
+                old_level, old_trend, old_mask = old
                 old_length = min(old_level.numel(), width)
                 if old_length < width:
                     old_level = torch.nn.functional.pad(
@@ -246,35 +249,24 @@ class EMAPrefetcher(HiSparsePrefetcher):
                     old_trend = torch.nn.functional.pad(
                         old_trend, (0, width - old_length)
                     )
+                    old_mask = torch.nn.functional.pad(
+                        old_mask, (0, width - old_length)
+                    )
                 else:
                     old_level = old_level[:width]
                     old_trend = old_trend[:width]
+                    old_mask = old_mask[:width]
                 initialized.append(True)
             old_levels.append(old_level)
             old_trends.append(old_trend)
+            old_masks.append(old_mask)
 
         current = scores.detach().float()
         previous_level = torch.stack(old_levels)
         previous_trend = torch.stack(old_trends)
         positions = torch.arange(width, device=scores.device).unsqueeze(0)
         valid = positions < seq_lens_device.unsqueeze(1)
-        # Every stored position has history. Build this mask from the already
-        # resident state tensors, avoiding Python-list -> CUDA metadata copies.
-        has_history = torch.stack(
-            [
-                torch.nn.functional.pad(
-                    torch.ones(
-                        min(self._state[key][0].numel(), width),
-                        dtype=torch.bool,
-                        device=scores.device,
-                    ),
-                    (0, max(0, width - self._state[key][0].numel())),
-                )[:width]
-                if key in self._state
-                else torch.zeros(width, dtype=torch.bool, device=scores.device)
-                for key in keys
-            ]
-        )
+        has_history = torch.stack(old_masks)
         updated_level = self.alpha * current + (1.0 - self.alpha) * previous_level
         updated_trend = (
             self.beta * (current - previous_level) + (1.0 - self.beta) * previous_trend
@@ -285,10 +277,14 @@ class EMAPrefetcher(HiSparsePrefetcher):
         ).masked_fill(~valid, 0)
         forecast = (level + self.gamma * trend).masked_fill(~valid, float("-inf"))
 
-        for row, (key, length) in enumerate(zip(keys, lengths)):
+        for row, key in enumerate(keys):
+            # Store views of the batch result rather than cloning level/trend
+            # once per request. The next update is functional and never mutates
+            # these tensors, so sharing the batch backing storage is safe.
             self._state[key] = (
-                level[row, :length].clone(),
-                trend[row, :length].clone(),
+                level[row],
+                trend[row],
+                valid[row],
             )
 
         if not any(initialized):
@@ -304,7 +300,9 @@ class EMAPrefetcher(HiSparsePrefetcher):
             )
         output.fill_(-1)
         actual_k = min(self.logical_entries, width)
-        values, indices = torch.topk(forecast, actual_k, dim=1, sorted=True)
+        # Prefetch consumes a set, not a score-ordered list. Avoid the costly
+        # sort that formal attention needs but residency warming does not.
+        values, indices = torch.topk(forecast, actual_k, dim=1, sorted=False)
         row_initialized = has_history.any(dim=1, keepdim=True)
         selected = indices.to(torch.int32).masked_fill(
             (values == float("-inf")) | ~row_initialized, -1

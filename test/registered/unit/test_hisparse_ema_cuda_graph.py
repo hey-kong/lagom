@@ -29,6 +29,7 @@ def test_graph_replay_joins_previous_ema_writer(monkeypatch):
     coordinator._previous_prefetch_event = event
     coordinator._previous_prefetch_pending_entries = 17
     coordinator._previous_prefetch_target_layer = 3
+    coordinator._ema_graph_work_pending = True
     monkeypatch.setattr(
         coordinator_module.device_module, "current_stream", lambda: "compute"
     )
@@ -38,6 +39,7 @@ def test_graph_replay_joins_previous_ema_writer(monkeypatch):
     assert event.waited_on == "compute"
     assert coordinator._previous_prefetch_pending_entries == 0
     assert coordinator._previous_prefetch_target_layer is None
+    assert not coordinator._ema_graph_work_pending
     assert coordinator.prefetcher.stats.completed_h2d_entries == 17
 
 
