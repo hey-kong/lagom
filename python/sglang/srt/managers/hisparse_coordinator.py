@@ -1718,11 +1718,10 @@ class HiSparseCoordinator:
             )
             if candidates is not None:
                 selected = self.prefetcher.select(candidates)
-                self._prefetch_candidate_buffer[:num_reqs].copy_(selected)
                 self._run_swap_in_kernel(
                     req_pool_indices,
                     compressed_seq_lens,
-                    self._prefetch_candidate_buffer[:num_reqs],
+                    selected,
                     layer_id,
                     record_plan=True,
                     num_top_k=self.prefetcher.logical_entries,

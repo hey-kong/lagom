@@ -351,6 +351,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Graph-keyed references to replayed EMA Indexer scores. EMA state and
         # H2D task descriptors remain ordinary Python and are updated post-replay.
         self._ema_graph_prefetch: dict[object, dict] = {}
+        # Graph outputs are overwritten by the next replay. These persistent
+        # snapshots are reused only after that replay's per-layer waits have
+        # completed the preceding EMA task.
+        self._ema_snapshot_buffers: dict[object, dict] = {}
         if self.ragged_verify_mode and (
             self.enable_two_batch_overlap
             or model_runner.server_args.enable_lora
@@ -1318,6 +1322,58 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raise RuntimeError("EMA CUDA Graph replay requires CPU sequence lengths")
         c4_seq_lens_cpu = (forward_batch.seq_lens_cpu // 4).clamp_min(1)
         max_c4_len = int(c4_seq_lens_cpu.max())
+        snapshot_buffers = getattr(self, "_ema_snapshot_buffers", None)
+        if snapshot_buffers is None:
+            snapshot_buffers = self._ema_snapshot_buffers = {}
+        snapshot = snapshot_buffers.setdefault(self._replay_graph_key, {})
+        first = next(iter(templates.values()))
+        max_c4_pages = max(
+            (
+                min(
+                    item["scores"].shape[1],
+                    ((max_c4_len + 255) // 256) * 256,
+                )
+                + item["page_size"]
+                - 1
+            )
+            // item["page_size"]
+            for item in templates.values()
+        )
+
+        def ensure_buffer(name, source, shape):
+            buffer = snapshot.get(name)
+            if buffer is None or any(
+                have < need for have, need in zip(buffer.shape, shape)
+            ):
+                buffer = torch.empty(shape, dtype=source.dtype, device=source.device)
+                snapshot[name] = buffer
+            return buffer
+
+        # Request metadata and page tables are shared by all C4 layers. Copy
+        # them once per decode step instead of once per layer.
+        req_pool_indices = ensure_buffer(
+            "req_pool_indices", forward_batch.req_pool_indices, (raw_bs,)
+        )[:raw_bs]
+        req_pool_indices.copy_(forward_batch.req_pool_indices)
+        compressed_seq_lens = ensure_buffer(
+            "compressed_seq_lens", first["compressed_seq_lens"], (raw_bs,)
+        )[:raw_bs]
+        compressed_seq_lens.copy_(first["compressed_seq_lens"][:raw_bs])
+        page_table = ensure_buffer(
+            "page_table", first["page_table"], (raw_bs, max_c4_pages)
+        )[:raw_bs, :max_c4_pages]
+        page_table.copy_(first["page_table"][:raw_bs, :max_c4_pages])
+        num_real_reqs = ensure_buffer("num_real_reqs", coordinator.num_real_reqs, (1,))
+        num_real_reqs.fill_(raw_bs)
+        req_pool_indices_cpu = ensure_buffer(
+            "req_pool_indices_cpu", forward_batch.req_pool_indices_cpu, (raw_bs,)
+        )[:raw_bs]
+        req_pool_indices_cpu.copy_(forward_batch.req_pool_indices_cpu)
+        compressed_seq_lens_cpu = ensure_buffer(
+            "compressed_seq_lens_cpu", c4_seq_lens_cpu, (raw_bs,)
+        )[:raw_bs]
+        compressed_seq_lens_cpu.copy_(c4_seq_lens_cpu)
+
         for captured in templates.values():
             page_size = captured["page_size"]
             ema_width = min(
@@ -1329,18 +1385,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # consumed by the asynchronous task now, on the compute stream.
             # The side stream waits for these copies, while the next graph is
             # free to overwrite its own score and metadata buffers.
-            scores = captured["scores"][:raw_bs, :ema_width].clone()
-            compressed_seq_lens = captured["compressed_seq_lens"][:raw_bs].clone()
-            page_table = captured["page_table"][:raw_bs, :num_c4_pages].clone()
-            req_pool_indices = forward_batch.req_pool_indices.clone()
-            num_real_reqs = coordinator.num_real_reqs.new_full((1,), raw_bs)
+            score_buffers = snapshot.setdefault("scores", {})
+            scores = score_buffers.get(captured["layer_id"])
+            if (
+                scores is None
+                or scores.shape[0] < raw_bs
+                or scores.shape[1] < ema_width
+            ):
+                scores = torch.empty(
+                    (raw_bs, ema_width),
+                    dtype=captured["scores"].dtype,
+                    device=captured["scores"].device,
+                )
+                score_buffers[captured["layer_id"]] = scores
+            scores = scores[:raw_bs, :ema_width]
+            scores.copy_(captured["scores"][:raw_bs, :ema_width])
             coordinator.submit_ema_prefetch(
                 req_pool_indices=req_pool_indices,
-                req_pool_indices_cpu=forward_batch.req_pool_indices_cpu.clone(),
+                req_pool_indices_cpu=req_pool_indices_cpu,
                 compressed_seq_lens=compressed_seq_lens,
-                compressed_seq_lens_cpu=c4_seq_lens_cpu.clone(),
+                compressed_seq_lens_cpu=compressed_seq_lens_cpu,
                 scores=scores,
-                page_table=page_table,
+                page_table=page_table[:, :num_c4_pages],
                 page_size=page_size,
                 num_real_reqs=num_real_reqs,
                 layer_id=captured["layer_id"],

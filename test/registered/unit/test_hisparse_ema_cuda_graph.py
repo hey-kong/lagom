@@ -135,3 +135,21 @@ def test_graph_replay_submits_live_batch_with_captured_scores():
     assert kwargs["page_size"] == 1
     assert kwargs["num_real_reqs"].item() == 2
     assert kwargs["layer_id"] == 2
+
+    snapshot_ptrs = {
+        name: kwargs[name].data_ptr()
+        for name in (
+            "req_pool_indices",
+            "compressed_seq_lens",
+            "scores",
+            "page_table",
+            "num_real_reqs",
+        )
+    }
+    batch.req_pool_indices.copy_(torch.tensor([7, 8]))
+    runner._submit_ema_graph_prefetch(batch)
+    next_kwargs = calls[-1][1]
+    assert all(
+        next_kwargs[name].data_ptr() == pointer
+        for name, pointer in snapshot_ptrs.items()
+    )
