@@ -75,3 +75,32 @@ def test_cuda_prefetcher_accepts_separate_cpu_and_device_request_indices():
         )
         is None
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fused_ema_accepts_growing_runtime_widths():
+    from sglang.kernels.ops.attention.dsv4.ema import ema_update_forecast
+
+    levels = torch.zeros((1, 513), dtype=torch.float32, device="cuda")
+    trends = torch.zeros_like(levels)
+    state_lens = torch.zeros(1, dtype=torch.int32, device="cuda")
+    prediction_lens = torch.empty(1, dtype=torch.int32, device="cuda")
+    reqs = torch.zeros(1, dtype=torch.int32, device="cuda")
+
+    for width in (257, 513):
+        scores = torch.ones((1, width), dtype=torch.float32, device="cuda")
+        forecast = torch.empty_like(scores)
+        result = ema_update_forecast(
+            scores,
+            reqs,
+            torch.tensor([width], dtype=torch.int32, device="cuda"),
+            levels,
+            trends,
+            state_lens,
+            prediction_lens,
+            forecast,
+            alpha=0.6,
+            beta=0.2,
+            gamma=0.25,
+        )
+        torch.testing.assert_close(result, scores)

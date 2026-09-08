@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["width"])
 def _ema_update_forecast_kernel(
     scores,
     req_indices,
@@ -17,7 +17,7 @@ def _ema_update_forecast_kernel(
     score_stride,
     forecast_stride,
     state_stride,
-    width: tl.constexpr,
+    width,
     alpha: tl.constexpr,
     beta: tl.constexpr,
     gamma: tl.constexpr,
