@@ -206,6 +206,9 @@ class EMAPrefetcher(HiSparsePrefetcher):
         layer_id: int,
         out_indices: Optional[torch.Tensor] = None,
         seq_lens_device: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
+        page_size: int = 1,
+        out_page_indices: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """Update observations and predict the next decode token's score ranking.
 
@@ -300,14 +303,37 @@ class EMAPrefetcher(HiSparsePrefetcher):
             )
         output.fill_(-1)
         actual_k = min(self.logical_entries, width)
-        # Prefetch consumes a set, not a score-ordered list. Avoid the costly
-        # sort that formal attention needs but residency warming does not.
-        values, indices = torch.topk(forecast, actual_k, dim=1, sorted=False)
         row_initialized = has_history.any(dim=1, keepdim=True)
-        selected = indices.to(torch.int32).masked_fill(
-            (values == float("-inf")) | ~row_initialized, -1
-        )
-        output[:, :actual_k].copy_(selected)
+        if (
+            scores.device.type == "cuda"
+            and page_table is not None
+            and out_page_indices is not None
+            and actual_k == self.logical_entries
+            and self.logical_entries <= 1024
+        ):
+            # Reuse DSV4's optimized fused selection kernel. Its raw output is
+            # exactly the logical C4 position wanted by HiSparse; physical page
+            # output is scratch only. This avoids generic torch.topk, the main
+            # remaining EMA cost at long context.
+            from sglang.kernels.ops.attention.dsv4 import topk_transform_512
+
+            topk_transform_512(
+                forecast,
+                seq_lens_device,
+                page_table,
+                out_page_indices,
+                page_size,
+                output,
+            )
+            output.masked_fill_(~row_initialized, -1)
+        else:
+            # CPU tests and unsupported candidate widths retain a portable path.
+            # Prefetch consumes a set, so score ordering is unnecessary.
+            values, indices = torch.topk(forecast, actual_k, dim=1, sorted=False)
+            selected = indices.to(torch.int32).masked_fill(
+                (values == float("-inf")) | ~row_initialized, -1
+            )
+            output[:, :actual_k].copy_(selected)
         self.stats.selected_entries += sum(
             min(self.logical_entries, length)
             for length, ready in zip(lengths, initialized)

@@ -919,6 +919,8 @@ class C4IndexerBackendMixin:
                     pending[compress_layer_id] = dict(
                         scores=logits,
                         compressed_seq_lens=c4_seq_lens,
+                        page_table=page_table,
+                        page_size=indexer_metadata.c4_page_size,
                         layer_id=compress_layer_id,
                     )
                 else:
@@ -940,6 +942,11 @@ class C4IndexerBackendMixin:
                         compress_layer_id,
                         candidate_output,
                         seq_lens_device=c4_seq_lens,
+                        page_table=page_table,
+                        page_size=indexer_metadata.c4_page_size,
+                        out_page_indices=hisparse_coordinator._ema_topk_page_locs[
+                            : c4_sparse_page_indices.size(0)
+                        ],
                     )
             else:
                 prefetch_candidates = get_prefetch_candidates(

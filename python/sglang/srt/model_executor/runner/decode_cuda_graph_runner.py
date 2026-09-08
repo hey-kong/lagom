@@ -1324,6 +1324,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 compressed_seq_lens=captured["compressed_seq_lens"][:raw_bs],
                 compressed_seq_lens_cpu=c4_seq_lens_cpu,
                 scores=captured["scores"][:raw_bs],
+                page_table=captured["page_table"][:raw_bs],
+                page_size=captured["page_size"],
                 layer_id=captured["layer_id"],
             )
 

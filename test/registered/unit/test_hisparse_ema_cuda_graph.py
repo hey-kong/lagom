@@ -55,11 +55,14 @@ def test_graph_replay_submits_live_batch_with_captured_scores():
     runner._replay_graph_key = "bs4"
     scores = torch.arange(24, dtype=torch.float32).view(4, 6)
     compressed_lens = torch.tensor([6, 5, 1, 1])
+    page_table = torch.arange(24, dtype=torch.int32).view(4, 6)
     runner._ema_graph_prefetch = {
         "bs4": {
             2: {
                 "scores": scores,
                 "compressed_seq_lens": compressed_lens,
+                "page_table": page_table,
+                "page_size": 1,
                 "layer_id": 2,
             }
         }
@@ -81,4 +84,6 @@ def test_graph_replay_submits_live_batch_with_captured_scores():
     assert torch.equal(kwargs["scores"], scores[:2])
     assert torch.equal(kwargs["compressed_seq_lens"], compressed_lens[:2])
     assert torch.equal(kwargs["compressed_seq_lens_cpu"], torch.tensor([6, 5]))
+    assert torch.equal(kwargs["page_table"], page_table[:2])
+    assert kwargs["page_size"] == 1
     assert kwargs["layer_id"] == 2
