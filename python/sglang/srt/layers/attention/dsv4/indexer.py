@@ -946,6 +946,7 @@ class C4IndexerBackendMixin:
                         forward_batch.req_pool_indices_cpu,
                         compress_layer_id,
                         candidate_output,
+                        req_pool_indices_device=forward_batch.req_pool_indices,
                         seq_lens_device=c4_seq_lens,
                         page_table=page_table,
                         page_size=c4_page_size,

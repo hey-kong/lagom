@@ -209,9 +209,10 @@ class EMAPrefetcher(HiSparsePrefetcher):
         self,
         scores: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
-        req_pool_indices,
+        req_pool_indices_cpu,
         layer_id: int,
         out_indices: Optional[torch.Tensor] = None,
+        req_pool_indices_device: Optional[torch.Tensor] = None,
         seq_lens_device: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         page_size: int = 1,
@@ -222,7 +223,7 @@ class EMAPrefetcher(HiSparsePrefetcher):
         The first observation for any request/layer initializes state and emits
         no prediction. State follows request-pool identity, not batch row order.
         """
-        slots = torch.as_tensor(req_pool_indices, device="cpu").tolist()
+        slots = torch.as_tensor(req_pool_indices_cpu, device="cpu").tolist()
         lengths = torch.as_tensor(seq_lens_cpu, device="cpu").tolist()
         if len(slots) != scores.shape[0]:
             raise ValueError("EMA request identities must match score rows")
@@ -236,11 +237,20 @@ class EMAPrefetcher(HiSparsePrefetcher):
             raise ValueError("EMA device sequence lengths must match score rows")
 
         if scores.device.type == "cuda":
+            if req_pool_indices_device is None:
+                raise ValueError("EMA CUDA scores require device request identities")
+            if (
+                not req_pool_indices_device.is_cuda
+                or req_pool_indices_device.shape[0] != scores.shape[0]
+            ):
+                raise ValueError(
+                    "EMA device request identities must be CUDA and match score rows"
+                )
             return self._update_cuda(
                 scores=scores,
                 seq_lens_cpu=lengths,
                 req_pool_indices_cpu=slots,
-                req_pool_indices_device=req_pool_indices,
+                req_pool_indices_device=req_pool_indices_device,
                 seq_lens_device=seq_lens_device,
                 layer_id=layer_id,
                 out_indices=out_indices,

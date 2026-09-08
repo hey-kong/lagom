@@ -1710,6 +1710,7 @@ class HiSparseCoordinator:
                 req_pool_indices_cpu,
                 layer_id,
                 self.indexer_prefetch_candidates_buffer[:num_reqs],
+                req_pool_indices_device=req_pool_indices,
                 seq_lens_device=compressed_seq_lens,
                 page_table=page_table,
                 page_size=page_size,

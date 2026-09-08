@@ -56,3 +56,22 @@ def test_fused_ema_update_forecast_uses_request_indexed_state():
     expected_trend = 0.2 * (second[0, :3] - old_for_req_2)
     torch.testing.assert_close(forecast[0, :3], expected_level + 0.25 * expected_trend)
     assert prediction_lens.tolist() == [3, 4]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_prefetcher_accepts_separate_cpu_and_device_request_indices():
+    from sglang.srt.managers.hisparse_prefetcher import EMAPrefetcher
+
+    prefetcher = EMAPrefetcher(logical_entries=2)
+    scores = torch.tensor([[1.0, 2.0]], device="cuda")
+    assert (
+        prefetcher.update(
+            scores,
+            torch.tensor([2]),
+            [5],
+            layer_id=0,
+            req_pool_indices_device=torch.tensor([5], dtype=torch.int32, device="cuda"),
+            seq_lens_device=torch.tensor([2], dtype=torch.int32, device="cuda"),
+        )
+        is None
+    )
