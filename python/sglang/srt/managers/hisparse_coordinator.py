@@ -1287,6 +1287,23 @@ class HiSparseCoordinator:
                     task.valid = False
                     self.prefetcher.stats.stale_tasks += 1
 
+    def _drain_named_prefetch_before_request_release(self) -> None:
+        """CPU-block until named-prefetch table readers/writers are finished."""
+        if (
+            self.prefetcher is None
+            or self.prefetcher_name == "oasiskv"
+            or not (
+                self._previous_prefetch_pending_entries or self._ema_graph_work_pending
+            )
+        ):
+            return
+        # RESOLVE reads req/host/device mappings before its H2D writer runs.
+        # Synchronize before *any* of those tables or their slots are reclaimed.
+        self._previous_prefetch_event.synchronize()
+        self._previous_prefetch_pending_entries = 0
+        self._ema_graph_work_pending = False
+        self._previous_prefetch_target_layer = None
+
     def request_finished(self, req: Req):
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
@@ -1295,6 +1312,9 @@ class HiSparseCoordinator:
         # This must precede *all* device mapping and host-page reclamation:
         # OasisKV DMA reads the request's host pages and writes resident slots.
         self._drain_oasiskv_tasks_for_request(req.req_pool_idx)
+        # EMA/previous RESOLVE also reads the shared request mappings. This must
+        # precede allocator frees, mapping clears, and host-page reclamation.
+        self._drain_named_prefetch_before_request_release()
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
         # allocator can over-allocate beyond the committed seqlen, and those
@@ -1338,15 +1358,6 @@ class HiSparseCoordinator:
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
         if self.prefetcher is not None:
-            if self.prefetcher_name != "oasiskv" and (
-                self._previous_prefetch_pending_entries or self._ema_graph_work_pending
-            ):
-                # Host pages and resident slots are reclaimed synchronously
-                # below, so an enqueued stream dependency is not sufficient.
-                self._previous_prefetch_event.synchronize()
-                self._previous_prefetch_pending_entries = 0
-                self._ema_graph_work_pending = False
-                self._previous_prefetch_target_layer = None
             self._prefetch_generation[req.req_pool_idx] += 1
             release = getattr(self.prefetcher, "release_request", None)
             if release is not None:

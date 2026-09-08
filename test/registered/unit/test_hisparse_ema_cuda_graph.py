@@ -14,9 +14,13 @@ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
 class _Event:
     def __init__(self):
         self.waited_on = None
+        self.synchronized = False
 
     def wait(self, stream):
         self.waited_on = stream
+
+    def synchronize(self):
+        self.synchronized = True
 
 
 def test_graph_replay_accounts_previous_ema_writer():
@@ -35,6 +39,24 @@ def test_graph_replay_accounts_previous_ema_writer():
     assert coordinator._previous_prefetch_target_layer is None
     assert not coordinator._ema_graph_work_pending
     assert coordinator.prefetcher.stats.completed_h2d_entries == 17
+
+
+def test_request_release_drains_ema_before_shared_tables_are_cleared():
+    event = _Event()
+    coordinator = object.__new__(HiSparseCoordinator)
+    coordinator.prefetcher_name = "ema"
+    coordinator.prefetcher = SimpleNamespace(stats=HiSparsePrefetchStats())
+    coordinator._previous_prefetch_event = event
+    coordinator._previous_prefetch_pending_entries = 8
+    coordinator._previous_prefetch_target_layer = 1
+    coordinator._ema_graph_work_pending = True
+
+    coordinator._drain_named_prefetch_before_request_release()
+
+    assert event.synchronized
+    assert coordinator._previous_prefetch_pending_entries == 0
+    assert coordinator._previous_prefetch_target_layer is None
+    assert not coordinator._ema_graph_work_pending
 
 
 def test_captured_layer_waits_only_for_its_ema_writer(monkeypatch):
