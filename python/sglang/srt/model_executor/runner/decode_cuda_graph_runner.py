@@ -1323,14 +1323,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ema_width = min(
                 captured["scores"].shape[1], ((max_c4_len + 255) // 256) * 256
             )
+            num_c4_pages = (ema_width + page_size - 1) // page_size
+            # The next replay overwrites every captured input/output address
+            # before its layer-local resident-buffer wait. Snapshot all data
+            # consumed by the asynchronous task now, on the compute stream.
+            # The side stream waits for these copies, while the next graph is
+            # free to overwrite its own score and metadata buffers.
+            scores = captured["scores"][:raw_bs, :ema_width].clone()
+            compressed_seq_lens = captured["compressed_seq_lens"][:raw_bs].clone()
+            page_table = captured["page_table"][:raw_bs, :num_c4_pages].clone()
+            req_pool_indices = forward_batch.req_pool_indices.clone()
+            num_real_reqs = coordinator.num_real_reqs.new_full((1,), raw_bs)
             coordinator.submit_ema_prefetch(
-                req_pool_indices=forward_batch.req_pool_indices,
-                req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
-                compressed_seq_lens=captured["compressed_seq_lens"][:raw_bs],
-                compressed_seq_lens_cpu=c4_seq_lens_cpu,
-                scores=captured["scores"][:raw_bs, :ema_width],
-                page_table=captured["page_table"][:raw_bs],
+                req_pool_indices=req_pool_indices,
+                req_pool_indices_cpu=forward_batch.req_pool_indices_cpu.clone(),
+                compressed_seq_lens=compressed_seq_lens,
+                compressed_seq_lens_cpu=c4_seq_lens_cpu.clone(),
+                scores=scores,
+                page_table=page_table,
                 page_size=page_size,
+                num_real_reqs=num_real_reqs,
                 layer_id=captured["layer_id"],
             )
 

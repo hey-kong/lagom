@@ -1363,6 +1363,7 @@ class HiSparseCoordinator:
         output_buffer: Optional[torch.Tensor] = None,
         miss_plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         skip_io: Optional[bool] = None,
+        num_real_reqs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the full plan+IO swap-in kernel for one layer; return its slot table.
 
@@ -1409,7 +1410,9 @@ class HiSparseCoordinator:
             hot_buffer_size=self.device_buffer_size,
             page_size=1,
             block_size=self.swap_in_block_size,
-            num_real_reqs=self.num_real_reqs,
+            num_real_reqs=(
+                self.num_real_reqs if num_real_reqs is None else num_real_reqs
+            ),
             skip_io=self.skip_io if skip_io is None else skip_io,
             **plan,
         )
@@ -1669,6 +1672,7 @@ class HiSparseCoordinator:
         scores: torch.Tensor,
         page_table: torch.Tensor,
         page_size: int,
+        num_real_reqs: torch.Tensor,
         layer_id: int,
     ) -> None:
         """Update EMA and warm one layer after current graph attention finishes."""
@@ -1680,6 +1684,14 @@ class HiSparseCoordinator:
         # mappings can be reused; consecutive layers serialize naturally on
         # the same side stream and safely share their plan buffers.
         self._previous_prefetch_stream.wait_stream(device_module.current_stream())
+        for tensor in (
+            req_pool_indices,
+            compressed_seq_lens,
+            scores,
+            page_table,
+            num_real_reqs,
+        ):
+            tensor.record_stream(self._previous_prefetch_stream)
         with device_module.stream(self._previous_prefetch_stream):
             candidates = self.prefetcher.update(
                 scores,
@@ -1709,12 +1721,13 @@ class HiSparseCoordinator:
                         self._previous_miss_count,
                     ),
                     skip_io=True,
+                    num_real_reqs=num_real_reqs,
                 )
                 copy_cache_planned_mla(
                     miss_src=self._previous_miss_src[:num_reqs],
                     miss_dst=self._previous_miss_dst[:num_reqs],
                     miss_count=self._previous_miss_count[:num_reqs],
-                    num_real_reqs=self.num_real_reqs,
+                    num_real_reqs=num_real_reqs,
                     host_cache=self.mem_pool_host.kv_buffer[layer_id],
                     device_buffer=self.mem_pool_device.kv_buffer[layer_id],
                     item_size_bytes=self.item_size_bytes,

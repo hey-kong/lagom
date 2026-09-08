@@ -58,6 +58,7 @@ def test_graph_replay_submits_live_batch_with_captured_scores():
     calls = []
     coordinator = SimpleNamespace(
         prefetcher_name="ema",
+        num_real_reqs=torch.zeros(1, dtype=torch.int32),
         consume_ema_prefetch=lambda: calls.append(("consume",)),
         submit_ema_prefetch=lambda **kwargs: calls.append(("submit", kwargs)),
     )
@@ -66,7 +67,7 @@ def test_graph_replay_submits_live_batch_with_captured_scores():
     runner._replay_graph_key = "bs4"
     scores = torch.arange(1200, dtype=torch.float32).view(4, 300)
     compressed_lens = torch.tensor([6, 5, 1, 1])
-    page_table = torch.arange(40, dtype=torch.int32).view(4, 10)
+    page_table = torch.arange(1200, dtype=torch.int32).view(4, 300)
     runner._ema_graph_prefetch = {
         "bs4": {
             2: {
@@ -88,13 +89,27 @@ def test_graph_replay_submits_live_batch_with_captured_scores():
     runner._prepare_ema_graph_replay()
     runner._submit_ema_graph_prefetch(batch)
 
+    # A subsequent replay/batch preparation may immediately overwrite every
+    # source tensor; submitted task snapshots must remain unchanged.
+    scores.zero_()
+    compressed_lens.zero_()
+    page_table.zero_()
+    batch.req_pool_indices.fill_(99)
+    batch.req_pool_indices_cpu.fill_(99)
+
     assert calls[0] == ("consume",)
     kwargs = calls[1][1]
-    assert kwargs["req_pool_indices"] is batch.req_pool_indices
-    assert kwargs["req_pool_indices_cpu"] is batch.req_pool_indices_cpu
-    assert torch.equal(kwargs["scores"], scores[:2, :256])
-    assert torch.equal(kwargs["compressed_seq_lens"], compressed_lens[:2])
+    assert torch.equal(kwargs["req_pool_indices"], torch.tensor([4, 9]))
+    assert torch.equal(kwargs["req_pool_indices_cpu"], torch.tensor([4, 9]))
+    assert torch.equal(
+        kwargs["scores"], torch.arange(1200, dtype=torch.float32).view(4, 300)[:2, :256]
+    )
+    assert torch.equal(kwargs["compressed_seq_lens"], torch.tensor([6, 5]))
     assert torch.equal(kwargs["compressed_seq_lens_cpu"], torch.tensor([6, 5]))
-    assert torch.equal(kwargs["page_table"], page_table[:2])
+    assert torch.equal(
+        kwargs["page_table"],
+        torch.arange(1200, dtype=torch.int32).view(4, 300)[:2, :256],
+    )
     assert kwargs["page_size"] == 1
+    assert kwargs["num_real_reqs"].item() == 2
     assert kwargs["layer_id"] == 2
