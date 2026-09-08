@@ -553,6 +553,17 @@ class HiSparseCoordinator:
             self._previous_prefetch_num_reqs = 0
             self._previous_prefetch_pending_entries = 0
             self._ema_graph_work_pending = False
+            self._ema_layer_events = None
+            if self.prefetcher_name == "ema":
+                # External events become per-layer wait nodes in the captured
+                # decode graph. Seed them so capture/warmup cannot deadlock.
+                self._ema_layer_events = [
+                    device_module.Event(external=True)
+                    for _ in range(self.mem_pool_device.layer_num)
+                ]
+                current_stream = device_module.current_stream()
+                for event in self._ema_layer_events:
+                    event.record(current_stream)
             # A monotonically increasing incarnation prevents an async copy
             # planned for a finished request from being consumed after its
             # scheduler slot is reused.
@@ -1411,6 +1422,13 @@ class HiSparseCoordinator:
         req_pool_indices_cpu: Optional[torch.Tensor] = None,
         committed_lens_cpu: Optional[torch.Tensor] = None,
     ) -> None:
+        if self.prefetcher_name == "ema":
+            # This call is intentionally unconditional: during CUDA Graph
+            # capture it records one external wait at the point each layer is
+            # about to resolve/read its buffer. Layer N can therefore execute
+            # while the prefetch stream is still preparing later layers.
+            self._ema_layer_events[layer_id].wait(device_module.current_stream())
+            return
         if self.prefetcher_name == "oasiskv":
             if self._oasiskv_ring is None:
                 return
@@ -1631,10 +1649,9 @@ class HiSparseCoordinator:
         return self._oasiskv_ring[layer_id][ring_slot]
 
     def consume_ema_prefetch(self) -> None:
-        """Order decode-graph replay after the prior EMA side-stream writer."""
+        """Publish prior work stats; per-layer graph nodes provide ordering."""
         if self.prefetcher_name != "ema" or not self._ema_graph_work_pending:
             return
-        self._previous_prefetch_event.wait(device_module.current_stream())
         self.prefetcher.stats.completed_h2d_entries += (
             self._previous_prefetch_pending_entries
         )
@@ -1709,6 +1726,7 @@ class HiSparseCoordinator:
                 self._previous_prefetch_pending_entries += submitted
                 self.prefetcher.stats.submitted_entries += submitted
             self._previous_prefetch_event.record(self._previous_prefetch_stream)
+            self._ema_layer_events[layer_id].record(self._previous_prefetch_stream)
         self._previous_prefetch_target_layer = layer_id
         self._previous_prefetch_num_reqs = num_reqs
         self._ema_graph_work_pending = True
@@ -1758,6 +1776,10 @@ class HiSparseCoordinator:
                 skip_io=self.skip_io,
             )
             self._previous_prefetch_event.record(self._previous_prefetch_stream)
+            if self.prefetcher_name == "ema":
+                self._ema_layer_events[target_layer].record(
+                    self._previous_prefetch_stream
+                )
         self._previous_prefetch_target_layer = target_layer
         self._previous_prefetch_num_reqs = num_reqs
         self._previous_prefetch_pending_entries = (

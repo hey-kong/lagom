@@ -19,9 +19,7 @@ class _Event:
         self.waited_on = stream
 
 
-def test_graph_replay_joins_previous_ema_writer(monkeypatch):
-    import sglang.srt.managers.hisparse_coordinator as coordinator_module
-
+def test_graph_replay_accounts_previous_ema_writer():
     event = _Event()
     coordinator = object.__new__(HiSparseCoordinator)
     coordinator.prefetcher_name = "ema"
@@ -30,17 +28,30 @@ def test_graph_replay_joins_previous_ema_writer(monkeypatch):
     coordinator._previous_prefetch_pending_entries = 17
     coordinator._previous_prefetch_target_layer = 3
     coordinator._ema_graph_work_pending = True
-    monkeypatch.setattr(
-        coordinator_module.device_module, "current_stream", lambda: "compute"
-    )
-
     coordinator.consume_ema_prefetch()
 
-    assert event.waited_on == "compute"
+    assert event.waited_on is None
     assert coordinator._previous_prefetch_pending_entries == 0
     assert coordinator._previous_prefetch_target_layer is None
     assert not coordinator._ema_graph_work_pending
     assert coordinator.prefetcher.stats.completed_h2d_entries == 17
+
+
+def test_captured_layer_waits_only_for_its_ema_writer(monkeypatch):
+    import sglang.srt.managers.hisparse_coordinator as coordinator_module
+
+    events = [_Event(), _Event()]
+    coordinator = object.__new__(HiSparseCoordinator)
+    coordinator.prefetcher_name = "ema"
+    coordinator._ema_layer_events = events
+    monkeypatch.setattr(
+        coordinator_module.device_module, "current_stream", lambda: "compute"
+    )
+
+    coordinator._consume_previous_prefetch(torch.tensor([0]), layer_id=1)
+
+    assert events[0].waited_on is None
+    assert events[1].waited_on == "compute"
 
 
 def test_graph_replay_submits_live_batch_with_captured_scores():
@@ -53,9 +64,9 @@ def test_graph_replay_submits_live_batch_with_captured_scores():
     runner = object.__new__(DecodeCudaGraphRunner)
     runner.model_runner = SimpleNamespace(hisparse_coordinator=coordinator)
     runner._replay_graph_key = "bs4"
-    scores = torch.arange(24, dtype=torch.float32).view(4, 6)
+    scores = torch.arange(1200, dtype=torch.float32).view(4, 300)
     compressed_lens = torch.tensor([6, 5, 1, 1])
-    page_table = torch.arange(24, dtype=torch.int32).view(4, 6)
+    page_table = torch.arange(40, dtype=torch.int32).view(4, 10)
     runner._ema_graph_prefetch = {
         "bs4": {
             2: {
@@ -81,7 +92,7 @@ def test_graph_replay_submits_live_batch_with_captured_scores():
     kwargs = calls[1][1]
     assert kwargs["req_pool_indices"] is batch.req_pool_indices
     assert kwargs["req_pool_indices_cpu"] is batch.req_pool_indices_cpu
-    assert torch.equal(kwargs["scores"], scores[:2])
+    assert torch.equal(kwargs["scores"], scores[:2, :256])
     assert torch.equal(kwargs["compressed_seq_lens"], compressed_lens[:2])
     assert torch.equal(kwargs["compressed_seq_lens_cpu"], torch.tensor([6, 5]))
     assert torch.equal(kwargs["page_table"], page_table[:2])

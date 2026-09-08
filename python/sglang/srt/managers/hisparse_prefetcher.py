@@ -189,6 +189,7 @@ class EMAPrefetcher(HiSparsePrefetcher):
         self._state: Dict[
             Tuple[int, int], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ] = {}
+        self._positions: Optional[torch.Tensor] = None
 
     def select(self, previous):
         """EMA consumes scores through :meth:`update`; indices are passed through."""
@@ -267,7 +268,14 @@ class EMAPrefetcher(HiSparsePrefetcher):
         current = scores.detach().float()
         previous_level = torch.stack(old_levels)
         previous_trend = torch.stack(old_trends)
-        positions = torch.arange(width, device=scores.device).unsqueeze(0)
+        positions = self._positions
+        if (
+            positions is None
+            or positions.device != scores.device
+            or positions.shape[1] != width
+        ):
+            positions = torch.arange(width, device=scores.device).unsqueeze(0)
+            self._positions = positions
         valid = positions < seq_lens_device.unsqueeze(1)
         has_history = torch.stack(old_masks)
         updated_level = self.alpha * current + (1.0 - self.alpha) * previous_level

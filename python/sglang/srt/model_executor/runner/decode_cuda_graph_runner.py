@@ -1317,15 +1317,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.seq_lens_cpu is None:
             raise RuntimeError("EMA CUDA Graph replay requires CPU sequence lengths")
         c4_seq_lens_cpu = (forward_batch.seq_lens_cpu // 4).clamp_min(1)
+        max_c4_len = int(c4_seq_lens_cpu.max())
         for captured in templates.values():
+            page_size = captured["page_size"]
+            ema_width = min(
+                captured["scores"].shape[1], ((max_c4_len + 255) // 256) * 256
+            )
             coordinator.submit_ema_prefetch(
                 req_pool_indices=forward_batch.req_pool_indices,
                 req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
                 compressed_seq_lens=captured["compressed_seq_lens"][:raw_bs],
                 compressed_seq_lens_cpu=c4_seq_lens_cpu,
-                scores=captured["scores"][:raw_bs],
+                scores=captured["scores"][:raw_bs, :ema_width],
                 page_table=captured["page_table"][:raw_bs],
-                page_size=captured["page_size"],
+                page_size=page_size,
                 layer_id=captured["layer_id"],
             )
 
