@@ -45,6 +45,13 @@ class HiSparsePrefetcher(ABC):
 _PREFETCHER_REGISTRY: Dict[str, Callable[..., HiSparsePrefetcher]] = {}
 
 
+def _grow_capacity(current: int, required: int) -> int:
+    """Grow one buffer dimension without inflating independent dimensions."""
+    if required <= current:
+        return current
+    return required if current == 0 else max(required, current * 2)
+
+
 def register_hisparse_prefetcher(name: str):
     def decorate(factory: Callable[..., HiSparsePrefetcher]):
         _PREFETCHER_REGISTRY[name] = factory
@@ -400,21 +407,28 @@ class EMAPrefetcher(HiSparsePrefetcher):
         if state is None or state[0].shape[0] < rows or state[0].shape[1] < width:
             old_rows = 0 if state is None else state[0].shape[0]
             old_width = 0 if state is None else state[0].shape[1]
-            row_capacity = rows if old_rows == 0 else max(rows, old_rows * 2)
-            width_capacity = width if old_width == 0 else max(width, old_width * 2)
-            level = torch.zeros(
+            row_capacity = _grow_capacity(old_rows, rows)
+            width_capacity = _grow_capacity(old_width, width)
+            # Uninitialized entries are never read: state_lens gates history
+            # loads in the fused kernel. Avoid clearing two potentially large
+            # matrices during growth.
+            level = torch.empty(
                 (row_capacity, width_capacity),
                 dtype=torch.float32,
                 device=scores.device,
             )
-            trend = torch.zeros_like(level)
-            state_lens = torch.zeros(
-                row_capacity, dtype=torch.int32, device=scores.device
-            )
+            trend = torch.empty_like(level)
+            if state is not None and row_capacity == old_rows:
+                state_lens = state[2]
+            else:
+                state_lens = torch.zeros(
+                    row_capacity, dtype=torch.int32, device=scores.device
+                )
             if state is not None:
                 level[:old_rows, :old_width].copy_(state[0])
                 trend[:old_rows, :old_width].copy_(state[1])
-                state_lens[:old_rows].copy_(state[2])
+                if state_lens is not state[2]:
+                    state_lens[:old_rows].copy_(state[2])
             state = self._cuda_state[layer_id] = (level, trend, state_lens)
 
         batch_size = scores.shape[0]
@@ -428,8 +442,8 @@ class EMAPrefetcher(HiSparsePrefetcher):
             old_width = 0 if forecast is None else forecast.shape[1]
             forecast = torch.empty(
                 (
-                    batch_size if old_rows == 0 else max(batch_size, old_rows * 2),
-                    width if old_width == 0 else max(width, old_width * 2),
+                    _grow_capacity(old_rows, batch_size),
+                    _grow_capacity(old_width, width),
                 ),
                 dtype=torch.float32,
                 device=scores.device,

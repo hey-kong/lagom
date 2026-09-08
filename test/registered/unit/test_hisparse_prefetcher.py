@@ -7,6 +7,7 @@ from sglang.srt.managers.hisparse_prefetcher import (
     EMAPrefetcher,
     OasisKVPrefetcher,
     PreviousPrefetcher,
+    _grow_capacity,
     create_hisparse_prefetcher,
     supported_hisparse_prefetchers,
 )
@@ -294,3 +295,11 @@ def test_ema_rejects_invalid_smoothing_parameters(field, value):
             effective_top_k=4,
             device_buffer_size=8,
         )
+
+
+def test_ema_capacity_only_grows_the_insufficient_dimension():
+    assert _grow_capacity(8, 8) == 8
+    assert _grow_capacity(8, 9) == 16
+    assert _grow_capacity(10240, 10496) == 20480
+    # Width growth must not implicitly change an already sufficient row count.
+    assert (_grow_capacity(8, 8), _grow_capacity(10240, 10496)) == (8, 20480)
