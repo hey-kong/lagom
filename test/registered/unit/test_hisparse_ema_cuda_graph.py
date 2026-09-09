@@ -1,6 +1,7 @@
 """CPU-only lifecycle tests for HiSparse EMA decode CUDA Graph integration."""
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 
@@ -77,6 +78,133 @@ def test_captured_layer_waits_only_for_its_ema_writer(monkeypatch):
 
     assert events[0].waited_on is None
     assert events[1].waited_on == "compute"
+
+
+def test_previous_graph_replay_joins_last_writer(monkeypatch):
+    import sglang.srt.managers.hisparse_coordinator as coordinator_module
+
+    event = _Event()
+    coordinator = object.__new__(HiSparseCoordinator)
+    coordinator.prefetcher_name = "previous"
+    coordinator.prefetcher = SimpleNamespace(stats=HiSparsePrefetchStats())
+    coordinator._previous_prefetch_event = event
+    coordinator._previous_prefetch_pending_entries = 12
+    coordinator._previous_prefetch_target_layer = 4
+    monkeypatch.setattr(
+        coordinator_module.device_module, "current_stream", lambda: "compute"
+    )
+
+    coordinator.consume_previous_graph_prefetch()
+
+    assert event.waited_on == "compute"
+    assert coordinator._previous_prefetch_pending_entries == 0
+    assert coordinator._previous_prefetch_target_layer is None
+    assert coordinator.prefetcher.stats.completed_h2d_entries == 12
+
+
+def test_forward_batch_waits_before_overwriting_shared_request_count():
+    operations = []
+    coordinator = object.__new__(HiSparseCoordinator)
+    coordinator.consume_previous_graph_prefetch = lambda: operations.append("wait")
+    coordinator.num_real_reqs = SimpleNamespace(
+        fill_=lambda value: operations.append(("fill", value))
+    )
+
+    coordinator.begin_forward_batch(32)
+
+    assert operations == ["wait", ("fill", 32)]
+
+
+def test_previous_capture_defers_legacy_submission():
+    coordinator = object.__new__(HiSparseCoordinator)
+    coordinator.enable_prefetch = False
+    coordinator.prefetcher_name = "previous"
+    coordinator.prefetcher = SimpleNamespace()
+    coordinator.top_k = 2
+    coordinator._consume_previous_prefetch = lambda *args: None
+    coordinator._run_swap_in_kernel = lambda *args, **kwargs: torch.tensor([[7, 8]])
+    coordinator._submit_previous_prefetch = MagicMock()
+
+    result = coordinator.swap_in_selected_pages(
+        req_pool_indices=torch.tensor([0]),
+        compressed_seq_lens=torch.tensor([4]),
+        top_k_result=torch.tensor([[1, 2]]),
+        layer_id=0,
+        prefetch_candidates=None,
+        defer_previous_prefetch=True,
+    )
+
+    assert torch.equal(result, torch.tensor([[7, 8]]))
+    coordinator._submit_previous_prefetch.assert_not_called()
+
+
+def test_graph_replay_submits_previous_candidates_to_following_layers():
+    calls = []
+    coordinator = SimpleNamespace(
+        prefetcher_name="previous",
+        mem_pool_device=SimpleNamespace(layer_num=4),
+        _submit_previous_prefetch_to_layer=lambda *args: calls.append(args),
+    )
+    runner = object.__new__(DecodeCudaGraphRunner)
+    runner.model_runner = SimpleNamespace(hisparse_coordinator=coordinator)
+    runner._replay_graph_key = "bs4"
+    runner._previous_graph_prefetch = {
+        "bs4": {
+            1: {
+                "candidates": torch.arange(8).view(4, 2),
+                "compressed_seq_lens": torch.tensor([8, 7, 1, 1]),
+                "source_layer_id": 1,
+            },
+            # The final layer has no consumer and must not launch useless IO.
+            3: {
+                "candidates": torch.arange(8).view(4, 2),
+                "compressed_seq_lens": torch.tensor([8, 7, 1, 1]),
+                "source_layer_id": 3,
+            },
+        }
+    }
+    batch = SimpleNamespace(
+        batch_size=2,
+        req_pool_indices=torch.tensor([4, 9, 0, 0]),
+    )
+
+    runner._submit_previous_graph_prefetch(batch)
+
+    assert len(calls) == 1
+    req_pool_indices, seq_lens, candidates, target_layer = calls[0]
+    assert torch.equal(req_pool_indices, torch.tensor([4, 9]))
+    assert torch.equal(seq_lens, torch.tensor([8, 7]))
+    assert torch.equal(candidates, torch.tensor([[0, 1], [2, 3]]))
+    assert target_layer == 2
+
+
+def test_idle_dp_rank_does_not_submit_previous_prefetch():
+    submit = MagicMock()
+    coordinator = SimpleNamespace(
+        prefetcher_name="previous",
+        mem_pool_device=SimpleNamespace(layer_num=2),
+        _submit_previous_prefetch_to_layer=submit,
+    )
+    runner = object.__new__(DecodeCudaGraphRunner)
+    runner.model_runner = SimpleNamespace(hisparse_coordinator=coordinator)
+    runner._replay_graph_key = "bs4"
+    runner._previous_graph_prefetch = {
+        "bs4": {
+            0: {
+                "candidates": torch.arange(8).view(4, 2),
+                "compressed_seq_lens": torch.tensor([8, 7, 1, 1]),
+                "source_layer_id": 0,
+            }
+        }
+    }
+    batch = SimpleNamespace(
+        batch_size=0,
+        req_pool_indices=torch.tensor([0, 0, 0, 0]),
+    )
+
+    runner._submit_previous_graph_prefetch(batch)
+
+    submit.assert_not_called()
 
 
 def test_graph_replay_submits_live_batch_with_captured_scores():

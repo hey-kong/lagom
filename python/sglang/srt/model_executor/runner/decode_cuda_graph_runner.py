@@ -351,6 +351,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Graph-keyed references to replayed EMA Indexer scores. EMA state and
         # H2D task descriptors remain ordinary Python and are updated post-replay.
         self._ema_graph_prefetch: dict[object, dict] = {}
+        self._previous_graph_prefetch: dict[object, dict] = {}
         # Graph outputs are overwritten by the next replay. These persistent
         # snapshots are reused only after that replay's per-layer waits have
         # completed the preceding EMA task.
@@ -1000,6 +1001,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.is_ema_graph_capture = (
                 forward_batch.hisparse_coordinator.prefetcher_name == "ema"
             )
+            forward_batch.is_previous_graph_capture = (
+                forward_batch.hisparse_coordinator.prefetcher_name == "previous"
+                and forward_batch.hisparse_coordinator.is_dsv4_hisparse
+            )
 
         if (
             self.model_runner.server_args.is_oasiskv_lookahead
@@ -1266,6 +1271,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ema_pending = getattr(forward_batch, "_ema_pending_prefetch", None)
                 if ema_pending:
                     self._ema_graph_prefetch[shape_key] = dict(ema_pending)
+                previous_pending = getattr(
+                    forward_batch, "_previous_pending_prefetch", None
+                )
+                if previous_pending:
+                    self._previous_graph_prefetch[shape_key] = dict(previous_pending)
 
     def _prepare_oasiskv_graph_replay(self, forward_batch: ForwardBatch) -> None:
         """Join prior H2D writers before the target graph reads C4 mappings."""
@@ -1310,6 +1320,33 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         coordinator = self.model_runner.hisparse_coordinator
         if coordinator is not None and coordinator.prefetcher_name == "ema":
             coordinator.consume_ema_prefetch()
+
+    def _submit_previous_graph_prefetch(self, forward_batch: ForwardBatch) -> None:
+        """Submit graph-produced Previous candidates without capturing Python state."""
+        raw_bs = forward_batch.batch_size
+        # Under DP attention an idle rank still replays a padded graph.  It has
+        # no local rows to prefetch, and the swap/copy kernels do not accept a
+        # zero-sized launch grid.
+        if raw_bs == 0:
+            return
+        templates = self._previous_graph_prefetch.get(self._replay_graph_key)
+        coordinator = self.model_runner.hisparse_coordinator
+        if (
+            not templates
+            or coordinator is None
+            or coordinator.prefetcher_name != "previous"
+        ):
+            return
+        for captured in templates.values():
+            source_layer_id = captured["source_layer_id"]
+            if source_layer_id + 1 >= coordinator.mem_pool_device.layer_num:
+                continue
+            coordinator._submit_previous_prefetch_to_layer(
+                forward_batch.req_pool_indices[:raw_bs],
+                captured["compressed_seq_lens"][:raw_bs],
+                captured["candidates"][:raw_bs],
+                source_layer_id + 1,
+            )
 
     def _submit_ema_graph_prefetch(self, forward_batch: ForwardBatch) -> None:
         """Use replayed Indexer scores to launch next-token EMA warmups."""
@@ -1584,6 +1621,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             output = self.backend.replay(self._replay_graph_key, forward_batch)
             self._publish_oasiskv_graph_prefetch(forward_batch)
             self._submit_ema_graph_prefetch(forward_batch)
+            self._submit_previous_graph_prefetch(forward_batch)
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

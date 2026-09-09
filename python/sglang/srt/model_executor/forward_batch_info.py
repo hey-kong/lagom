@@ -544,6 +544,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # EMA capture records graph-stable Indexer score tensors. Python EMA state
     # updates and side-stream H2D submission run after each graph replay.
     is_ema_graph_capture: bool = False
+    # Previous capture records per-layer Indexer candidates. The mutable
+    # resident-cache plan and side-stream copies are submitted after replay.
+    is_previous_graph_capture: bool = False
     oasiskv_normal_rows: Optional[torch.Tensor] = None
     oasiskv_draft_rows: Optional[torch.Tensor] = None
     oasiskv_draft_valid: Optional[torch.Tensor] = None

@@ -427,6 +427,7 @@ class HiSparseCoordinator:
             (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
         )
         self.indexer_prefetch_candidates_buffer = None
+        self.previous_graph_candidates_buffer = None
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
@@ -522,6 +523,20 @@ class HiSparseCoordinator:
                 dtype=torch.int32,
                 device=device,
             )
+            if self.prefetcher_name == "previous" and self.is_dsv4_hisparse:
+                # Indexer candidate output is otherwise shared by every layer.
+                # Keep one fixed address per layer so a completed graph replay
+                # can publish every layer's result without a device sync.
+                self.previous_graph_candidates_buffer = torch.full(
+                    (
+                        layer_num,
+                        max_num_req_slots,
+                        self.prefetcher.logical_entries,
+                    ),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
             self._prefetch_candidate_buffer = torch.full(
                 (max_num_req_slots, self.prefetcher.logical_entries),
                 -1,
@@ -1509,6 +1524,30 @@ class HiSparseCoordinator:
         )
         self._previous_prefetch_pending_entries = 0
 
+    def consume_previous_graph_prefetch(self) -> None:
+        """Join post-replay Previous writes before the next graph reads them."""
+        if self.prefetcher_name != "previous" or self.prefetcher is None:
+            return
+        if self._previous_prefetch_pending_entries:
+            self._previous_prefetch_event.wait(device_module.current_stream())
+            self.prefetcher.stats.completed_h2d_entries += (
+                self._previous_prefetch_pending_entries
+            )
+            self._previous_prefetch_pending_entries = 0
+        self._previous_prefetch_target_layer = None
+
+    def begin_forward_batch(self, num_real_reqs: int) -> None:
+        """Drain deferred Previous IO before publishing a new batch size.
+
+        Post-graph copies read ``num_real_reqs`` asynchronously.  The scalar
+        must therefore remain unchanged until the final copy has joined the
+        compute stream.  This must run for every forward mode because an
+        extend/prefill batch can be scheduled between decode batches and uses
+        the same scalar and copy-plan storage.
+        """
+        self.consume_previous_graph_prefetch()
+        self.num_real_reqs.fill_(num_real_reqs)
+
     def consume_oasiskv_prefetch(
         self,
         *,
@@ -1831,6 +1870,7 @@ class HiSparseCoordinator:
         prefetch_candidates: Optional[torch.Tensor] = None,
         req_pool_indices_cpu: Optional[torch.Tensor] = None,
         committed_lens_cpu: Optional[torch.Tensor] = None,
+        defer_previous_prefetch: bool = False,
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices.
 
@@ -1850,7 +1890,7 @@ class HiSparseCoordinator:
                 top_k_result[:, : self.top_k],
                 layer_id,
             )
-            if self.prefetcher_name == "previous":
+            if self.prefetcher_name == "previous" and not defer_previous_prefetch:
                 self._submit_previous_prefetch(
                     req_pool_indices,
                     compressed_seq_lens,
