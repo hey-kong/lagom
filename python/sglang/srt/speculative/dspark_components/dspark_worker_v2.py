@@ -299,6 +299,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     InfoComponent.TARGET_VERIFY_GPU_TIME,
                     InfoComponent.INDEXER_TOPK_GPU_TIME,
                     InfoComponent.TOPK_TRANSFER_GPU_TIME,
+                    InfoComponent.ACCEPTED_TOKENS,
                 }
                 if server_args.enable_metrics and server_args.enable_hisparse
                 else None

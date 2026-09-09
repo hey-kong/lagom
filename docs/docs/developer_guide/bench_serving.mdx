@@ -72,8 +72,8 @@ At the end of the console's `Serving Benchmark Result`, the
 - Mean target verification time per round
 - Mean Indexer Top-K time on the target verification critical path
 - Mean Top-K transfer time on the target verification critical path
-- Mean number of tokens received by the full target-verification batch per
-  round, plus the mean per request
+- Mean number of tokens accepted after verification, per request and per
+  speculative decoding round (accepted draft tokens plus the bonus token)
 
 Times are reported in milliseconds. The same values are stored under
 `dspark_hisparse_metrics` in the output JSONL record. Use `--output-file PATH`

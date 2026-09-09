@@ -1072,6 +1072,13 @@ def summarize_dspark_metrics(server_info: Optional[dict]) -> Optional[dict[str, 
 
     total_verify_tokens = sum(float(record["num_verify_tokens"]) for record in records)
     total_verify_requests = sum(float(record["bs"]) for record in records)
+    accepted_records = [
+        record for record in records if record.get("num_accepted_tokens", -1) >= 0
+    ]
+    total_accepted_tokens = sum(
+        float(record["num_accepted_tokens"]) for record in accepted_records
+    )
+    total_accepted_requests = sum(float(record["bs"]) for record in accepted_records)
 
     return {
         "mean_dspark_ms": mean("step_gpu_ms"),
@@ -1082,6 +1089,11 @@ def summarize_dspark_metrics(server_info: Optional[dict]) -> Optional[dict[str, 
         "mean_target_verify_tokens_per_request": (
             total_verify_tokens / total_verify_requests
             if total_verify_requests > 0
+            else 0.0
+        ),
+        "mean_accepted_tokens_per_request_per_round": (
+            total_accepted_tokens / total_accepted_requests
+            if total_accepted_requests > 0
             else 0.0
         ),
         "num_steps": float(len(records)),
@@ -1760,14 +1772,8 @@ async def benchmark(
         )
         print(
             "{:<40} {:<10.2f}".format(
-                "Mean target verify batch tokens/round:",
-                dspark_metrics["mean_target_verify_tokens"],
-            )
-        )
-        print(
-            "{:<40} {:<10.2f}".format(
-                "Mean target verify tokens/request:",
-                dspark_metrics["mean_target_verify_tokens_per_request"],
+                "Mean accepted tokens/request/round:",
+                dspark_metrics["mean_accepted_tokens_per_request_per_round"],
             )
         )
     elif is_dspark_hisparse_server(

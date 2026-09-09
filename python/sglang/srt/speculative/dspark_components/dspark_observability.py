@@ -40,6 +40,7 @@ class InfoComponent(str, Enum):
     TARGET_VERIFY_GPU_TIME = "target_verify_gpu_time"
     INDEXER_TOPK_GPU_TIME = "indexer_topk_gpu_time"
     TOPK_TRANSFER_GPU_TIME = "topk_transfer_gpu_time"
+    ACCEPTED_TOKENS = "accepted_tokens"
     REQS = "reqs"
 
 
@@ -114,6 +115,7 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     target_verify_gpu_ms: Optional[float] = None
     indexer_topk_gpu_ms: Optional[float] = None
     topk_transfer_gpu_ms: Optional[float] = None
+    num_accepted_tokens: int = -1
     reqs: Optional[list[ReqDetail]] = None
 
 
@@ -156,6 +158,7 @@ class _PendingStep(msgspec.Struct):
     step_cpu_ms: Optional[float]
     rids: Optional[list[str]]
     future: Optional[FutureTensors]
+    accepted_tokens_future: Optional[FutureTensors]
     segment_events: dict[InfoSegment, list[tuple[torch.cuda.Event, torch.cuda.Event]]]
 
 
@@ -200,7 +203,10 @@ class DsparkInfoDumper:
         self._prev_stamp: Optional[float] = None
 
         self._d2h_stream: Optional[torch.cuda.Stream] = None
-        if self.enabled and InfoComponent.REQS in self._components:
+        if self.enabled and (
+            InfoComponent.REQS in self._components
+            or InfoComponent.ACCEPTED_TOKENS in self._components
+        ):
             self._d2h_stream = torch.cuda.Stream(device=device)
 
         self._current_segments: dict[
@@ -270,6 +276,14 @@ class DsparkInfoDumper:
         future = (
             self._stage_reqs(obs) if InfoComponent.REQS in self._components else None
         )
+        accepted_tokens_future = (
+            FutureTensors.device_to_host(
+                {"num_accepted_tokens": obs.commit_lens.sum()},
+                d2h_stream=self._d2h_stream,
+            )
+            if InfoComponent.ACCEPTED_TOKENS in self._components
+            else None
+        )
         self._pending = _PendingStep(
             forward_ct=int(obs.forward_ct),
             bs=int(obs.bs),
@@ -285,6 +299,7 @@ class DsparkInfoDumper:
             step_cpu_ms=step_cpu_ms,
             rids=obs.rids,
             future=future,
+            accepted_tokens_future=accepted_tokens_future,
             segment_events=self._current_segments,
         )
         self._current_segments = {}
@@ -412,6 +427,9 @@ class DsparkInfoDumper:
             record.topk_transfer_gpu_ms = self._segment_ms(
                 pending, InfoSegment.TOPK_TRANSFER
             )
+        if pending.accepted_tokens_future is not None:
+            accepted = pending.accepted_tokens_future.wait()["num_accepted_tokens"]
+            record.num_accepted_tokens = int(accepted.item())
         if InfoComponent.REQS in self._components and pending.future is not None:
             record.reqs = self._build_reqs(
                 host=pending.future.wait(), bs=pending.bs, rids=pending.rids
