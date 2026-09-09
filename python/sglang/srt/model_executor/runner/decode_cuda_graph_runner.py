@@ -1327,18 +1327,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             snapshot_buffers = self._ema_snapshot_buffers = {}
         snapshot = snapshot_buffers.setdefault(self._replay_graph_key, {})
         first = next(iter(templates.values()))
-        max_c4_pages = max(
-            (
-                min(
-                    item["scores"].shape[1],
-                    ((max_c4_len + 255) // 256) * 256,
-                )
-                + item["page_size"]
-                - 1
-            )
-            // item["page_size"]
-            for item in templates.values()
-        )
 
         def ensure_buffer(name, source, shape):
             buffer = snapshot.get(name)
@@ -1349,8 +1337,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 snapshot[name] = buffer
             return buffer
 
-        # Request metadata and page tables are shared by all C4 layers. Copy
-        # them once per decode step instead of once per layer.
+        # Request metadata is shared by all C4 layers. Copy and parse it once
+        # per decode step instead of once per layer.
         req_pool_indices = ensure_buffer(
             "req_pool_indices", forward_batch.req_pool_indices, (raw_bs,)
         )[:raw_bs]
@@ -1359,10 +1347,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             "compressed_seq_lens", first["compressed_seq_lens"], (raw_bs,)
         )[:raw_bs]
         compressed_seq_lens.copy_(first["compressed_seq_lens"][:raw_bs])
-        page_table = ensure_buffer(
-            "page_table", first["page_table"], (raw_bs, max_c4_pages)
-        )[:raw_bs, :max_c4_pages]
-        page_table.copy_(first["page_table"][:raw_bs, :max_c4_pages])
         num_real_reqs = ensure_buffer("num_real_reqs", coordinator.num_real_reqs, (1,))
         num_real_reqs.fill_(raw_bs)
         req_pool_indices_cpu = ensure_buffer(
@@ -1373,13 +1357,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             "compressed_seq_lens_cpu", c4_seq_lens_cpu, (raw_bs,)
         )[:raw_bs]
         compressed_seq_lens_cpu.copy_(c4_seq_lens_cpu)
+        batch_metadata = coordinator.prefetcher.prepare_batch(
+            req_pool_indices_cpu, compressed_seq_lens_cpu
+        )
 
         for captured in templates.values():
-            page_size = captured["page_size"]
             ema_width = min(
                 captured["scores"].shape[1], ((max_c4_len + 255) // 256) * 256
             )
-            num_c4_pages = (ema_width + page_size - 1) // page_size
             # The next replay overwrites every captured input/output address
             # before its layer-local resident-buffer wait. Snapshot all data
             # consumed by the asynchronous task now, on the compute stream.
@@ -1406,10 +1391,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 compressed_seq_lens=compressed_seq_lens,
                 compressed_seq_lens_cpu=compressed_seq_lens_cpu,
                 scores=scores,
-                page_table=page_table[:, :num_c4_pages],
-                page_size=page_size,
                 num_real_reqs=num_real_reqs,
                 layer_id=captured["layer_id"],
+                batch_metadata=batch_metadata,
             )
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:

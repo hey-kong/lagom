@@ -303,3 +303,10 @@ def test_ema_capacity_only_grows_the_insufficient_dimension():
     assert _grow_capacity(10240, 10496) == 20480
     # Width growth must not implicitly change an already sufficient row count.
     assert (_grow_capacity(8, 8), _grow_capacity(10240, 10496)) == (8, 20480)
+
+
+def test_ema_prepares_shared_cpu_batch_metadata_once():
+    metadata = EMAPrefetcher.prepare_batch([7, 2], torch.tensor([13, 9]))
+    assert metadata.slots == (7, 2)
+    assert metadata.lengths == (13, 9)
+    assert metadata.required_rows == 8

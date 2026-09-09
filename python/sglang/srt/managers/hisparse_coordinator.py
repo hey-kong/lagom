@@ -531,9 +531,6 @@ class HiSparseCoordinator:
             self._previous_prefetch_device_locs = torch.full_like(
                 self._prefetch_candidate_buffer, -1
             )
-            self._ema_topk_page_locs = torch.full_like(
-                self._prefetch_candidate_buffer, -1
-            )
             self._previous_miss_src = torch.zeros(
                 (max_num_req_slots, self.prefetcher.logical_entries),
                 dtype=torch.int64,
@@ -1681,10 +1678,9 @@ class HiSparseCoordinator:
         compressed_seq_lens: torch.Tensor,
         compressed_seq_lens_cpu: torch.Tensor,
         scores: torch.Tensor,
-        page_table: torch.Tensor,
-        page_size: int,
         num_real_reqs: torch.Tensor,
         layer_id: int,
+        batch_metadata,
     ) -> None:
         """Update EMA and warm one layer after current graph attention finishes."""
         if self.prefetcher_name != "ema" or self.prefetcher is None:
@@ -1699,7 +1695,6 @@ class HiSparseCoordinator:
             req_pool_indices,
             compressed_seq_lens,
             scores,
-            page_table,
             num_real_reqs,
         ):
             tensor.record_stream(self._previous_prefetch_stream)
@@ -1712,9 +1707,7 @@ class HiSparseCoordinator:
                 self.indexer_prefetch_candidates_buffer[:num_reqs],
                 req_pool_indices_device=req_pool_indices,
                 seq_lens_device=compressed_seq_lens,
-                page_table=page_table,
-                page_size=page_size,
-                out_page_indices=self._ema_topk_page_locs[:num_reqs],
+                batch_metadata=batch_metadata,
             )
             if candidates is not None:
                 selected = self.prefetcher.select(candidates)

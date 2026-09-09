@@ -104,3 +104,16 @@ def test_fused_ema_accepts_growing_runtime_widths():
             gamma=0.25,
         )
         torch.testing.assert_close(result, scores)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_dsv4_topk_raw_matches_logical_selection_without_page_table():
+    from sglang.kernels.ops.attention.dsv4.topk import topk_raw_512
+
+    scores = torch.tensor([[1.0, 7.0, 3.0, 9.0], [8.0, 2.0, 6.0, 4.0]], device="cuda")
+    lengths = torch.tensor([4, 3], dtype=torch.int32, device="cuda")
+    output = torch.empty((2, 2), dtype=torch.int32, device="cuda")
+    topk_raw_512(scores, lengths, output)
+
+    assert set(output[0].tolist()) == {1, 3}
+    assert set(output[1].tolist()) == {0, 2}

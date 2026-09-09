@@ -29,6 +29,13 @@ class HiSparsePrefetchStats:
     stale_tasks: int = 0
 
 
+@dataclass(frozen=True)
+class EMABatchMetadata:
+    slots: tuple[int, ...]
+    lengths: tuple[int, ...]
+    required_rows: int
+
+
 class HiSparsePrefetcher(ABC):
     """Select logical KV entries; cache ownership remains in the coordinator."""
 
@@ -201,8 +208,19 @@ class EMAPrefetcher(HiSparsePrefetcher):
             int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ] = {}
         self._cuda_forecasts: Dict[int, torch.Tensor] = {}
-        self._initialized_keys = set()
+        self._initialized_slots: Dict[int, set[int]] = {}
         self._prediction_lens: Optional[torch.Tensor] = None
+
+    @staticmethod
+    def prepare_batch(req_pool_indices_cpu, seq_lens_cpu) -> EMABatchMetadata:
+        """Parse scheduler-owned CPU metadata once for all layers in a step."""
+        slots = tuple(torch.as_tensor(req_pool_indices_cpu, device="cpu").tolist())
+        lengths = tuple(torch.as_tensor(seq_lens_cpu, device="cpu").tolist())
+        return EMABatchMetadata(
+            slots=slots,
+            lengths=lengths,
+            required_rows=max(slots) + 1 if slots else 0,
+        )
 
     def select(self, previous):
         """EMA consumes scores through :meth:`update`; indices are passed through."""
@@ -224,14 +242,18 @@ class EMAPrefetcher(HiSparsePrefetcher):
         page_table: Optional[torch.Tensor] = None,
         page_size: int = 1,
         out_page_indices: Optional[torch.Tensor] = None,
+        batch_metadata: Optional[EMABatchMetadata] = None,
     ) -> Optional[torch.Tensor]:
         """Update observations and predict the next decode token's score ranking.
 
         The first observation for any request/layer initializes state and emits
         no prediction. State follows request-pool identity, not batch row order.
         """
-        slots = torch.as_tensor(req_pool_indices_cpu, device="cpu").tolist()
-        lengths = torch.as_tensor(seq_lens_cpu, device="cpu").tolist()
+        metadata = batch_metadata or self.prepare_batch(
+            req_pool_indices_cpu, seq_lens_cpu
+        )
+        slots = metadata.slots
+        lengths = metadata.lengths
         if len(slots) != scores.shape[0]:
             raise ValueError("EMA request identities must match score rows")
         if len(lengths) != scores.shape[0]:
@@ -258,6 +280,7 @@ class EMAPrefetcher(HiSparsePrefetcher):
                 seq_lens_cpu=lengths,
                 req_pool_indices_cpu=slots,
                 req_pool_indices_device=req_pool_indices_device,
+                required_rows=metadata.required_rows,
                 seq_lens_device=seq_lens_device,
                 layer_id=layer_id,
                 out_indices=out_indices,
@@ -393,6 +416,7 @@ class EMAPrefetcher(HiSparsePrefetcher):
         seq_lens_cpu,
         req_pool_indices_cpu,
         req_pool_indices_device,
+        required_rows,
         seq_lens_device,
         layer_id,
         out_indices,
@@ -401,7 +425,7 @@ class EMAPrefetcher(HiSparsePrefetcher):
         out_page_indices,
     ):
         """Fused CUDA update over persistent request-indexed layer state."""
-        rows = max(req_pool_indices_cpu) + 1
+        rows = required_rows
         width = scores.shape[1]
         state = self._cuda_state.get(layer_id)
         if state is None or state[0].shape[0] < rows or state[0].shape[1] < width:
@@ -459,10 +483,8 @@ class EMAPrefetcher(HiSparsePrefetcher):
                 batch_size, dtype=torch.int32, device=scores.device
             )
         prediction_lens = self._prediction_lens[:batch_size]
-        ready = [
-            (int(slot), int(layer_id)) in self._initialized_keys
-            for slot in req_pool_indices_cpu
-        ]
+        initialized_slots = self._initialized_slots.setdefault(int(layer_id), set())
+        ready = [slot in initialized_slots for slot in req_pool_indices_cpu]
 
         from sglang.kernels.ops.attention.dsv4.ema import ema_update_forecast
 
@@ -479,8 +501,11 @@ class EMAPrefetcher(HiSparsePrefetcher):
             beta=self.beta,
             gamma=self.gamma,
         )
-        for slot in req_pool_indices_cpu:
-            self._initialized_keys.add((int(slot), int(layer_id)))
+        initialized_slots.update(
+            slot
+            for slot, initialized in zip(req_pool_indices_cpu, ready)
+            if not initialized
+        )
         if not any(ready):
             return None
 
@@ -491,22 +516,10 @@ class EMAPrefetcher(HiSparsePrefetcher):
                 dtype=torch.int32,
                 device=scores.device,
             )
-        if (
-            page_table is not None
-            and out_page_indices is not None
-            and self.logical_entries <= 1024
-            and width >= self.logical_entries
-        ):
-            from sglang.kernels.ops.attention.dsv4.topk import topk_transform_512
+        if self.logical_entries <= 1024 and width >= self.logical_entries:
+            from sglang.kernels.ops.attention.dsv4.topk import topk_raw_512
 
-            topk_transform_512(
-                forecast,
-                prediction_lens,
-                page_table,
-                out_page_indices,
-                page_size,
-                out_indices,
-            )
+            topk_raw_512(forecast, prediction_lens, out_indices)
         else:
             # Very short contexts and non-standard candidate counts use the
             # portable selector, but still retain fused persistent EMA state.
@@ -533,6 +546,5 @@ class EMAPrefetcher(HiSparsePrefetcher):
         for _, _, state_lens in self._cuda_state.values():
             if req_pool_idx < state_lens.numel():
                 state_lens[req_pool_idx] = 0
-        self._initialized_keys = {
-            key for key in self._initialized_keys if key[0] != req_pool_idx
-        }
+        for initialized_slots in self._initialized_slots.values():
+            initialized_slots.discard(req_pool_idx)

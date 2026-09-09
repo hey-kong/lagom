@@ -5,7 +5,10 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-from sglang.srt.managers.hisparse_prefetcher import HiSparsePrefetchStats
+from sglang.srt.managers.hisparse_prefetcher import (
+    EMAPrefetcher,
+    HiSparsePrefetchStats,
+)
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -80,6 +83,7 @@ def test_graph_replay_submits_live_batch_with_captured_scores():
     calls = []
     coordinator = SimpleNamespace(
         prefetcher_name="ema",
+        prefetcher=EMAPrefetcher(logical_entries=2),
         num_real_reqs=torch.zeros(1, dtype=torch.int32),
         consume_ema_prefetch=lambda: calls.append(("consume",)),
         submit_ema_prefetch=lambda **kwargs: calls.append(("submit", kwargs)),
@@ -89,14 +93,11 @@ def test_graph_replay_submits_live_batch_with_captured_scores():
     runner._replay_graph_key = "bs4"
     scores = torch.arange(1200, dtype=torch.float32).view(4, 300)
     compressed_lens = torch.tensor([6, 5, 1, 1])
-    page_table = torch.arange(1200, dtype=torch.int32).view(4, 300)
     runner._ema_graph_prefetch = {
         "bs4": {
             2: {
                 "scores": scores,
                 "compressed_seq_lens": compressed_lens,
-                "page_table": page_table,
-                "page_size": 1,
                 "layer_id": 2,
             }
         }
@@ -115,7 +116,6 @@ def test_graph_replay_submits_live_batch_with_captured_scores():
     # source tensor; submitted task snapshots must remain unchanged.
     scores.zero_()
     compressed_lens.zero_()
-    page_table.zero_()
     batch.req_pool_indices.fill_(99)
     batch.req_pool_indices_cpu.fill_(99)
 
@@ -128,11 +128,8 @@ def test_graph_replay_submits_live_batch_with_captured_scores():
     )
     assert torch.equal(kwargs["compressed_seq_lens"], torch.tensor([6, 5]))
     assert torch.equal(kwargs["compressed_seq_lens_cpu"], torch.tensor([6, 5]))
-    assert torch.equal(
-        kwargs["page_table"],
-        torch.arange(1200, dtype=torch.int32).view(4, 300)[:2, :256],
-    )
-    assert kwargs["page_size"] == 1
+    assert kwargs["batch_metadata"].slots == (4, 9)
+    assert kwargs["batch_metadata"].lengths == (6, 5)
     assert kwargs["num_real_reqs"].item() == 2
     assert kwargs["layer_id"] == 2
 
@@ -142,7 +139,6 @@ def test_graph_replay_submits_live_batch_with_captured_scores():
             "req_pool_indices",
             "compressed_seq_lens",
             "scores",
-            "page_table",
             "num_real_reqs",
         )
     }
