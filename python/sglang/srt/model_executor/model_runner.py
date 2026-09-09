@@ -1780,7 +1780,7 @@ class ModelRunner:
             ):
                 forward_batch.hisparse_coordinator = self.hisparse_coordinator
                 self.hisparse_coordinator.wait_for_pending_backup()
-                self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+                self.hisparse_coordinator.begin_decode_batch(forward_batch.batch_size)
 
             # Replay cuda graph if applicable
             if can_run_graph:

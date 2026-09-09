@@ -1321,12 +1321,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if coordinator is not None and coordinator.prefetcher_name == "ema":
             coordinator.consume_ema_prefetch()
 
-    def _prepare_previous_graph_replay(self) -> None:
-        """Join the previous replay's H2D writes before cache mappings are read."""
-        coordinator = self.model_runner.hisparse_coordinator
-        if coordinator is not None and coordinator.prefetcher_name == "previous":
-            coordinator.consume_previous_graph_prefetch()
-
     def _submit_previous_graph_prefetch(self, forward_batch: ForwardBatch) -> None:
         """Submit graph-produced Previous candidates without capturing Python state."""
         templates = self._previous_graph_prefetch.get(self._replay_graph_key)
@@ -1602,7 +1596,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.load_batch(forward_batch, pp_proxy_tensors)
             self._prepare_oasiskv_graph_replay(forward_batch)
             self._prepare_ema_graph_replay()
-            self._prepare_previous_graph_replay()
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
                     "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",

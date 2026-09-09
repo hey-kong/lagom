@@ -1526,7 +1526,7 @@ class HiSparseCoordinator:
 
     def consume_previous_graph_prefetch(self) -> None:
         """Join post-replay Previous writes before the next graph reads them."""
-        if self.prefetcher_name != "previous":
+        if self.prefetcher_name != "previous" or self.prefetcher is None:
             return
         if self._previous_prefetch_pending_entries:
             self._previous_prefetch_event.wait(device_module.current_stream())
@@ -1535,6 +1535,17 @@ class HiSparseCoordinator:
             )
             self._previous_prefetch_pending_entries = 0
         self._previous_prefetch_target_layer = None
+
+    def begin_decode_batch(self, num_real_reqs: int) -> None:
+        """Drain deferred Previous IO before publishing the next batch size.
+
+        Post-graph copies read ``num_real_reqs`` asynchronously.  The scalar
+        must therefore remain unchanged until the final copy has joined the
+        compute stream.  Doing this at the common decode entry also covers a
+        graph-to-eager fallback.
+        """
+        self.consume_previous_graph_prefetch()
+        self.num_real_reqs.fill_(num_real_reqs)
 
     def consume_oasiskv_prefetch(
         self,
