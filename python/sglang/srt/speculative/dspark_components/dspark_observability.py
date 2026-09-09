@@ -7,7 +7,7 @@ import time
 from collections import deque
 from contextlib import contextmanager, nullcontext
 from enum import Enum
-from typing import Callable, ContextManager, Iterator, Optional, Union
+from typing import Any, Callable, ContextManager, Iterator, Optional, Union
 
 import msgspec
 import torch
@@ -141,6 +141,7 @@ class DecodeStepObservation(msgspec.Struct):
     cap_trim_lens: torch.Tensor
     commit_lens: torch.Tensor
     rids: Optional[list[str]]
+    graph_event_key: Optional[Any] = None
 
 
 class _PendingStep(msgspec.Struct):
@@ -217,8 +218,12 @@ class DsparkInfoDumper:
         # every replay. Keep them by verify graph size so a replay can publish
         # the inner timings even though Python indexer code is not re-entered.
         self._graph_segment_events: dict[
-            int, dict[InfoSegment, list[tuple[torch.cuda.Event, torch.cuda.Event]]]
+            Any, dict[InfoSegment, list[tuple[torch.cuda.Event, torch.cuda.Event]]]
         ] = {}
+
+    def reset_graph_segments(self, graph_key: Any) -> None:
+        """Discard captured events before replacing a graph with the same key."""
+        self._graph_segment_events.pop(graph_key, None)
 
     def begin_step(self) -> None:
         if not self.enabled:
@@ -246,7 +251,7 @@ class DsparkInfoDumper:
             self._open_segment(segment)
 
     def end_external_segment(
-        self, name: Union[InfoSegment, str], *, graph_key: Optional[int] = None
+        self, name: Union[InfoSegment, str], *, graph_key: Optional[Any] = None
     ) -> None:
         """Finish a segment started by :meth:`begin_external_segment`."""
         segment = InfoSegment(name)
@@ -273,7 +278,7 @@ class DsparkInfoDumper:
         # Keep this fallback for direct/test callers that only observe steps.
         self._drain_pending()
 
-        graph_events = self._graph_segment_events.get(obs.verify_tokens_graph_key, {})
+        graph_events = self._graph_segment_events.get(obs.graph_event_key, {})
         for segment, events in graph_events.items():
             if segment not in self._current_segments:
                 self._current_segments[segment] = events
@@ -374,7 +379,7 @@ class DsparkInfoDumper:
         end.record()
         event_pair = (start, end)
         if graph_key is not None and torch.cuda.is_current_stream_capturing():
-            by_segment = self._graph_segment_events.setdefault(int(graph_key), {})
+            by_segment = self._graph_segment_events.setdefault(graph_key, {})
             by_segment.setdefault(segment, []).append(event_pair)
         else:
             self._current_segments.setdefault(segment, []).append(event_pair)
@@ -911,6 +916,7 @@ class DsparkStepObservers:
         req_pool_indices: torch.Tensor,
         verify_tier_num_tokens: int,
         dp_tier_num_tokens: Optional[int],
+        graph_event_key: Optional[Any],
     ) -> None:
         planner = self._planner
         if not proposal_folded:
@@ -998,6 +1004,7 @@ class DsparkStepObservers:
                     cap_trim_lens=cap_trim_lens,
                     commit_lens=commit_lens,
                     rids=[req.rid for req in reqs],
+                    graph_event_key=graph_event_key,
                 )
             )
 

@@ -847,7 +847,7 @@ class C4IndexerBackendMixin:
             if dspark_timer is not None:
                 dspark_timer.end_external_segment(
                     InfoSegment.INDEXER_TOPK,
-                    graph_key=int(forward_batch.input_ids.numel()),
+                    graph_key=forward_batch.dspark_graph_key,
                 )
             return
 
@@ -922,7 +922,7 @@ class C4IndexerBackendMixin:
         if dspark_timer is not None:
             dspark_timer.end_external_segment(
                 InfoSegment.INDEXER_TOPK,
-                graph_key=int(forward_batch.input_ids.numel()),
+                graph_key=forward_batch.dspark_graph_key,
             )
         prefetch_candidates = None
         if hisparse_decode and hisparse_coordinator.prefetcher is not None:
@@ -1097,7 +1097,7 @@ class C4IndexerBackendMixin:
                     if dspark_timer is not None:
                         dspark_timer.end_external_segment(
                             InfoSegment.TOPK_TRANSFER,
-                            graph_key=int(forward_batch.input_ids.numel()),
+                            graph_key=forward_batch.dspark_graph_key,
                         )
                     # Host misses for current verify C4 rows resolve through the
                     # transaction's scratch mapping rather than becoming -1.

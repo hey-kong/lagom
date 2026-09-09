@@ -1245,6 +1245,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     variant_label,
                     dsa_variant,
                 )
+                forward_batch.dspark_graph_key = shape_key
                 post_warmup_hook = getattr(
                     self.model_runner.attn_backend,
                     "on_after_cuda_graph_warmup",
@@ -1256,6 +1257,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                     run_lm_head=True,
                 )
+                coordinator = self.model_runner.hisparse_coordinator
+                dspark_dumper = (
+                    getattr(coordinator, "dspark_info_dumper", None)
+                    if coordinator is not None
+                    else None
+                )
+                if dspark_dumper is not None:
+                    dspark_dumper.reset_graph_segments(shape_key)
                 self.backend.capture_one(
                     shape_key,
                     run_once,

@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -547,6 +547,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Previous capture records per-layer Indexer candidates. The mutable
     # resident-cache plan and side-stream copies are submitted after replay.
     is_previous_graph_capture: bool = False
+    # Exact target CUDA graph identity used by DSpark inner-segment timing.
+    dspark_graph_key: Optional[Any] = None
     oasiskv_normal_rows: Optional[torch.Tensor] = None
     oasiskv_draft_rows: Optional[torch.Tensor] = None
     oasiskv_draft_valid: Optional[torch.Tensor] = None
