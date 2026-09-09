@@ -65,12 +65,16 @@ SGL_DEVICE void naive_transform(
     const uint32_t page_bits,
     const uint32_t topk) {
   if (const auto tx = threadIdx.x; tx < length) {
-    indices[tx] = page_to_indices(page_table, tx, page_bits);
+    if (indices != nullptr) {
+      indices[tx] = page_to_indices(page_table, tx, page_bits);
+    }
     if (raw_indices != nullptr) {
       raw_indices[tx] = tx;
     }
   } else if (tx < topk) {
-    indices[tx] = -1;  // fill invalid indices to -1
+    if (indices != nullptr) {
+      indices[tx] = -1;  // fill invalid indices to -1
+    }
     if (raw_indices != nullptr) {
       raw_indices[tx] = -1;
     }
@@ -247,8 +251,8 @@ __global__ void topk_transform_kernel(const __grid_constant__ TopKParams params)
   /// NOTE: dangerous prefetch seq_len before PDL wait
   const uint32_t seq_len = seq_lens[work_id];
   const auto score_ptr = scores + work_id * score_stride;
-  const auto page_ptr = page_table + work_id * page_table_stride;
-  const auto indices_ptr = page_indices + work_id * topk;
+  const auto page_ptr = page_table != nullptr ? page_table + work_id * page_table_stride : nullptr;
+  const auto indices_ptr = page_indices != nullptr ? page_indices + work_id * topk : nullptr;
   const auto raw_indices_ptr = raw_indices != nullptr ? raw_indices + work_id * topk : nullptr;
 
   device::PDLWaitPrimary<kUsePDL>();
@@ -260,7 +264,9 @@ __global__ void topk_transform_kernel(const __grid_constant__ TopKParams params)
     radix_topk(score_ptr, s_topk_indices, seq_len, topk);
     const auto tx = threadIdx.x;
     if (tx < topk) {
-      indices_ptr[tx] = page_to_indices(page_ptr, s_topk_indices[tx], page_bits);
+      if (indices_ptr != nullptr) {
+        indices_ptr[tx] = page_to_indices(page_ptr, s_topk_indices[tx], page_bits);
+      }
       if (raw_indices_ptr != nullptr) {
         raw_indices_ptr[tx] = s_topk_indices[tx];
       }
@@ -344,6 +350,38 @@ struct TopKKernel {
         .topk = topk,
     };
     constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);  // align up a little
+    setup_kernel_smem_once<kernel, kSMEM_>();
+    LaunchKernel(batch_size, kTopKBlockSize, device.unwrap(), kSMEM_).enable_pdl(kUsePDL)(kernel, params);
+  }
+
+  static void select(
+      const tvm::ffi::TensorView scores, const tvm::ffi::TensorView seq_lens, const tvm::ffi::TensorView raw_indices) {
+    using namespace host;
+    auto B = SymbolicSize{"batch_size"};
+    auto S = SymbolicSize{"score_stride"};
+    auto K = SymbolicSize{"topk"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({B, -1}).with_strides({S, 1}).with_dtype<float>().with_device(device).verify(scores);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(seq_lens);
+    TensorMatcher({B, K}).with_dtype<int32_t>().with_device(device).verify(raw_indices);
+
+    const auto batch_size = static_cast<uint32_t>(B.unwrap());
+    const auto topk = static_cast<uint32_t>(K.unwrap());
+    RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 1024]");
+    const auto params = TopKParams{
+        .scores = static_cast<float*>(scores.data_ptr()),
+        .seq_lens = static_cast<int32_t*>(seq_lens.data_ptr()),
+        .page_table = nullptr,
+        .page_indices = nullptr,
+        .raw_indices = static_cast<int32_t*>(raw_indices.data_ptr()),
+        .score_stride = S.unwrap(),
+        .page_table_stride = 0,
+        .page_bits = 0,
+        .topk = topk,
+    };
+    constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);
     setup_kernel_smem_once<kernel, kSMEM_>();
     LaunchKernel(batch_size, kTopKBlockSize, device.unwrap(), kSMEM_).enable_pdl(kUsePDL)(kernel, params);
   }

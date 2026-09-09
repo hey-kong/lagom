@@ -348,6 +348,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # target graph.  They have graph-pool-stable addresses and are turned
         # into live prefetch submissions only after replay and root commit.
         self._oasiskv_graph_prefetch: dict[object, dict] = {}
+        # Graph-keyed references to replayed EMA Indexer scores. EMA state and
+        # H2D task descriptors remain ordinary Python and are updated post-replay.
+        self._ema_graph_prefetch: dict[object, dict] = {}
+        # Graph outputs are overwritten by the next replay. These persistent
+        # snapshots are reused only after that replay's per-layer waits have
+        # completed the preceding EMA task.
+        self._ema_snapshot_buffers: dict[object, dict] = {}
         if self.ragged_verify_mode and (
             self.enable_two_batch_overlap
             or model_runner.server_args.enable_lora
@@ -990,6 +997,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
         if forward_batch.hisparse_coordinator is not None:
             forward_batch.hisparse_coordinator.num_real_reqs.fill_(bs)
+            forward_batch.is_ema_graph_capture = (
+                forward_batch.hisparse_coordinator.prefetcher_name == "ema"
+            )
 
         if (
             self.model_runner.server_args.is_oasiskv_lookahead
@@ -1253,6 +1263,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     # warmup-created descriptors have been overwritten by the
                     # capture invocation of run_once.
                     self._oasiskv_graph_prefetch[shape_key] = dict(pending)
+                ema_pending = getattr(forward_batch, "_ema_pending_prefetch", None)
+                if ema_pending:
+                    self._ema_graph_prefetch[shape_key] = dict(ema_pending)
 
     def _prepare_oasiskv_graph_replay(self, forward_batch: ForwardBatch) -> None:
         """Join prior H2D writers before the target graph reads C4 mappings."""
@@ -1291,6 +1304,97 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ),
             )
         forward_batch._oasiskv_pending_prefetch = pending
+
+    def _prepare_ema_graph_replay(self) -> None:
+        """Join the preceding token's EMA writes before graph cache reads."""
+        coordinator = self.model_runner.hisparse_coordinator
+        if coordinator is not None and coordinator.prefetcher_name == "ema":
+            coordinator.consume_ema_prefetch()
+
+    def _submit_ema_graph_prefetch(self, forward_batch: ForwardBatch) -> None:
+        """Use replayed Indexer scores to launch next-token EMA warmups."""
+        templates = self._ema_graph_prefetch.get(self._replay_graph_key)
+        coordinator = self.model_runner.hisparse_coordinator
+        if not templates or coordinator is None or coordinator.prefetcher_name != "ema":
+            return
+        raw_bs = forward_batch.batch_size
+        if forward_batch.seq_lens_cpu is None:
+            raise RuntimeError("EMA CUDA Graph replay requires CPU sequence lengths")
+        c4_seq_lens_cpu = (forward_batch.seq_lens_cpu // 4).clamp_min(1)
+        max_c4_len = int(c4_seq_lens_cpu.max())
+        snapshot_buffers = getattr(self, "_ema_snapshot_buffers", None)
+        if snapshot_buffers is None:
+            snapshot_buffers = self._ema_snapshot_buffers = {}
+        snapshot = snapshot_buffers.setdefault(self._replay_graph_key, {})
+        first = next(iter(templates.values()))
+
+        def ensure_buffer(name, source, shape):
+            buffer = snapshot.get(name)
+            if buffer is None or any(
+                have < need for have, need in zip(buffer.shape, shape)
+            ):
+                buffer = torch.empty(shape, dtype=source.dtype, device=source.device)
+                snapshot[name] = buffer
+            return buffer
+
+        # Request metadata is shared by all C4 layers. Copy and parse it once
+        # per decode step instead of once per layer.
+        req_pool_indices = ensure_buffer(
+            "req_pool_indices", forward_batch.req_pool_indices, (raw_bs,)
+        )[:raw_bs]
+        req_pool_indices.copy_(forward_batch.req_pool_indices)
+        compressed_seq_lens = ensure_buffer(
+            "compressed_seq_lens", first["compressed_seq_lens"], (raw_bs,)
+        )[:raw_bs]
+        compressed_seq_lens.copy_(first["compressed_seq_lens"][:raw_bs])
+        num_real_reqs = ensure_buffer("num_real_reqs", coordinator.num_real_reqs, (1,))
+        num_real_reqs.fill_(raw_bs)
+        req_pool_indices_cpu = ensure_buffer(
+            "req_pool_indices_cpu", forward_batch.req_pool_indices_cpu, (raw_bs,)
+        )[:raw_bs]
+        req_pool_indices_cpu.copy_(forward_batch.req_pool_indices_cpu)
+        compressed_seq_lens_cpu = ensure_buffer(
+            "compressed_seq_lens_cpu", c4_seq_lens_cpu, (raw_bs,)
+        )[:raw_bs]
+        compressed_seq_lens_cpu.copy_(c4_seq_lens_cpu)
+        batch_metadata = coordinator.prefetcher.prepare_batch(
+            req_pool_indices_cpu, compressed_seq_lens_cpu
+        )
+
+        for captured in templates.values():
+            ema_width = min(
+                captured["scores"].shape[1], ((max_c4_len + 255) // 256) * 256
+            )
+            # The next replay overwrites every captured input/output address
+            # before its layer-local resident-buffer wait. Snapshot all data
+            # consumed by the asynchronous task now, on the compute stream.
+            # The side stream waits for these copies, while the next graph is
+            # free to overwrite its own score and metadata buffers.
+            score_buffers = snapshot.setdefault("scores", {})
+            scores = score_buffers.get(captured["layer_id"])
+            if (
+                scores is None
+                or scores.shape[0] < raw_bs
+                or scores.shape[1] < ema_width
+            ):
+                scores = torch.empty(
+                    (raw_bs, ema_width),
+                    dtype=captured["scores"].dtype,
+                    device=captured["scores"].device,
+                )
+                score_buffers[captured["layer_id"]] = scores
+            scores = scores[:raw_bs, :ema_width]
+            scores.copy_(captured["scores"][:raw_bs, :ema_width])
+            coordinator.submit_ema_prefetch(
+                req_pool_indices=req_pool_indices,
+                req_pool_indices_cpu=req_pool_indices_cpu,
+                compressed_seq_lens=compressed_seq_lens,
+                compressed_seq_lens_cpu=compressed_seq_lens_cpu,
+                scores=scores,
+                num_real_reqs=num_real_reqs,
+                layer_id=captured["layer_id"],
+                batch_metadata=batch_metadata,
+            )
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
@@ -1459,6 +1563,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
             self._prepare_oasiskv_graph_replay(forward_batch)
+            self._prepare_ema_graph_replay()
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
                     "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",
@@ -1478,6 +1583,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             output = self.backend.replay(self._replay_graph_key, forward_batch)
             self._publish_oasiskv_graph_prefetch(forward_batch)
+            self._submit_ema_graph_prefetch(forward_batch)
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

@@ -4,8 +4,10 @@ import pytest
 import torch
 
 from sglang.srt.managers.hisparse_prefetcher import (
+    EMAPrefetcher,
     OasisKVPrefetcher,
     PreviousPrefetcher,
+    _grow_capacity,
     create_hisparse_prefetcher,
     supported_hisparse_prefetchers,
 )
@@ -144,7 +146,9 @@ def test_unknown_algorithm_and_fields_are_rejected():
         create_hisparse_prefetcher(
             "random", {}, effective_top_k=4, device_buffer_size=8
         )
-    with pytest.raises(ValueError, match="supported prefetchers: oasiskv, previous"):
+    with pytest.raises(
+        ValueError, match="supported prefetchers: ema, oasiskv, previous"
+    ):
         create_hisparse_prefetcher(
             "previous_layer_topk", {}, effective_top_k=4, device_buffer_size=8
         )
@@ -155,7 +159,7 @@ def test_unknown_algorithm_and_fields_are_rejected():
             effective_top_k=4,
             device_buffer_size=8,
         )
-    assert supported_hisparse_prefetchers() == ("oasiskv", "previous")
+    assert supported_hisparse_prefetchers() == ("ema", "oasiskv", "previous")
 
 
 def test_oasiskv_token_coverage_and_selection():
@@ -188,3 +192,121 @@ def test_rejects_invalid_or_too_short_previous():
         prefetcher.select(torch.tensor([1, 2, 3]))
     with pytest.raises(ValueError, match="2 entries"):
         prefetcher.select(torch.tensor([[1, 2]]))
+
+
+def test_ema_defaults_and_c4_token_coverage():
+    prefetcher = create_hisparse_prefetcher(
+        "ema", {}, effective_top_k=512, device_buffer_size=4096, entry_token_span=4
+    )
+    assert isinstance(prefetcher, EMAPrefetcher)
+    assert prefetcher.logical_entries == 512
+    assert prefetcher.size == 2048
+    assert (prefetcher.alpha, prefetcher.beta, prefetcher.gamma) == (0.6, 0.2, 0.25)
+
+
+def test_ema_first_observation_skips_then_updates_level_and_trend():
+    prefetcher = EMAPrefetcher(logical_entries=2)
+    first = torch.tensor([[1.0, 4.0, 2.0]])
+    formal_top_k = torch.tensor([[7, 8]], dtype=torch.int32)
+    assert prefetcher.update(first, torch.tensor([3]), [11], 2) is None
+
+    second = torch.tensor([[3.0, 2.0, 5.0]])
+    predicted = prefetcher.update(second, torch.tensor([3]), [11], 2)
+    # level=[2.2, 2.8, 3.8], trend=[.4, -.4, .6], forecast=[2.3,2.7,3.95]
+    assert torch.equal(
+        predicted.sort(dim=1).values, torch.tensor([[1, 2]], dtype=torch.int32)
+    )
+    # Predictions are side data: the current Indexer Top-K stays byte-for-byte intact.
+    assert torch.equal(formal_top_k, torch.tensor([[7, 8]], dtype=torch.int32))
+
+
+def test_ema_enabled_and_disabled_attention_selection_is_identical():
+    """EMA warms residency only; attention continues to gather formal Top-K."""
+    values = torch.tensor([[2.0, 3.0, 5.0, 7.0]])
+    formal = torch.tensor([[3, 1]])
+    disabled = torch.gather(values, 1, formal)
+
+    prefetcher = EMAPrefetcher(logical_entries=2)
+    prefetcher.update(values, torch.tensor([4]), [0], 0)
+    prediction = prefetcher.update(values.flip(1), torch.tensor([4]), [0], 0)
+    assert prediction is not None and not torch.equal(prediction.long(), formal)
+    enabled = torch.gather(values, 1, formal)
+    assert torch.equal(enabled, disabled)
+
+
+def test_ema_state_isolated_by_request_and_layer_and_survives_batch_reorder():
+    prefetcher = EMAPrefetcher(logical_entries=1)
+    scores = torch.tensor([[9.0, 1.0], [1.0, 9.0]])
+    assert prefetcher.update(scores, torch.tensor([2, 2]), [3, 7], 0) is None
+    # Reverse batch rows; request identity, rather than row number, selects history.
+    result = prefetcher.update(scores.flip(0), torch.tensor([2, 2]), [7, 3], 0)
+    assert torch.equal(result, torch.tensor([[1], [0]], dtype=torch.int32))
+    assert prefetcher.update(scores[:1], torch.tensor([2]), [3], 1) is None
+    assert set(prefetcher._state) == {(3, 0), (7, 0), (3, 1)}
+
+    prefetcher.release_request(3)
+    assert set(prefetcher._state) == {(7, 0)}
+    assert prefetcher.update(scores[:1], torch.tensor([2]), [3], 0) is None
+
+
+def test_ema_new_request_only_skips_its_own_batch_row():
+    prefetcher = EMAPrefetcher(logical_entries=2)
+    assert (
+        prefetcher.update(torch.tensor([[1.0, 3.0, 2.0]]), torch.tensor([3]), [4], 0)
+        is None
+    )
+
+    selected = prefetcher.update(
+        torch.tensor([[2.0, 4.0, 1.0], [9.0, 8.0, 7.0]]),
+        torch.tensor([3, 3]),
+        [4, 8],
+        0,
+    )
+
+    assert torch.equal(
+        selected[0].sort().values, torch.tensor([0, 1], dtype=torch.int32)
+    )
+    assert torch.equal(selected[1], torch.tensor([-1, -1], dtype=torch.int32))
+    assert prefetcher.stats.selected_entries == 2
+
+
+def test_ema_uses_existing_device_lengths_for_gpu_masking():
+    prefetcher = EMAPrefetcher(logical_entries=2)
+    scores = torch.tensor([[1.0, 9.0, 8.0]])
+    assert prefetcher.update(scores, torch.tensor([3]), [2], 0) is None
+
+    selected = prefetcher.update(
+        scores,
+        torch.tensor([1]),
+        [2],
+        0,
+        seq_lens_device=torch.tensor([1]),
+    )
+
+    assert torch.equal(selected, torch.tensor([[0, -1]], dtype=torch.int32))
+
+
+@pytest.mark.parametrize("field,value", [("alpha", -0.1), ("beta", 1.1), ("gamma", -1)])
+def test_ema_rejects_invalid_smoothing_parameters(field, value):
+    with pytest.raises(ValueError, match=field):
+        create_hisparse_prefetcher(
+            "ema",
+            {field: value},
+            effective_top_k=4,
+            device_buffer_size=8,
+        )
+
+
+def test_ema_capacity_only_grows_the_insufficient_dimension():
+    assert _grow_capacity(8, 8) == 8
+    assert _grow_capacity(8, 9) == 16
+    assert _grow_capacity(10240, 10496) == 20480
+    # Width growth must not implicitly change an already sufficient row count.
+    assert (_grow_capacity(8, 8), _grow_capacity(10240, 10496)) == (8, 20480)
+
+
+def test_ema_prepares_shared_cpu_batch_metadata_once():
+    metadata = EMAPrefetcher.prepare_batch([7, 2], torch.tensor([13, 9]))
+    assert metadata.slots == (7, 2)
+    assert metadata.lengths == (13, 9)
+    assert metadata.required_rows == 8

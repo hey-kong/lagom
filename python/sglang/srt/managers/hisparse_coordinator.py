@@ -442,9 +442,10 @@ class HiSparseCoordinator:
         )
         self.prefetcher = None
         self.prefetcher_name = prefetcher_name.lower() if prefetcher_name else None
-        if self.prefetcher_name == "oasiskv" and not self.is_dsv4_hisparse:
+        if self.prefetcher_name in ("oasiskv", "ema") and not self.is_dsv4_hisparse:
             raise ValueError(
-                'HiSparse prefetcher "oasiskv" requires the DeepSeek-V4 C4 Indexer'
+                f'HiSparse prefetcher "{self.prefetcher_name}" requires the '
+                "DeepSeek-V4 C4 Indexer"
             )
         # Validate even when a higher-priority mode wins, so misspellings never
         # become silently dormant configuration.
@@ -496,6 +497,15 @@ class HiSparseCoordinator:
                 prefetcher_name.lower() if prefetcher_name is not None else "disabled",
             )
         if self.prefetcher is not None:
+            if (
+                self.prefetcher_name == "ema"
+                and self.prefetcher.logical_entries + self.top_k
+                > self.device_buffer_size
+            ):
+                raise ValueError(
+                    "EMA prefetch coverage plus attention Top-K must fit in "
+                    "device_buffer_size so prefetch cannot evict current attention slots"
+                )
             if not self.is_dsv4_hisparse and (
                 self.prefetcher.logical_entries != self.top_k
             ):
@@ -539,6 +549,18 @@ class HiSparseCoordinator:
             self._previous_prefetch_target_layer = None
             self._previous_prefetch_num_reqs = 0
             self._previous_prefetch_pending_entries = 0
+            self._ema_graph_work_pending = False
+            self._ema_layer_events = None
+            if self.prefetcher_name == "ema":
+                # External events become per-layer wait nodes in the captured
+                # decode graph. Seed them so capture/warmup cannot deadlock.
+                self._ema_layer_events = [
+                    device_module.Event(external=True)
+                    for _ in range(self.mem_pool_device.layer_num)
+                ]
+                current_stream = device_module.current_stream()
+                for event in self._ema_layer_events:
+                    event.record(current_stream)
             # A monotonically increasing incarnation prevents an async copy
             # planned for a finished request from being consumed after its
             # scheduler slot is reused.
@@ -607,9 +629,10 @@ class HiSparseCoordinator:
                     self.mem_pool_device.layer_num,
                 )
             logger.info(
-                "HiSparse Previous Prefetcher: %d-token coverage maps to %d "
+                "HiSparse %s prefetcher: %d-token coverage maps to %d "
                 "logical KV entries per request (entry span=%d tokens); Indexer "
                 "selection is Top-%d and attention remains Top-%d.",
+                self.prefetcher_name,
                 self.prefetcher.size,
                 self.prefetcher.logical_entries,
                 self.prefetch_entry_token_span,
@@ -1261,6 +1284,23 @@ class HiSparseCoordinator:
                     task.valid = False
                     self.prefetcher.stats.stale_tasks += 1
 
+    def _drain_named_prefetch_before_request_release(self) -> None:
+        """CPU-block until named-prefetch table readers/writers are finished."""
+        if (
+            self.prefetcher is None
+            or self.prefetcher_name == "oasiskv"
+            or not (
+                self._previous_prefetch_pending_entries or self._ema_graph_work_pending
+            )
+        ):
+            return
+        # RESOLVE reads req/host/device mappings before its H2D writer runs.
+        # Synchronize before *any* of those tables or their slots are reclaimed.
+        self._previous_prefetch_event.synchronize()
+        self._previous_prefetch_pending_entries = 0
+        self._ema_graph_work_pending = False
+        self._previous_prefetch_target_layer = None
+
     def request_finished(self, req: Req):
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
@@ -1269,6 +1309,9 @@ class HiSparseCoordinator:
         # This must precede *all* device mapping and host-page reclamation:
         # OasisKV DMA reads the request's host pages and writes resident slots.
         self._drain_oasiskv_tasks_for_request(req.req_pool_idx)
+        # EMA/previous RESOLVE also reads the shared request mappings. This must
+        # precede allocator frees, mapping clears, and host-page reclamation.
+        self._drain_named_prefetch_before_request_release()
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
         # allocator can over-allocate beyond the committed seqlen, and those
@@ -1312,14 +1355,10 @@ class HiSparseCoordinator:
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
         if self.prefetcher is not None:
-            if (
-                self.prefetcher_name != "oasiskv"
-                and self._previous_prefetch_pending_entries
-            ):
-                self._previous_prefetch_event.wait(device_module.current_stream())
-                self._previous_prefetch_pending_entries = 0
-                self._previous_prefetch_target_layer = None
             self._prefetch_generation[req.req_pool_idx] += 1
+            release = getattr(self.prefetcher, "release_request", None)
+            if release is not None:
+                release(req.req_pool_idx)
 
     def _run_swap_in_kernel(
         self,
@@ -1332,6 +1371,7 @@ class HiSparseCoordinator:
         output_buffer: Optional[torch.Tensor] = None,
         miss_plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         skip_io: Optional[bool] = None,
+        num_real_reqs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the full plan+IO swap-in kernel for one layer; return its slot table.
 
@@ -1378,7 +1418,9 @@ class HiSparseCoordinator:
             hot_buffer_size=self.device_buffer_size,
             page_size=1,
             block_size=self.swap_in_block_size,
-            num_real_reqs=self.num_real_reqs,
+            num_real_reqs=(
+                self.num_real_reqs if num_real_reqs is None else num_real_reqs
+            ),
             skip_io=self.skip_io if skip_io is None else skip_io,
             **plan,
         )
@@ -1391,6 +1433,13 @@ class HiSparseCoordinator:
         req_pool_indices_cpu: Optional[torch.Tensor] = None,
         committed_lens_cpu: Optional[torch.Tensor] = None,
     ) -> None:
+        if self.prefetcher_name == "ema":
+            # This call is intentionally unconditional: during CUDA Graph
+            # capture it records one external wait at the point each layer is
+            # about to resolve/read its buffer. Layer N can therefore execute
+            # while the prefetch stream is still preparing later layers.
+            self._ema_layer_events[layer_id].wait(device_module.current_stream())
+            return
         if self.prefetcher_name == "oasiskv":
             if self._oasiskv_ring is None:
                 return
@@ -1610,9 +1659,107 @@ class HiSparseCoordinator:
         self._oasiskv_next_slot[layer_id] = 1 - ring_slot
         return self._oasiskv_ring[layer_id][ring_slot]
 
+    def consume_ema_prefetch(self) -> None:
+        """Publish prior work stats; per-layer graph nodes provide ordering."""
+        if self.prefetcher_name != "ema" or not self._ema_graph_work_pending:
+            return
+        self.prefetcher.stats.completed_h2d_entries += (
+            self._previous_prefetch_pending_entries
+        )
+        self._previous_prefetch_pending_entries = 0
+        self._previous_prefetch_target_layer = None
+        self._ema_graph_work_pending = False
+
+    def submit_ema_prefetch(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        compressed_seq_lens_cpu: torch.Tensor,
+        scores: torch.Tensor,
+        num_real_reqs: torch.Tensor,
+        layer_id: int,
+        batch_metadata,
+    ) -> None:
+        """Update EMA and warm one layer after current graph attention finishes."""
+        if self.prefetcher_name != "ema" or self.prefetcher is None:
+            raise RuntimeError("submit_ema_prefetch requires EMA mode")
+        num_reqs = scores.shape[0]
+        # Keep EMA math, Top-M, RESOLVE, and H2D off the compute stream. The
+        # replay pre-hook joins this event before graph-pool scores or resident
+        # mappings can be reused; consecutive layers serialize naturally on
+        # the same side stream and safely share their plan buffers.
+        self._previous_prefetch_stream.wait_stream(device_module.current_stream())
+        for tensor in (
+            req_pool_indices,
+            compressed_seq_lens,
+            scores,
+            num_real_reqs,
+        ):
+            tensor.record_stream(self._previous_prefetch_stream)
+        with device_module.stream(self._previous_prefetch_stream):
+            candidates = self.prefetcher.update(
+                scores,
+                compressed_seq_lens_cpu,
+                req_pool_indices_cpu,
+                layer_id,
+                self.indexer_prefetch_candidates_buffer[:num_reqs],
+                req_pool_indices_device=req_pool_indices,
+                seq_lens_device=compressed_seq_lens,
+                batch_metadata=batch_metadata,
+            )
+            if candidates is not None:
+                selected = self.prefetcher.select(candidates)
+                self._run_swap_in_kernel(
+                    req_pool_indices,
+                    compressed_seq_lens,
+                    selected,
+                    layer_id,
+                    record_plan=True,
+                    num_top_k=self.prefetcher.logical_entries,
+                    output_buffer=self._previous_prefetch_device_locs,
+                    miss_plan=(
+                        self._previous_miss_src,
+                        self._previous_miss_dst,
+                        self._previous_miss_count,
+                    ),
+                    skip_io=True,
+                    num_real_reqs=num_real_reqs,
+                )
+                copy_cache_planned_mla(
+                    miss_src=self._previous_miss_src[:num_reqs],
+                    miss_dst=self._previous_miss_dst[:num_reqs],
+                    miss_count=self._previous_miss_count[:num_reqs],
+                    num_real_reqs=num_real_reqs,
+                    host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                    device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                    item_size_bytes=self.item_size_bytes,
+                    num_blocks=4,
+                    is_dsv4_layout=self.is_dsv4_hisparse,
+                    skip_io=self.skip_io,
+                )
+                submitted = num_reqs * self.prefetcher.logical_entries
+                self._previous_prefetch_pending_entries += submitted
+                self.prefetcher.stats.submitted_entries += submitted
+            self._previous_prefetch_event.record(self._previous_prefetch_stream)
+            self._ema_layer_events[layer_id].record(self._previous_prefetch_stream)
+        self._previous_prefetch_target_layer = layer_id
+        self._previous_prefetch_num_reqs = num_reqs
+        self._ema_graph_work_pending = True
+
     def _submit_previous_prefetch_to_layer(
         self, req_pool_indices, compressed_seq_lens, candidates, target_layer
     ) -> None:
+        # The plan buffers are shared across layers. Let the preceding layer's
+        # DMA finish before reusing them; its transfer still overlaps that
+        # layer's attention and its warmed entries remain resident next step.
+        if self._previous_prefetch_pending_entries:
+            self._previous_prefetch_event.wait(device_module.current_stream())
+            self.prefetcher.stats.completed_h2d_entries += (
+                self._previous_prefetch_pending_entries
+            )
+            self._previous_prefetch_pending_entries = 0
         selected = self.prefetcher.select(candidates)
         num_reqs = selected.size(0)
         self._prefetch_candidate_buffer[:num_reqs].copy_(selected)
@@ -1646,6 +1793,10 @@ class HiSparseCoordinator:
                 skip_io=self.skip_io,
             )
             self._previous_prefetch_event.record(self._previous_prefetch_stream)
+            if self.prefetcher_name == "ema":
+                self._ema_layer_events[target_layer].record(
+                    self._previous_prefetch_stream
+                )
         self._previous_prefetch_target_layer = target_layer
         self._previous_prefetch_num_reqs = num_reqs
         self._previous_prefetch_pending_entries = (
@@ -1706,6 +1857,17 @@ class HiSparseCoordinator:
                     top_k_result
                     if prefetch_candidates is None
                     else prefetch_candidates,
+                    layer_id,
+                )
+            elif self.prefetcher_name == "ema" and prefetch_candidates is not None:
+                # The real Top-K was resolved first and is therefore MRU. The
+                # startup capacity check reserves enough other slots for every
+                # prediction, so this same-layer plan cannot evict locations
+                # about to be read by current attention.
+                self._submit_previous_prefetch_to_layer(
+                    req_pool_indices,
+                    compressed_seq_lens,
+                    prefetch_candidates,
                     layer_id,
                 )
             return result

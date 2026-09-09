@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Dict, Mapping, Optional
+from typing import Callable, Dict, Mapping, Optional, Tuple
+
+import torch
 
 
 @dataclass
@@ -27,6 +29,13 @@ class HiSparsePrefetchStats:
     stale_tasks: int = 0
 
 
+@dataclass(frozen=True)
+class EMABatchMetadata:
+    slots: tuple[int, ...]
+    lengths: tuple[int, ...]
+    required_rows: int
+
+
 class HiSparsePrefetcher(ABC):
     """Select logical KV entries; cache ownership remains in the coordinator."""
 
@@ -41,6 +50,13 @@ class HiSparsePrefetcher(ABC):
 
 
 _PREFETCHER_REGISTRY: Dict[str, Callable[..., HiSparsePrefetcher]] = {}
+
+
+def _grow_capacity(current: int, required: int) -> int:
+    """Grow one buffer dimension without inflating independent dimensions."""
+    if required <= current:
+        return current
+    return required if current == 0 else max(required, current * 2)
 
 
 def register_hisparse_prefetcher(name: str):
@@ -79,8 +95,8 @@ def create_hisparse_prefetcher(
     )
     if resolved is None:
         return None
-    factory, logical_entries, size = resolved
-    return factory(logical_entries=logical_entries, size=size)
+    factory, logical_entries, size, algorithm_config = resolved
+    return factory(logical_entries=logical_entries, size=size, **algorithm_config)
 
 
 def validate_hisparse_prefetcher(
@@ -101,7 +117,8 @@ def validate_hisparse_prefetcher(
         raise ValueError(
             f"Unknown HiSparse prefetcher {name!r}; supported prefetchers: {supported}"
         )
-    unknown = set(config) - {"size"}
+    algorithm_fields = {"alpha", "beta", "gamma"} if normalized == "ema" else set()
+    unknown = set(config) - ({"size"} | algorithm_fields)
     if unknown:
         raise ValueError(
             f"Unknown {normalized} prefetcher_config field(s): "
@@ -119,7 +136,20 @@ def validate_hisparse_prefetcher(
             f"entries) exceeds device buffer capacity ({device_buffer_size} "
             "logical entries)"
         )
-    return factory, logical_entries, size
+    algorithm_config = {}
+    for key, default in (("alpha", 0.6), ("beta", 0.2), ("gamma", 0.25)):
+        if key not in algorithm_fields:
+            continue
+        value = config.get(key, default)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(f"prefetcher_config.{key} must be a number")
+        value = float(value)
+        if key != "gamma" and not 0.0 <= value <= 1.0:
+            raise ValueError(f"prefetcher_config.{key} must be in [0, 1]")
+        if key == "gamma" and value < 0.0:
+            raise ValueError("prefetcher_config.gamma must be non-negative")
+        algorithm_config[key] = value
+    return factory, logical_entries, size, algorithm_config
 
 
 @register_hisparse_prefetcher("previous")
@@ -154,3 +184,367 @@ class OasisKVPrefetcher(HiSparsePrefetcher):
         result = predicted[:, : self.logical_entries]
         self.stats.selected_entries += result.numel()
         return result
+
+
+@register_hisparse_prefetcher("ema")
+class EMAPrefetcher(HiSparsePrefetcher):
+    """PRR-style per-request, per-layer EMA prediction over Indexer scores."""
+
+    def __init__(
+        self,
+        logical_entries: int,
+        size: Optional[int] = None,
+        alpha: float = 0.6,
+        beta: float = 0.2,
+        gamma: float = 0.25,
+    ):
+        super().__init__(logical_entries, size)
+        self.alpha, self.beta, self.gamma = alpha, beta, gamma
+        self._state: Dict[
+            Tuple[int, int], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+        self._positions: Optional[torch.Tensor] = None
+        self._cuda_state: Dict[
+            int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+        self._cuda_forecasts: Dict[int, torch.Tensor] = {}
+        self._initialized_slots: Dict[int, set[int]] = {}
+        self._prediction_lens: Optional[torch.Tensor] = None
+
+    @staticmethod
+    def prepare_batch(req_pool_indices_cpu, seq_lens_cpu) -> EMABatchMetadata:
+        """Parse scheduler-owned CPU metadata once for all layers in a step."""
+        slots = tuple(torch.as_tensor(req_pool_indices_cpu, device="cpu").tolist())
+        lengths = tuple(torch.as_tensor(seq_lens_cpu, device="cpu").tolist())
+        return EMABatchMetadata(
+            slots=slots,
+            lengths=lengths,
+            required_rows=max(slots) + 1 if slots else 0,
+        )
+
+    def select(self, previous):
+        """EMA consumes scores through :meth:`update`; indices are passed through."""
+        if previous is None or previous.ndim != 2:
+            raise ValueError("EMA candidates must be a two-dimensional tensor")
+        # update() already accounts for valid, initialized rows without reading
+        # a GPU reduction back to the CPU.
+        return previous[:, : self.logical_entries]
+
+    def update(
+        self,
+        scores: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu,
+        layer_id: int,
+        out_indices: Optional[torch.Tensor] = None,
+        req_pool_indices_device: Optional[torch.Tensor] = None,
+        seq_lens_device: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
+        page_size: int = 1,
+        out_page_indices: Optional[torch.Tensor] = None,
+        batch_metadata: Optional[EMABatchMetadata] = None,
+    ) -> Optional[torch.Tensor]:
+        """Update observations and predict the next decode token's score ranking.
+
+        The first observation for any request/layer initializes state and emits
+        no prediction. State follows request-pool identity, not batch row order.
+        """
+        metadata = batch_metadata or self.prepare_batch(
+            req_pool_indices_cpu, seq_lens_cpu
+        )
+        slots = metadata.slots
+        lengths = metadata.lengths
+        if len(slots) != scores.shape[0]:
+            raise ValueError("EMA request identities must match score rows")
+        if len(lengths) != scores.shape[0]:
+            raise ValueError("EMA CPU sequence lengths must match score rows")
+        if seq_lens_device is None:
+            if scores.device.type != "cpu":
+                raise ValueError("EMA CUDA scores require device sequence lengths")
+            seq_lens_device = torch.as_tensor(seq_lens_cpu, device="cpu")
+        if seq_lens_device.shape[0] != scores.shape[0]:
+            raise ValueError("EMA device sequence lengths must match score rows")
+
+        if scores.device.type == "cuda":
+            if req_pool_indices_device is None:
+                raise ValueError("EMA CUDA scores require device request identities")
+            if (
+                not req_pool_indices_device.is_cuda
+                or req_pool_indices_device.shape[0] != scores.shape[0]
+            ):
+                raise ValueError(
+                    "EMA device request identities must be CUDA and match score rows"
+                )
+            return self._update_cuda(
+                scores=scores,
+                seq_lens_cpu=lengths,
+                req_pool_indices_cpu=slots,
+                req_pool_indices_device=req_pool_indices_device,
+                required_rows=metadata.required_rows,
+                seq_lens_device=seq_lens_device,
+                layer_id=layer_id,
+                out_indices=out_indices,
+                page_table=page_table,
+                page_size=page_size,
+                out_page_indices=out_page_indices,
+            )
+
+        width = scores.shape[1]
+        old_levels = []
+        old_trends = []
+        old_masks = []
+        initialized = []
+        keys = []
+        for slot in slots:
+            key = (int(slot), int(layer_id))
+            keys.append(key)
+            old = self._state.get(key)
+            if old is None:
+                old_level = old_trend = scores.new_zeros(width, dtype=torch.float32)
+                old_mask = torch.zeros(width, dtype=torch.bool, device=scores.device)
+                initialized.append(False)
+            else:
+                old_level, old_trend, old_mask = old
+                old_length = min(old_level.numel(), width)
+                if old_length < width:
+                    old_level = torch.nn.functional.pad(
+                        old_level, (0, width - old_length)
+                    )
+                    old_trend = torch.nn.functional.pad(
+                        old_trend, (0, width - old_length)
+                    )
+                    old_mask = torch.nn.functional.pad(
+                        old_mask, (0, width - old_length)
+                    )
+                else:
+                    old_level = old_level[:width]
+                    old_trend = old_trend[:width]
+                    old_mask = old_mask[:width]
+                initialized.append(True)
+            old_levels.append(old_level)
+            old_trends.append(old_trend)
+            old_masks.append(old_mask)
+
+        current = scores.detach().float()
+        previous_level = torch.stack(old_levels)
+        previous_trend = torch.stack(old_trends)
+        positions = self._positions
+        if (
+            positions is None
+            or positions.device != scores.device
+            or positions.shape[1] != width
+        ):
+            positions = torch.arange(width, device=scores.device).unsqueeze(0)
+            self._positions = positions
+        valid = positions < seq_lens_device.unsqueeze(1)
+        has_history = torch.stack(old_masks)
+        updated_level = self.alpha * current + (1.0 - self.alpha) * previous_level
+        updated_trend = (
+            self.beta * (current - previous_level) + (1.0 - self.beta) * previous_trend
+        )
+        level = torch.where(has_history, updated_level, current).masked_fill(~valid, 0)
+        trend = torch.where(
+            has_history, updated_trend, torch.zeros_like(updated_trend)
+        ).masked_fill(~valid, 0)
+        forecast = (level + self.gamma * trend).masked_fill(~valid, float("-inf"))
+
+        for row, key in enumerate(keys):
+            # Store views of the batch result rather than cloning level/trend
+            # once per request. The next update is functional and never mutates
+            # these tensors, so sharing the batch backing storage is safe.
+            self._state[key] = (
+                level[row],
+                trend[row],
+                valid[row],
+            )
+
+        if not any(initialized):
+            return None
+
+        output = out_indices
+        if output is None:
+            output = torch.full(
+                (scores.shape[0], self.logical_entries),
+                -1,
+                dtype=torch.int32,
+                device=scores.device,
+            )
+        output.fill_(-1)
+        actual_k = min(self.logical_entries, width)
+        row_initialized = has_history.any(dim=1, keepdim=True)
+        if (
+            scores.device.type == "cuda"
+            and page_table is not None
+            and out_page_indices is not None
+            and actual_k == self.logical_entries
+            and self.logical_entries <= 1024
+        ):
+            # Reuse DSV4's optimized fused selection kernel. Its raw output is
+            # exactly the logical C4 position wanted by HiSparse; physical page
+            # output is scratch only. This avoids generic torch.topk, the main
+            # remaining EMA cost at long context.
+            from sglang.kernels.ops.attention.dsv4 import topk_transform_512
+
+            topk_transform_512(
+                forecast,
+                seq_lens_device,
+                page_table,
+                out_page_indices,
+                page_size,
+                output,
+            )
+            output.masked_fill_(~row_initialized, -1)
+        else:
+            # CPU tests and unsupported candidate widths retain a portable path.
+            # Prefetch consumes a set, so score ordering is unnecessary.
+            values, indices = torch.topk(forecast, actual_k, dim=1, sorted=False)
+            selected = indices.to(torch.int32).masked_fill(
+                (values == float("-inf")) | ~row_initialized, -1
+            )
+            output[:, :actual_k].copy_(selected)
+        self.stats.selected_entries += sum(
+            min(self.logical_entries, length)
+            for length, ready in zip(lengths, initialized)
+            if ready
+        )
+        return output
+
+    def _update_cuda(
+        self,
+        *,
+        scores,
+        seq_lens_cpu,
+        req_pool_indices_cpu,
+        req_pool_indices_device,
+        required_rows,
+        seq_lens_device,
+        layer_id,
+        out_indices,
+        page_table,
+        page_size,
+        out_page_indices,
+    ):
+        """Fused CUDA update over persistent request-indexed layer state."""
+        rows = required_rows
+        width = scores.shape[1]
+        state = self._cuda_state.get(layer_id)
+        if state is None or state[0].shape[0] < rows or state[0].shape[1] < width:
+            old_rows = 0 if state is None else state[0].shape[0]
+            old_width = 0 if state is None else state[0].shape[1]
+            row_capacity = _grow_capacity(old_rows, rows)
+            width_capacity = _grow_capacity(old_width, width)
+            # Uninitialized entries are never read: state_lens gates history
+            # loads in the fused kernel. Avoid clearing two potentially large
+            # matrices during growth.
+            level = torch.empty(
+                (row_capacity, width_capacity),
+                dtype=torch.float32,
+                device=scores.device,
+            )
+            trend = torch.empty_like(level)
+            if state is not None and row_capacity == old_rows:
+                state_lens = state[2]
+            else:
+                state_lens = torch.zeros(
+                    row_capacity, dtype=torch.int32, device=scores.device
+                )
+            if state is not None:
+                level[:old_rows, :old_width].copy_(state[0])
+                trend[:old_rows, :old_width].copy_(state[1])
+                if state_lens is not state[2]:
+                    state_lens[:old_rows].copy_(state[2])
+            state = self._cuda_state[layer_id] = (level, trend, state_lens)
+
+        batch_size = scores.shape[0]
+        forecast = self._cuda_forecasts.get(layer_id)
+        if (
+            forecast is None
+            or forecast.shape[0] < batch_size
+            or forecast.shape[1] < width
+        ):
+            old_rows = 0 if forecast is None else forecast.shape[0]
+            old_width = 0 if forecast is None else forecast.shape[1]
+            forecast = torch.empty(
+                (
+                    _grow_capacity(old_rows, batch_size),
+                    _grow_capacity(old_width, width),
+                ),
+                dtype=torch.float32,
+                device=scores.device,
+            )
+            self._cuda_forecasts[layer_id] = forecast
+        forecast = forecast[:batch_size, :width]
+        if (
+            self._prediction_lens is None
+            or self._prediction_lens.device != scores.device
+            or self._prediction_lens.numel() < batch_size
+        ):
+            self._prediction_lens = torch.empty(
+                batch_size, dtype=torch.int32, device=scores.device
+            )
+        prediction_lens = self._prediction_lens[:batch_size]
+        initialized_slots = self._initialized_slots.setdefault(int(layer_id), set())
+        ready = [slot in initialized_slots for slot in req_pool_indices_cpu]
+
+        from sglang.kernels.ops.attention.dsv4.ema import ema_update_forecast
+
+        forecast = ema_update_forecast(
+            scores,
+            req_pool_indices_device,
+            seq_lens_device,
+            state[0],
+            state[1],
+            state[2],
+            prediction_lens,
+            forecast,
+            alpha=self.alpha,
+            beta=self.beta,
+            gamma=self.gamma,
+        )
+        initialized_slots.update(
+            slot
+            for slot, initialized in zip(req_pool_indices_cpu, ready)
+            if not initialized
+        )
+        if not any(ready):
+            return None
+
+        if out_indices is None:
+            out_indices = torch.full(
+                (batch_size, self.logical_entries),
+                -1,
+                dtype=torch.int32,
+                device=scores.device,
+            )
+        if self.logical_entries <= 1024 and width >= self.logical_entries:
+            from sglang.kernels.ops.attention.dsv4.topk import topk_raw_512
+
+            topk_raw_512(forecast, prediction_lens, out_indices)
+        else:
+            # Very short contexts and non-standard candidate counts use the
+            # portable selector, but still retain fused persistent EMA state.
+            out_indices.fill_(-1)
+            actual_k = min(self.logical_entries, width)
+            positions = torch.arange(width, device=scores.device).unsqueeze(0)
+            masked = forecast.masked_fill(
+                positions >= prediction_lens.unsqueeze(1), float("-inf")
+            )
+            values, indices = torch.topk(masked, actual_k, dim=1, sorted=False)
+            out_indices[:, :actual_k].copy_(
+                indices.to(torch.int32).masked_fill_(values == float("-inf"), -1)
+            )
+        self.stats.selected_entries += sum(
+            min(self.logical_entries, length)
+            for length, initialized in zip(seq_lens_cpu, ready)
+            if initialized
+        )
+        return out_indices
+
+    def release_request(self, req_pool_idx: int) -> None:
+        for key in [key for key in self._state if key[0] == req_pool_idx]:
+            del self._state[key]
+        for _, _, state_lens in self._cuda_state.values():
+            if req_pool_idx < state_lens.numel():
+                state_lens[req_pool_idx] = 0
+        for initialized_slots in self._initialized_slots.values():
+            initialized_slots.discard(req_pool_idx)

@@ -905,12 +905,61 @@ class C4IndexerBackendMixin:
             candidate_output = hisparse_coordinator.indexer_prefetch_candidates_buffer[
                 : c4_sparse_page_indices.size(0)
             ]
-            prefetch_candidates = get_prefetch_candidates(
-                logits,
-                c4_seq_lens,
-                raw_indices,
-                candidate_output,
-            )
+            if hisparse_coordinator.prefetcher_name == "ema":
+                compress_layer_id = token_to_kv_pool.layer_mapping[
+                    c4_indexer.layer_id
+                ].compress_layer_id
+                if forward_batch.is_ema_graph_capture:
+                    # Python state mutation and side-stream submission cannot
+                    # be captured. Preserve graph-pool tensor references; the
+                    # decode runner consumes their replayed values afterwards.
+                    pending = getattr(forward_batch, "_ema_pending_prefetch", None)
+                    if pending is None:
+                        pending = forward_batch._ema_pending_prefetch = {}
+                    pending[compress_layer_id] = dict(
+                        scores=logits,
+                        compressed_seq_lens=c4_seq_lens,
+                        layer_id=compress_layer_id,
+                    )
+                else:
+                    seq_lens_cpu = forward_batch.seq_lens_cpu
+                    if seq_lens_cpu is None:
+                        raise RuntimeError(
+                            "EMA requires the decode CPU sequence lengths"
+                        )
+                    c4_seq_lens_cpu = getattr(
+                        forward_batch, "_ema_c4_seq_lens_cpu", None
+                    )
+                    if c4_seq_lens_cpu is None:
+                        c4_seq_lens_cpu = (seq_lens_cpu // 4).clamp_min(1)
+                        forward_batch._ema_c4_seq_lens_cpu = c4_seq_lens_cpu
+                    batch_metadata = getattr(forward_batch, "_ema_batch_metadata", None)
+                    if batch_metadata is None:
+                        batch_metadata = hisparse_coordinator.prefetcher.prepare_batch(
+                            forward_batch.req_pool_indices_cpu, c4_seq_lens_cpu
+                        )
+                        forward_batch._ema_batch_metadata = batch_metadata
+                    max_c4_len = int(c4_seq_lens_cpu.max())
+                    # A small bucket avoids scanning capture capacity while
+                    # keeping tensor shapes stable for many decode steps.
+                    ema_width = min(logits.shape[1], ((max_c4_len + 255) // 256) * 256)
+                    prefetch_candidates = hisparse_coordinator.prefetcher.update(
+                        logits[:, :ema_width],
+                        c4_seq_lens_cpu,
+                        forward_batch.req_pool_indices_cpu,
+                        compress_layer_id,
+                        candidate_output,
+                        req_pool_indices_device=forward_batch.req_pool_indices,
+                        seq_lens_device=c4_seq_lens,
+                        batch_metadata=batch_metadata,
+                    )
+            else:
+                prefetch_candidates = get_prefetch_candidates(
+                    logits,
+                    c4_seq_lens,
+                    raw_indices,
+                    candidate_output,
+                )
         if hisparse_paired:
             normal_rows = forward_batch.oasiskv_normal_rows
             draft_rows = forward_batch.oasiskv_draft_rows

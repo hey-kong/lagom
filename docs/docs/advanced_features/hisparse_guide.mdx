@@ -116,12 +116,12 @@ Pass as a JSON string via `--hisparse-config`:
     <tr>
       <td><code>prefetcher</code></td>
       <td>string / unset</td>
-      <td>Optional HiSparse prefetch algorithm. When unset, preserves the existing model-specific automatic behavior. Currently supports <code>previous</code>.</td>
+      <td>Optional HiSparse prefetch algorithm. When unset, preserves the existing model-specific automatic behavior. Supports <code>previous</code>, <code>ema</code>, and <code>oasiskv</code> (speculative mode).</td>
     </tr>
     <tr>
       <td><code>prefetcher_config</code></td>
       <td>object / <code>{"{}"}</code></td>
-      <td>Optional algorithm-specific configuration. For <code>previous</code>, supports token-coverage <code>size</code>.</td>
+      <td>Optional algorithm-specific configuration. <code>size</code> is original-token coverage; EMA also accepts <code>alpha</code>, <code>beta</code>, and <code>gamma</code>.</td>
     </tr>
   </tbody>
 </table>
@@ -157,6 +157,21 @@ For ordinary DSA, one logical KV entry covers one token. For DeepSeek-V4-Flash C
 When no `prefetcher` is specified, existing behavior is unchanged: eligible GLM-5.2 shared-index layers use automatic cross-layer prefetch, while DeepSeek-V4 does not prefetch. Legacy shared-index prefetch has priority over `previous`; the two modes never operate on the same device buffer concurrently. `SGLANG_DISABLE_HISPARSE_PREFETCH=1` disables both modes.
 
 The initial implementation is disabled with pipeline parallelism or speculative decoding and uses eager decode rather than CUDA graphs. It allocates no additional KV staging buffer. A plan-only RESOLVE applies the preceding layer's positions to the next layer's existing resident table and LRU, then a low-footprint copy-only kernel replays the miss plan directly into that layer's device buffer on a side stream while the current layer computes.
+
+### EMA next-token prefetcher (experimental)
+
+DeepSeek-V4 decode can use a training-free PRR-style EMA of each request and layer's C4 Indexer scores:
+
+```bash
+--enable-hisparse \
+--hisparse-config '{"prefetcher":"ema","prefetcher_config":{"alpha":0.6,"beta":0.2,"gamma":0.25},"top_k":2048,"device_buffer_size":4096,"host_to_device_ratio":5}'
+```
+
+For every logical C4 entry, EMA maintains level and trend across decode tokens and predicts the next score as `level + gamma × trend`. Defaults are `alpha=0.6`, `beta=0.2`, and `gamma=0.25`; override them under `prefetcher_config`. The first observation for each request/layer only initializes that row and deliberately skips its prefetch; mature rows in the same continuous batch still prefetch normally. State follows the request-pool identity across batch reorder and is deleted when that request finishes. EMA derives C4 lengths from the scheduler's CPU sequence-length mirror. On CUDA, one fused kernel updates `level` and `trend`, initializes new request entries, applies valid-history masks, and writes forecasts into reusable storage indexed directly by request-pool ID. Persistent state and forecast row/width capacities grow independently on demand; the existing DeepSeek-V4 kernel still performs Top-M selection. This avoids per-request state stacking, intermediate EMA tensors, and per-layer GPU-to-CPU scalar reads.
+
+The default `size` covers `top_k` original tokens. Because one DeepSeek-V4 C4 entry represents four tokens, the example warms 512 logical entries. Predictions never replace the current Indexer's real Top-K. HiSparse first resolves the real selection, then its existing page table, resident filtering, LRU miss plan, staging, and asynchronous copy path warm only nonresident predictions. The buffer must fit attention Top-K plus the EMA candidate count, which protects every slot current attention may read. Prediction misses still use normal RESOLVE/swap-in, while false positives only transfer extra KV data.
+
+EMA supports decode CUDA Graph with pipeline parallel size 1 and non-speculative decode. After replay, the compute stream copies shared request metadata once per step, plus each layer's active score window, into persistent snapshot buffers before graph storage can be reused; EMA state updates and H2D task descriptors remain outside the captured graph. Snapshot capacity grows only when needed and is then reused. The graph contains one external event wait immediately before each layer consumes its resident buffer, so layer 0 of the next decode can start as soon as layer 0 prefetch finishes while later-layer prefetch remains in flight. This preserves prediction/compute overlap instead of globally draining every layer before replay, without racing the next Indexer write against the preceding EMA score read. On CUDA, prediction selection reuses a logical-index-only mode of the optimized DeepSeek-V4 Top-K kernel, so EMA neither snapshots the page table nor computes unused physical indices. Logical candidates are written directly into RESOLVE's input, avoiding an intermediate candidate copy; the portable PyTorch Top-K path remains a fallback for CPU tests and unsupported candidate widths. EMA also limits score processing to the scheduler's maximum live C4 length rounded to a 256-entry bucket rather than scanning the full capture capacity. Use `--disable-cuda-graph` only when you explicitly want eager decode for comparison.
 
 ## Deployment
 

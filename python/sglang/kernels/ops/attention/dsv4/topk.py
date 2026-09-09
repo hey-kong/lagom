@@ -27,7 +27,10 @@ def _jit_topk_v1_module():
         make_name("topk_v1"),
         *args,
         cuda_files=["deepseek_v4/topk_v1.cuh"],
-        cuda_wrappers=[("topk_transform", f"TopKKernel<{args}>::transform")],
+        cuda_wrappers=[
+            ("topk_transform", f"TopKKernel<{args}>::transform"),
+            ("topk_raw", f"TopKKernel<{args}>::select"),
+        ],
     )
 
 
@@ -62,6 +65,26 @@ def topk_transform_512(
         module.topk_transform(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
         )
+
+
+def topk_raw_512(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out_raw_indices: torch.Tensor,
+) -> None:
+    """Select raw row-relative indices without performing a page-table lookup."""
+    if is_hip_runtime():
+        width = scores.shape[1]
+        positions = torch.arange(width, device=scores.device).unsqueeze(0)
+        masked = scores.masked_fill(positions >= seq_lens.unsqueeze(1), float("-inf"))
+        values, indices = torch.topk(
+            masked, out_raw_indices.shape[1], dim=1, sorted=False
+        )
+        out_raw_indices.copy_(
+            indices.to(torch.int32).masked_fill_(values == float("-inf"), -1)
+        )
+    else:
+        _jit_topk_v1_module().topk_raw(scores, seq_lens, out_raw_indices)
 
 
 # metadata is (batch+1, 2) int32: row 0 = {cluster_threshold, num_cluster_items};
