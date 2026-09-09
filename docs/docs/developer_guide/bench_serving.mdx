@@ -56,6 +56,31 @@ python3 -m sglang.bench_serving \
   --model meta-llama/Llama-3.1-8B-Instruct
 ```
 
+### DSpark and HiSparse metrics
+
+On NVIDIA CUDA, a DSpark server started with both `--enable-hisparse` and
+`--enable-metrics` automatically records the per-round DSpark and HiSparse
+breakdown. You do not need to add another benchmark argument. Keep
+`--backend sglang` so `bench_serving` can read the records from the server's
+`/server_info` endpoint. Using `--flush-cache` is recommended because it clears
+records from an earlier run before the measured requests begin.
+
+At the end of the console's `Serving Benchmark Result`, the
+`DSpark + HiSparse` section reports:
+
+- Mean full DSpark time per speculative decoding round
+- Mean target verification time per round
+- Mean Indexer Top-K time on the target verification critical path
+- Mean Top-K transfer time on the target verification critical path
+- Mean number of tokens received by target verification per round
+
+Times are reported in milliseconds. The same values are stored under
+`dspark_hisparse_metrics` in the output JSONL record. Use `--output-file PATH`
+to select the JSONL destination. Without it, `bench_serving` creates a file in
+the current working directory; for the random dataset its name follows
+`sglang_MMDD_NUM_PROMPTS_INPUT_LEN_OUTPUT_LEN.jsonl`. The command prints the
+absolute output path after appending the result.
+
 ### Fair embedding comparison
 
 Use the two embedding backends with the same model, tokenizer, input length, prompt count, and concurrency. The benchmark reports input-token throughput and end-to-end latency; embeddings have no decode-side TTFT or TPOT.

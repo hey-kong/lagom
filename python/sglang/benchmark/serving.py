@@ -1960,6 +1960,7 @@ async def benchmark(
         else:
             result_for_dump = result
         file.write(json.dumps(result_for_dump) + "\n")
+    print(f"Benchmark results appended to: {os.path.abspath(output_file_name)}")
 
     return result | result_details
 
