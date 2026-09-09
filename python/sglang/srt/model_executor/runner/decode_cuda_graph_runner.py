@@ -1323,6 +1323,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _submit_previous_graph_prefetch(self, forward_batch: ForwardBatch) -> None:
         """Submit graph-produced Previous candidates without capturing Python state."""
+        raw_bs = forward_batch.batch_size
+        # Under DP attention an idle rank still replays a padded graph.  It has
+        # no local rows to prefetch, and the swap/copy kernels do not accept a
+        # zero-sized launch grid.
+        if raw_bs == 0:
+            return
         templates = self._previous_graph_prefetch.get(self._replay_graph_key)
         coordinator = self.model_runner.hisparse_coordinator
         if (
@@ -1331,7 +1337,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             or coordinator.prefetcher_name != "previous"
         ):
             return
-        raw_bs = forward_batch.batch_size
         for captured in templates.values():
             source_layer_id = captured["source_layer_id"]
             if source_layer_id + 1 >= coordinator.mem_pool_device.layer_num:

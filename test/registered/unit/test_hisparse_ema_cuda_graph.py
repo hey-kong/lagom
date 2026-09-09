@@ -178,6 +178,35 @@ def test_graph_replay_submits_previous_candidates_to_following_layers():
     assert target_layer == 2
 
 
+def test_idle_dp_rank_does_not_submit_previous_prefetch():
+    submit = MagicMock()
+    coordinator = SimpleNamespace(
+        prefetcher_name="previous",
+        mem_pool_device=SimpleNamespace(layer_num=2),
+        _submit_previous_prefetch_to_layer=submit,
+    )
+    runner = object.__new__(DecodeCudaGraphRunner)
+    runner.model_runner = SimpleNamespace(hisparse_coordinator=coordinator)
+    runner._replay_graph_key = "bs4"
+    runner._previous_graph_prefetch = {
+        "bs4": {
+            0: {
+                "candidates": torch.arange(8).view(4, 2),
+                "compressed_seq_lens": torch.tensor([8, 7, 1, 1]),
+                "source_layer_id": 0,
+            }
+        }
+    }
+    batch = SimpleNamespace(
+        batch_size=0,
+        req_pool_indices=torch.tensor([0, 0, 0, 0]),
+    )
+
+    runner._submit_previous_graph_prefetch(batch)
+
+    submit.assert_not_called()
+
+
 def test_graph_replay_submits_live_batch_with_captured_scores():
     calls = []
     coordinator = SimpleNamespace(
