@@ -45,6 +45,7 @@ from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
 from sglang.srt.speculative.dspark_components.dspark_observability import (
+    InfoComponent,
     DsparkStepObservers,
     InfoSegment,
 )
@@ -291,7 +292,23 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_rank=self.ps.tp_rank,
             device=self.device,
             simulate_acc_len=self._simulate_acc_len,
+            components=(
+                {
+                    InfoComponent.CORE,
+                    InfoComponent.STEP_GPU_TIME,
+                    InfoComponent.TARGET_VERIFY_GPU_TIME,
+                    InfoComponent.INDEXER_TOPK_GPU_TIME,
+                    InfoComponent.TOPK_TRANSFER_GPU_TIME,
+                }
+                if server_args.enable_metrics
+                and self.model_runner.hisparse_coordinator is not None
+                else None
+            ),
         )
+        if self.model_runner.hisparse_coordinator is not None:
+            self.model_runner.hisparse_coordinator.dspark_info_dumper = (
+                self._observers._info_dumper
+            )
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
@@ -400,7 +417,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def clear_cache_pool(self):
-        pass
+        self._observers.clear_info_records()
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         self._forced_budget_frac = frac

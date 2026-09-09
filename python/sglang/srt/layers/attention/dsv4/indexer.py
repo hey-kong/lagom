@@ -42,6 +42,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+from sglang.srt.speculative.dspark_components.dspark_observability import InfoSegment
 from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
 
@@ -794,6 +795,16 @@ class C4IndexerBackendMixin:
         _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
         if _c4sl.dim() == 1 and not _use_tilelang and not _use_aiter:
             _c4sl = _c4sl.unsqueeze(-1)
+        hisparse_coordinator = self.hisparse_coordinator
+        dspark_timer = (
+            getattr(hisparse_coordinator, "dspark_info_dumper", None)
+            if hisparse_coordinator is not None
+            and forward_batch.forward_mode.is_target_verify()
+            else None
+        )
+        if dspark_timer is not None:
+            dspark_timer.begin_external_segment(InfoSegment.INDEXER_TOPK)
+
         nonpaged_plan = self._get_nonpaged_indexer_plan(
             c4_indexer=c4_indexer,
             forward_batch=forward_batch,
@@ -833,12 +844,13 @@ class C4IndexerBackendMixin:
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
+            if dspark_timer is not None:
+                dspark_timer.end_external_segment(InfoSegment.INDEXER_TOPK)
             return
 
         indexer_capturer = get_global_indexer_capturer()
         capture_enabled = indexer_capturer is not None
 
-        hisparse_coordinator = self.hisparse_coordinator
         hisparse_decode = (
             hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
         )
@@ -904,6 +916,8 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
+        if dspark_timer is not None:
+            dspark_timer.end_external_segment(InfoSegment.INDEXER_TOPK)
         prefetch_candidates = None
         if hisparse_decode and hisparse_coordinator.prefetcher is not None:
             assert hisparse_coordinator.indexer_prefetch_candidates_buffer is not None
@@ -1064,6 +1078,8 @@ class C4IndexerBackendMixin:
                             logical_c4_sparse_page_indices
                         ).to(torch.int32)
                     )
+                    if dspark_timer is not None:
+                        dspark_timer.begin_external_segment(InfoSegment.TOPK_TRANSFER)
                     swapped_locs = hisparse_coordinator.swap_in_selected_pages_spec(
                         req_pool_indices=forward_batch.req_pool_indices,
                         compressed_seq_lens=indexer_metadata.c4_seq_lens,
@@ -1072,6 +1088,8 @@ class C4IndexerBackendMixin:
                         verify_lens_cpu=verify_lens_cpu,
                         output_buffer=c4_sparse_page_indices,
                     )
+                    if dspark_timer is not None:
+                        dspark_timer.end_external_segment(InfoSegment.TOPK_TRANSFER)
                     # Host misses for current verify C4 rows resolve through the
                     # transaction's scratch mapping rather than becoming -1.
                     core_metadata.c4_sparse_page_indices = (
