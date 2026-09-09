@@ -952,7 +952,10 @@ class ModelRunner:
             # Candidate tensors and side-stream plans change each decode step.
             # Graph-safe modes retain fixed graph outputs and publish dynamic
             # Python/H2D work after replay instead of capturing its descriptors.
-            if self.hisparse_coordinator.prefetcher_name in ("oasiskv", "ema"):
+            if self.hisparse_coordinator.prefetcher_name in ("oasiskv", "ema") or (
+                self.hisparse_coordinator.prefetcher_name == "previous"
+                and self.hisparse_coordinator.is_dsv4_hisparse
+            ):
                 # Previous H2D writers are joined before replay and graph-produced
                 # scores/predictions are published afterwards, so no stale Python
                 # descriptor is captured.
@@ -963,7 +966,7 @@ class ModelRunner:
                 )
             else:
                 disable_decode_graph_reason = (
-                    "HiSparse previous prefetch currently requires eager decode; "
+                    "HiSparse previous prefetch on generic DSA currently requires eager decode; "
                     "decode CUDA graph capture has been disabled."
                 )
         if disable_decode_graph_reason is not None:

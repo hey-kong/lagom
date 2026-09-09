@@ -79,6 +79,68 @@ def test_captured_layer_waits_only_for_its_ema_writer(monkeypatch):
     assert events[1].waited_on == "compute"
 
 
+def test_previous_graph_replay_joins_last_writer(monkeypatch):
+    import sglang.srt.managers.hisparse_coordinator as coordinator_module
+
+    event = _Event()
+    coordinator = object.__new__(HiSparseCoordinator)
+    coordinator.prefetcher_name = "previous"
+    coordinator.prefetcher = SimpleNamespace(stats=HiSparsePrefetchStats())
+    coordinator._previous_prefetch_event = event
+    coordinator._previous_prefetch_pending_entries = 12
+    coordinator._previous_prefetch_target_layer = 4
+    monkeypatch.setattr(
+        coordinator_module.device_module, "current_stream", lambda: "compute"
+    )
+
+    coordinator.consume_previous_graph_prefetch()
+
+    assert event.waited_on == "compute"
+    assert coordinator._previous_prefetch_pending_entries == 0
+    assert coordinator._previous_prefetch_target_layer is None
+    assert coordinator.prefetcher.stats.completed_h2d_entries == 12
+
+
+def test_graph_replay_submits_previous_candidates_to_following_layers():
+    calls = []
+    coordinator = SimpleNamespace(
+        prefetcher_name="previous",
+        mem_pool_device=SimpleNamespace(layer_num=4),
+        _submit_previous_prefetch_to_layer=lambda *args: calls.append(args),
+    )
+    runner = object.__new__(DecodeCudaGraphRunner)
+    runner.model_runner = SimpleNamespace(hisparse_coordinator=coordinator)
+    runner._replay_graph_key = "bs4"
+    runner._previous_graph_prefetch = {
+        "bs4": {
+            1: {
+                "candidates": torch.arange(8).view(4, 2),
+                "compressed_seq_lens": torch.tensor([8, 7, 1, 1]),
+                "source_layer_id": 1,
+            },
+            # The final layer has no consumer and must not launch useless IO.
+            3: {
+                "candidates": torch.arange(8).view(4, 2),
+                "compressed_seq_lens": torch.tensor([8, 7, 1, 1]),
+                "source_layer_id": 3,
+            },
+        }
+    }
+    batch = SimpleNamespace(
+        batch_size=2,
+        req_pool_indices=torch.tensor([4, 9, 0, 0]),
+    )
+
+    runner._submit_previous_graph_prefetch(batch)
+
+    assert len(calls) == 1
+    req_pool_indices, seq_lens, candidates, target_layer = calls[0]
+    assert torch.equal(req_pool_indices, torch.tensor([4, 9]))
+    assert torch.equal(seq_lens, torch.tensor([8, 7]))
+    assert torch.equal(candidates, torch.tensor([[0, 1], [2, 3]]))
+    assert target_layer == 2
+
+
 def test_graph_replay_submits_live_batch_with_captured_scores():
     calls = []
     coordinator = SimpleNamespace(

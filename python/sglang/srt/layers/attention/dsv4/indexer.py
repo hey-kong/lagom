@@ -954,12 +954,38 @@ class C4IndexerBackendMixin:
                         batch_metadata=batch_metadata,
                     )
             else:
+                if forward_batch.is_previous_graph_capture:
+                    graph_outputs = (
+                        hisparse_coordinator.previous_graph_candidates_buffer
+                    )
+                    if graph_outputs is None:
+                        raise RuntimeError(
+                            "Previous CUDA Graph capture requires per-layer outputs"
+                        )
+                    compress_layer_id = token_to_kv_pool.layer_mapping[
+                        c4_indexer.layer_id
+                    ].compress_layer_id
+                    candidate_output = graph_outputs[
+                        compress_layer_id, : c4_sparse_page_indices.size(0)
+                    ]
                 prefetch_candidates = get_prefetch_candidates(
                     logits,
                     c4_seq_lens,
                     raw_indices,
                     candidate_output,
                 )
+                if forward_batch.is_previous_graph_capture:
+                    pending = getattr(forward_batch, "_previous_pending_prefetch", None)
+                    if pending is None:
+                        pending = forward_batch._previous_pending_prefetch = {}
+                    pending[compress_layer_id] = dict(
+                        candidates=prefetch_candidates,
+                        compressed_seq_lens=c4_seq_lens,
+                        source_layer_id=compress_layer_id,
+                    )
+                    # Submission mutates Python state and launches work on an
+                    # external stream, so it must happen after graph replay.
+                    prefetch_candidates = None
         if hisparse_paired:
             normal_rows = forward_batch.oasiskv_normal_rows
             draft_rows = forward_batch.oasiskv_draft_rows
