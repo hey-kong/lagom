@@ -300,15 +300,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                     InfoComponent.INDEXER_TOPK_GPU_TIME,
                     InfoComponent.TOPK_TRANSFER_GPU_TIME,
                 }
-                if server_args.enable_metrics
-                and self.model_runner.hisparse_coordinator is not None
+                if server_args.enable_metrics and server_args.enable_hisparse
                 else None
             ),
         )
-        if self.model_runner.hisparse_coordinator is not None:
-            self.model_runner.hisparse_coordinator.dspark_info_dumper = (
-                self._observers._info_dumper
-            )
+        self._attach_hisparse_observer()
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
@@ -317,6 +313,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
         return target_model.model.get_input_embeddings()
+
+    def _attach_hisparse_observer(self) -> None:
+        """Attach after HiSparse initialization, which may follow worker creation."""
+        coordinator = self.model_runner.hisparse_coordinator
+        if (
+            coordinator is not None
+            and getattr(coordinator, "dspark_info_dumper", None) is None
+        ):
+            coordinator.dspark_info_dumper = self._observers._info_dumper
 
     @property
     def carries_confidence(self) -> bool:
@@ -572,6 +577,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _forward_decode(
         self, batch: ScheduleBatch, on_publish, grammar_barrier=None
     ) -> GenerationBatchResult:
+        self._attach_hisparse_observer()
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
         draft_input = batch.spec_info

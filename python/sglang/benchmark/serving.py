@@ -1080,6 +1080,16 @@ def summarize_dspark_metrics(server_info: Optional[dict]) -> Optional[dict[str, 
     }
 
 
+def is_dspark_hisparse_server(server_info: Optional[dict]) -> bool:
+    if not server_info:
+        return False
+    return any(
+        state.get("speculative_algorithm") == "DSPARK"
+        and bool(state.get("enable_hisparse"))
+        for state in server_info.get("internal_states") or []
+    )
+
+
 async def get_request(
     input_requests: List[DatasetRow],
     request_rate: float,
@@ -1745,6 +1755,16 @@ async def benchmark(
                 "Mean target verify tokens per round:",
                 dspark_metrics["mean_target_verify_tokens"],
             )
+        )
+    elif is_dspark_hisparse_server(
+        server_info_json
+        if "sglang" in backend and server_info.status_code == 200
+        else None
+    ):
+        print(
+            "Warning: DSpark + HiSparse metrics were not returned by the server. "
+            "Ensure the server was started with --enable-metrics and uses the same "
+            "SGLang build as bench_serving."
         )
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
     print(
