@@ -401,9 +401,14 @@ def get_prefetch_candidates(
     seq_lens: torch.Tensor,
     formal_top_k: torch.Tensor,
     out_indices: torch.Tensor,
+    *,
+    materialize_output: bool = False,
 ) -> torch.Tensor:
     """Return a prefetch-only candidate tensor without mutating formal Top-k."""
     if out_indices.shape[1] == formal_top_k.shape[1]:
+        if materialize_output:
+            out_indices.copy_(formal_top_k)
+            return out_indices
         return formal_top_k
     select_prefetch_candidates_pytorch(scores, seq_lens, out_indices)
     return out_indices
@@ -973,6 +978,7 @@ class C4IndexerBackendMixin:
                     c4_seq_lens,
                     raw_indices,
                     candidate_output,
+                    materialize_output=forward_batch.is_previous_graph_capture,
                 )
                 if forward_batch.is_previous_graph_capture:
                     pending = getattr(forward_batch, "_previous_pending_prefetch", None)
@@ -1085,6 +1091,9 @@ class C4IndexerBackendMixin:
                             prefetch_candidates=prefetch_candidates,
                             req_pool_indices_cpu=forward_batch.req_pool_indices_cpu,
                             committed_lens_cpu=forward_batch.seq_lens_cpu,
+                            defer_previous_prefetch=(
+                                forward_batch.is_previous_graph_capture
+                            ),
                         )
                     )
             else:

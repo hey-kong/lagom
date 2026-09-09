@@ -1,6 +1,7 @@
 """CPU-only lifecycle tests for HiSparse EMA decode CUDA Graph integration."""
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 
@@ -99,6 +100,29 @@ def test_previous_graph_replay_joins_last_writer(monkeypatch):
     assert coordinator._previous_prefetch_pending_entries == 0
     assert coordinator._previous_prefetch_target_layer is None
     assert coordinator.prefetcher.stats.completed_h2d_entries == 12
+
+
+def test_previous_capture_defers_legacy_submission():
+    coordinator = object.__new__(HiSparseCoordinator)
+    coordinator.enable_prefetch = False
+    coordinator.prefetcher_name = "previous"
+    coordinator.prefetcher = SimpleNamespace()
+    coordinator.top_k = 2
+    coordinator._consume_previous_prefetch = lambda *args: None
+    coordinator._run_swap_in_kernel = lambda *args, **kwargs: torch.tensor([[7, 8]])
+    coordinator._submit_previous_prefetch = MagicMock()
+
+    result = coordinator.swap_in_selected_pages(
+        req_pool_indices=torch.tensor([0]),
+        compressed_seq_lens=torch.tensor([4]),
+        top_k_result=torch.tensor([[1, 2]]),
+        layer_id=0,
+        prefetch_candidates=None,
+        defer_previous_prefetch=True,
+    )
+
+    assert torch.equal(result, torch.tensor([[7, 8]]))
+    coordinator._submit_previous_prefetch.assert_not_called()
 
 
 def test_graph_replay_submits_previous_candidates_to_following_layers():

@@ -1858,6 +1858,7 @@ class HiSparseCoordinator:
         prefetch_candidates: Optional[torch.Tensor] = None,
         req_pool_indices_cpu: Optional[torch.Tensor] = None,
         committed_lens_cpu: Optional[torch.Tensor] = None,
+        defer_previous_prefetch: bool = False,
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices.
 
@@ -1877,7 +1878,7 @@ class HiSparseCoordinator:
                 top_k_result[:, : self.top_k],
                 layer_id,
             )
-            if self.prefetcher_name == "previous":
+            if self.prefetcher_name == "previous" and not defer_previous_prefetch:
                 self._submit_previous_prefetch(
                     req_pool_indices,
                     compressed_seq_lens,

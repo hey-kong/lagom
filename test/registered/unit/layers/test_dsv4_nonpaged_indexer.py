@@ -76,6 +76,23 @@ class TestDSV4PrefetchCandidates(CustomTestCase):
             candidates, torch.tensor([[3, 1, 2, 0]], dtype=torch.int32)
         )
 
+    def test_equal_size_materializes_graph_stable_output(self):
+        scores = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
+        seq_lens = torch.tensor([4], dtype=torch.int32)
+        formal_top_k = torch.tensor([[3, 1, 2, 0]], dtype=torch.int32)
+        candidate_output = torch.full_like(formal_top_k, -1)
+
+        candidates = get_prefetch_candidates(
+            scores,
+            seq_lens,
+            formal_top_k,
+            candidate_output,
+            materialize_output=True,
+        )
+
+        self.assertIs(candidates, candidate_output)
+        torch.testing.assert_close(candidate_output, formal_top_k)
+
 
 class TestDSV4PagedIndexerMetadata(CustomTestCase):
     def test_sm120_fp4_forces_deep_gemm_metadata(self):
