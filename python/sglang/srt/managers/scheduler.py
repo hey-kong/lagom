@@ -986,6 +986,8 @@ class Scheduler(
 
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
+        if self.draft_worker is not None:
+            self.draft_worker.prepare_target_cuda_graph_capture()
         self.tp_worker.init_cuda_graphs()
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()

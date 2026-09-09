@@ -260,9 +260,9 @@ async def async_request_openai_completions(
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith(
-        "completions"
-    ), "OpenAI Completions API URL must end with 'completions'."
+    assert api_url.endswith("completions"), (
+        "OpenAI Completions API URL must end with 'completions'."
+    )
 
     prompt = request_func_input.prompt
 
@@ -391,9 +391,9 @@ async def async_request_openai_chat_completions(
                            latency, TTFT, ITL, and success status.
     """
     api_url = request_func_input.api_url
-    assert api_url.endswith(
-        "chat/completions"
-    ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
+    assert api_url.endswith("chat/completions"), (
+        "OpenAI Chat Completions API URL must end with 'chat/completions'."
+    )
 
     # TODO put it to other functions when `pbar` logic is refactored
     if getattr(args, "print_requests", False):
@@ -1052,6 +1052,77 @@ class BenchmarkMetrics:
     max_concurrent_requests: int = 0
 
 
+def summarize_dspark_metrics(server_info: Optional[dict]) -> Optional[dict[str, float]]:
+    """Aggregate per-step DSpark GPU timings exposed by ``/server_info``."""
+    if not server_info:
+        return None
+    states = server_info.get("internal_states") or []
+    records = []
+    for state in states:
+        records.extend((state.get("dspark_info_record") or {}).get("records") or [])
+    records = [record for record in records if record.get("step_gpu_ms") is not None]
+    if not records:
+        return None
+
+    def mean(field: str) -> float:
+        values = [
+            float(record[field]) for record in records if record.get(field) is not None
+        ]
+        return sum(values) / len(values) if values else 0.0
+
+    verify_token_records = [
+        record
+        for record in records
+        if record.get("num_verify_tokens", -1) >= 0 and record.get("bs", -1) > 0
+    ]
+    total_verify_tokens = sum(
+        float(record["num_verify_tokens"]) for record in verify_token_records
+    )
+    total_verify_requests = sum(float(record["bs"]) for record in verify_token_records)
+    accepted_records = [
+        record
+        for record in records
+        if record.get("num_accepted_tokens", -1) >= 0 and record.get("bs", -1) > 0
+    ]
+    total_accepted_tokens = sum(
+        float(record["num_accepted_tokens"]) for record in accepted_records
+    )
+    total_accepted_requests = sum(float(record["bs"]) for record in accepted_records)
+
+    return {
+        "mean_dspark_ms": mean("step_gpu_ms"),
+        "mean_target_verify_ms": mean("target_verify_gpu_ms"),
+        "mean_indexer_topk_ms": mean("indexer_topk_gpu_ms"),
+        "mean_topk_transfer_ms": mean("topk_transfer_gpu_ms"),
+        "mean_target_verify_tokens": (
+            total_verify_tokens / len(verify_token_records)
+            if verify_token_records
+            else 0.0
+        ),
+        "mean_target_verify_tokens_per_request": (
+            total_verify_tokens / total_verify_requests
+            if total_verify_requests > 0
+            else 0.0
+        ),
+        "mean_accepted_tokens_per_request_per_round": (
+            total_accepted_tokens / total_accepted_requests
+            if total_accepted_requests > 0
+            else 0.0
+        ),
+        "num_steps": float(len(records)),
+    }
+
+
+def is_dspark_hisparse_server(server_info: Optional[dict]) -> bool:
+    if not server_info:
+        return False
+    return any(
+        state.get("speculative_algorithm") == "DSPARK"
+        and bool(state.get("enable_hisparse"))
+        for state in server_info.get("internal_states") or []
+    )
+
+
 async def get_request(
     input_requests: List[DatasetRow],
     request_rate: float,
@@ -1295,9 +1366,9 @@ def _normalize_round_messages(turn: Any) -> Optional[List[Dict[str, str]]]:
 
 
 def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callable:
-    assert (
-        backend in MULTI_TURN_BACKENDS
-    ), f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
+    assert backend in MULTI_TURN_BACKENDS, (
+        f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
+    )
 
     async def f(
         request_func_input: RequestFuncInput,
@@ -1525,9 +1596,9 @@ async def benchmark(
                 lora_name = lora_names[lora_idx]
                 lora_idx = (lora_idx + 1) % len(lora_names)
             else:
-                assert (
-                    lora_request_distribution == "skewed"
-                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+                assert lora_request_distribution == "skewed", (
+                    f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
+                )
 
                 lora_name = np.random.choice(lora_names, p=lora_probs)
         else:
@@ -1599,6 +1670,12 @@ async def benchmark(
             accept_length = None
     else:
         accept_length = None
+
+    dspark_metrics = summarize_dspark_metrics(
+        server_info_json
+        if "sglang" in backend and server_info.status_code == 200
+        else None
+    )
 
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
@@ -1680,6 +1757,48 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
+    if dspark_metrics is not None:
+        print("{s:{c}^{n}}".format(s="DSpark + HiSparse", n=50, c="-"))
+        print(
+            "{:<40} {:<10.3f}".format(
+                "Mean DSpark time per round (ms):",
+                dspark_metrics["mean_dspark_ms"],
+            )
+        )
+        print(
+            "{:<40} {:<10.3f}".format(
+                "Mean target verify time per round (ms):",
+                dspark_metrics["mean_target_verify_ms"],
+            )
+        )
+        print(
+            "{:<40} {:<10.3f}".format(
+                "  Mean indexer Top-K critical time (ms):",
+                dspark_metrics["mean_indexer_topk_ms"],
+            )
+        )
+        print(
+            "{:<40} {:<10.3f}".format(
+                "  Mean Top-K transfer critical time (ms):",
+                dspark_metrics["mean_topk_transfer_ms"],
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Mean accepted tokens/request/round:",
+                dspark_metrics["mean_accepted_tokens_per_request_per_round"],
+            )
+        )
+    elif is_dspark_hisparse_server(
+        server_info_json
+        if "sglang" in backend and server_info.status_code == 200
+        else None
+    ):
+        print(
+            "Warning: DSpark + HiSparse metrics were not returned by the server. "
+            "Ensure the server was started with --enable-metrics and uses the same "
+            "SGLang build as bench_serving."
+        )
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
     print(
         "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
@@ -1835,6 +1954,7 @@ async def benchmark(
             "p99_itl_ms": metrics.p99_itl_ms,
             "concurrency": metrics.concurrency,
             "accept_length": accept_length,
+            "dspark_hisparse_metrics": dspark_metrics,
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
@@ -1893,6 +2013,7 @@ async def benchmark(
         else:
             result_for_dump = result
         file.write(json.dumps(result_for_dump) + "\n")
+    print(f"Benchmark results appended to: {os.path.abspath(output_file_name)}")
 
     return result | result_details
 
@@ -1991,9 +2112,9 @@ def run_benchmark(args_: argparse.Namespace):
         extra_request_body["bootstrap_room"] = 0
 
     if args.tokenize_prompt:
-        assert (
-            args.backend == "sglang"
-        ), "`--tokenize-prompt` only compatible with `--backend sglang` currently"
+        assert args.backend == "sglang", (
+            "`--tokenize-prompt` only compatible with `--backend sglang` currently"
+        )
 
     # Set url
     if args.port is None:
@@ -2070,18 +2191,18 @@ def run_benchmark(args_: argparse.Namespace):
 
     if args.dataset_name in ["image", "mmmu"]:
         args.apply_chat_template = True
-        assert (
-            not args.tokenize_prompt
-        ), "`--tokenize-prompt` not compatible with image dataset"
+        assert not args.tokenize_prompt, (
+            "`--tokenize-prompt` not compatible with image dataset"
+        )
 
     if args.lora_request_distribution in ["distinct", "skewed"]:
-        assert (
-            args.lora_name is not None and len(args.lora_name) > 1
-        ), "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
+        assert args.lora_name is not None and len(args.lora_name) > 1, (
+            "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
+        )
 
-    assert (
-        args.lora_zipf_alpha > 1
-    ), f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
+    assert args.lora_zipf_alpha > 1, (
+        f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
+    )
 
     print(f"{args}\n")
 
@@ -2355,13 +2476,13 @@ def cli_main():
         "--image-format",
         type=str,
         default="jpeg",
-        help=("Format of images for image dataset. " "Supports jpeg and png."),
+        help=("Format of images for image dataset. Supports jpeg and png."),
     )
     parser.add_argument(
         "--image-content",
         type=str,
         default="random",
-        help=("Content for images for image dataset. " "Supports random and blank."),
+        help=("Content for images for image dataset. Supports random and blank."),
     )
     parser.add_argument(
         "--request-rate",

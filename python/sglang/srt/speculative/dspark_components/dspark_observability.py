@@ -7,7 +7,7 @@ import time
 from collections import deque
 from contextlib import contextmanager, nullcontext
 from enum import Enum
-from typing import Callable, ContextManager, Iterator, Optional, Union
+from typing import Any, Callable, ContextManager, Iterator, Optional, Union
 
 import msgspec
 import torch
@@ -38,6 +38,9 @@ class InfoComponent(str, Enum):
     STEP_GPU_TIME = "step_gpu_time"
     DRAFT_GPU_TIME = "draft_gpu_time"
     TARGET_VERIFY_GPU_TIME = "target_verify_gpu_time"
+    INDEXER_TOPK_GPU_TIME = "indexer_topk_gpu_time"
+    TOPK_TRANSFER_GPU_TIME = "topk_transfer_gpu_time"
+    ACCEPTED_TOKENS = "accepted_tokens"
     REQS = "reqs"
 
 
@@ -45,6 +48,8 @@ class InfoSegment(str, Enum):
     STEP = "step"
     DRAFT = "draft"
     TARGET_VERIFY = "target_verify"
+    INDEXER_TOPK = "indexer_topk"
+    TOPK_TRANSFER = "topk_transfer"
 
 
 INFO_DUMP_MAX_RECORDS = 200_000
@@ -108,6 +113,9 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     step_gpu_ms: Optional[float] = None
     draft_gpu_ms: Optional[float] = None
     target_verify_gpu_ms: Optional[float] = None
+    indexer_topk_gpu_ms: Optional[float] = None
+    topk_transfer_gpu_ms: Optional[float] = None
+    num_accepted_tokens: int = -1
     reqs: Optional[list[ReqDetail]] = None
 
 
@@ -133,6 +141,7 @@ class DecodeStepObservation(msgspec.Struct):
     cap_trim_lens: torch.Tensor
     commit_lens: torch.Tensor
     rids: Optional[list[str]]
+    graph_event_key: Optional[Any] = None
 
 
 class _PendingStep(msgspec.Struct):
@@ -150,7 +159,8 @@ class _PendingStep(msgspec.Struct):
     step_cpu_ms: Optional[float]
     rids: Optional[list[str]]
     future: Optional[FutureTensors]
-    segment_events: dict[InfoSegment, tuple[torch.cuda.Event, torch.cuda.Event]]
+    segment_events: dict[InfoSegment, list[tuple[torch.cuda.Event, torch.cuda.Event]]]
+    accepted_tokens_future: Optional[FutureTensors] = None
 
 
 class DsparkInfoDumper:
@@ -194,17 +204,33 @@ class DsparkInfoDumper:
         self._prev_stamp: Optional[float] = None
 
         self._d2h_stream: Optional[torch.cuda.Stream] = None
-        if self.enabled and InfoComponent.REQS in self._components:
+        if self.enabled and (
+            InfoComponent.REQS in self._components
+            or InfoComponent.ACCEPTED_TOKENS in self._components
+        ):
             self._d2h_stream = torch.cuda.Stream(device=device)
 
         self._current_segments: dict[
-            InfoSegment, tuple[torch.cuda.Event, torch.cuda.Event]
+            InfoSegment, list[tuple[torch.cuda.Event, torch.cuda.Event]]
         ] = {}
         self._open_segments: dict[InfoSegment, torch.cuda.Event] = {}
+        # Event nodes recorded while a CUDA graph is captured execute again on
+        # every replay. Keep them by verify graph size so a replay can publish
+        # the inner timings even though Python indexer code is not re-entered.
+        self._graph_segment_events: dict[
+            Any, dict[InfoSegment, list[tuple[torch.cuda.Event, torch.cuda.Event]]]
+        ] = {}
+
+    def reset_graph_segments(self, graph_key: Any) -> None:
+        """Discard captured events before replacing a graph with the same key."""
+        self._graph_segment_events.pop(graph_key, None)
 
     def begin_step(self) -> None:
         if not self.enabled:
             return
+        # Captured event objects are reused by the next replay of the same
+        # graph. Resolve the previous step before that replay overwrites them.
+        self._drain_pending()
         self._current_segments = {}
         self._open_segments = {}
         if InfoComponent.STEP_GPU_TIME in self._components:
@@ -217,6 +243,20 @@ class DsparkInfoDumper:
         if not self._segment_enabled(segment):
             return _NULL_SEGMENT
         return self._active_segment(segment)
+
+    def begin_external_segment(self, name: Union[InfoSegment, str]) -> None:
+        """Start a segment owned by a lower-level kernel integration."""
+        segment = InfoSegment(name)
+        if self.enabled and self._segment_enabled(segment):
+            self._open_segment(segment)
+
+    def end_external_segment(
+        self, name: Union[InfoSegment, str], *, graph_key: Optional[Any] = None
+    ) -> None:
+        """Finish a segment started by :meth:`begin_external_segment`."""
+        segment = InfoSegment(name)
+        if self.enabled and self._segment_enabled(segment):
+            self._close_segment(segment, graph_key=graph_key)
 
     @contextmanager
     def _active_segment(self, segment: InfoSegment) -> Iterator[None]:
@@ -234,10 +274,25 @@ class DsparkInfoDumper:
 
         now = self._clock()
         step_cpu_ms = self._step_cpu_ms(now=now)
+        # Normally begin_step drained the previous record before graph replay.
+        # Keep this fallback for direct/test callers that only observe steps.
         self._drain_pending()
+
+        graph_events = self._graph_segment_events.get(obs.graph_event_key, {})
+        for segment, events in graph_events.items():
+            if segment not in self._current_segments:
+                self._current_segments[segment] = events
 
         future = (
             self._stage_reqs(obs) if InfoComponent.REQS in self._components else None
+        )
+        accepted_tokens_future = (
+            FutureTensors.device_to_host(
+                {"num_accepted_tokens": obs.commit_lens.sum()},
+                d2h_stream=self._d2h_stream,
+            )
+            if InfoComponent.ACCEPTED_TOKENS in self._components
+            else None
         )
         self._pending = _PendingStep(
             forward_ct=int(obs.forward_ct),
@@ -254,6 +309,7 @@ class DsparkInfoDumper:
             step_cpu_ms=step_cpu_ms,
             rids=obs.rids,
             future=future,
+            accepted_tokens_future=accepted_tokens_future,
             segment_events=self._current_segments,
         )
         self._current_segments = {}
@@ -300,20 +356,33 @@ class DsparkInfoDumper:
             return InfoComponent.DRAFT_GPU_TIME in self._components
         if segment is InfoSegment.TARGET_VERIFY:
             return InfoComponent.TARGET_VERIFY_GPU_TIME in self._components
+        if segment is InfoSegment.INDEXER_TOPK:
+            return InfoComponent.INDEXER_TOPK_GPU_TIME in self._components
+        if segment is InfoSegment.TOPK_TRANSFER:
+            return InfoComponent.TOPK_TRANSFER_GPU_TIME in self._components
         return False
 
     def _open_segment(self, segment: InfoSegment) -> None:
-        start = torch.cuda.Event(enable_timing=True)
+        # ``external=True`` keeps record nodes in captured CUDA graphs so the
+        # same event pair is refreshed on every graph replay.
+        start = torch.cuda.Event(enable_timing=True, external=True)
         start.record()
         self._open_segments[segment] = start
 
-    def _close_segment(self, segment: InfoSegment) -> None:
+    def _close_segment(
+        self, segment: InfoSegment, *, graph_key: Optional[int] = None
+    ) -> None:
         start = self._open_segments.pop(segment, None)
         if start is None:
             return
-        end = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True, external=True)
         end.record()
-        self._current_segments[segment] = (start, end)
+        event_pair = (start, end)
+        if graph_key is not None and torch.cuda.is_current_stream_capturing():
+            by_segment = self._graph_segment_events.setdefault(graph_key, {})
+            by_segment.setdefault(segment, []).append(event_pair)
+        else:
+            self._current_segments.setdefault(segment, []).append(event_pair)
 
     def _stage_reqs(self, obs: DecodeStepObservation) -> Optional[FutureTensors]:
         tensors: dict[str, torch.Tensor] = {
@@ -360,6 +429,17 @@ class DsparkInfoDumper:
             record.target_verify_gpu_ms = self._segment_ms(
                 pending, InfoSegment.TARGET_VERIFY
             )
+        if InfoComponent.INDEXER_TOPK_GPU_TIME in self._components:
+            record.indexer_topk_gpu_ms = self._segment_ms(
+                pending, InfoSegment.INDEXER_TOPK
+            )
+        if InfoComponent.TOPK_TRANSFER_GPU_TIME in self._components:
+            record.topk_transfer_gpu_ms = self._segment_ms(
+                pending, InfoSegment.TOPK_TRANSFER
+            )
+        if pending.accepted_tokens_future is not None:
+            accepted = pending.accepted_tokens_future.wait()["num_accepted_tokens"]
+            record.num_accepted_tokens = int(accepted.item())
         if InfoComponent.REQS in self._components and pending.future is not None:
             record.reqs = self._build_reqs(
                 host=pending.future.wait(), bs=pending.bs, rids=pending.rids
@@ -425,9 +505,8 @@ class DsparkInfoDumper:
         events = pending.segment_events.get(segment)
         if events is None:
             return None
-        start, end = events
-        end.synchronize()
-        elapsed_ms = start.elapsed_time(end)
+        events[-1][1].synchronize()
+        elapsed_ms = sum(start.elapsed_time(end) for start, end in events)
         if elapsed_ms > self._max_step_cpu_seconds * 1000.0:
             return None
         return round(elapsed_ms, 4)
@@ -495,7 +574,6 @@ def _format_float(value: float, digits: int = 4) -> str:
 
 
 class PerPositionConfidenceMetrics:
-
     def __init__(
         self,
         *,
@@ -655,7 +733,6 @@ class PerPositionConfidenceMetrics:
 
 
 class ConfidenceMetricsProbe:
-
     def __init__(
         self,
         *,
@@ -739,6 +816,7 @@ class DsparkStepObservers:
         tp_rank: int,
         device,
         simulate_acc_len: float,
+        components: Optional[set[InfoComponent]] = None,
     ) -> None:
         self._planner = planner
         self._gamma = int(gamma)
@@ -751,7 +829,7 @@ class DsparkStepObservers:
             tp_rank=tp_rank,
         )
         self._info_dumper = DsparkInfoDumper(
-            components=resolve_enabled_components(),
+            components=resolve_enabled_components() | (components or set()),
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
             attn_tp_rank=get_parallel().attn_tp_rank,
@@ -838,6 +916,7 @@ class DsparkStepObservers:
         req_pool_indices: torch.Tensor,
         verify_tier_num_tokens: int,
         dp_tier_num_tokens: Optional[int],
+        graph_event_key: Optional[Any],
     ) -> None:
         planner = self._planner
         if not proposal_folded:
@@ -925,6 +1004,7 @@ class DsparkStepObservers:
                     cap_trim_lens=cap_trim_lens,
                     commit_lens=commit_lens,
                     rids=[req.rid for req in reqs],
+                    graph_event_key=graph_event_key,
                 )
             )
 

@@ -45,6 +45,7 @@ from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
 from sglang.srt.speculative.dspark_components.dspark_observability import (
+    InfoComponent,
     DsparkStepObservers,
     InfoSegment,
 )
@@ -291,7 +292,20 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_rank=self.ps.tp_rank,
             device=self.device,
             simulate_acc_len=self._simulate_acc_len,
+            components=(
+                {
+                    InfoComponent.CORE,
+                    InfoComponent.STEP_GPU_TIME,
+                    InfoComponent.TARGET_VERIFY_GPU_TIME,
+                    InfoComponent.INDEXER_TOPK_GPU_TIME,
+                    InfoComponent.TOPK_TRANSFER_GPU_TIME,
+                    InfoComponent.ACCEPTED_TOKENS,
+                }
+                if server_args.enable_metrics and server_args.enable_hisparse
+                else None
+            ),
         )
+        self._attach_hisparse_observer()
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
@@ -300,6 +314,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
         return target_model.model.get_input_embeddings()
+
+    def _attach_hisparse_observer(self) -> None:
+        """Attach after HiSparse initialization, which may follow worker creation."""
+        coordinator = self.model_runner.hisparse_coordinator
+        if (
+            coordinator is not None
+            and getattr(coordinator, "dspark_info_dumper", None) is None
+        ):
+            coordinator.dspark_info_dumper = self._observers._info_dumper
 
     @property
     def carries_confidence(self) -> bool:
@@ -380,6 +403,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
 
+    def prepare_target_cuda_graph_capture(self) -> None:
+        # Scheduler invokes this immediately before target graph capture, after
+        # target attention and HiSparse initialization have completed.
+        self._attach_hisparse_observer()
+
     def _maybe_build_draft_sampler(self):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
@@ -400,7 +428,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def clear_cache_pool(self):
-        pass
+        self._observers.clear_info_records()
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         self._forced_budget_frac = frac
@@ -555,6 +583,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _forward_decode(
         self, batch: ScheduleBatch, on_publish, grammar_barrier=None
     ) -> GenerationBatchResult:
+        self._attach_hisparse_observer()
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
         draft_input = batch.spec_info
@@ -805,6 +834,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            graph_event_key=(
+                getattr(
+                    self.model_runner.decode_cuda_graph_runner,
+                    "_replay_graph_key",
+                    None,
+                )
+                if can_run_cuda_graph
+                else None
+            ),
         )
 
         next_draft_input = make_next_draft_input(
