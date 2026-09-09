@@ -231,6 +231,10 @@ class BaseSpecWorker(ABC):
         # TODO: move this method to BaseTpWorker and call through self.model_runner
         pass
 
+    def prepare_target_cuda_graph_capture(self) -> None:
+        """Hook for speculative workers that instrument the target graph."""
+        pass
+
     def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
         target_model_runner = self.target_worker.model_runner
         target_model_runner.mtp_draft_device_pools = ()

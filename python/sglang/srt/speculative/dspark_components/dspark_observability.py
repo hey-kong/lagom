@@ -158,8 +158,8 @@ class _PendingStep(msgspec.Struct):
     step_cpu_ms: Optional[float]
     rids: Optional[list[str]]
     future: Optional[FutureTensors]
-    accepted_tokens_future: Optional[FutureTensors]
     segment_events: dict[InfoSegment, list[tuple[torch.cuda.Event, torch.cuda.Event]]]
+    accepted_tokens_future: Optional[FutureTensors] = None
 
 
 class DsparkInfoDumper:
@@ -223,6 +223,9 @@ class DsparkInfoDumper:
     def begin_step(self) -> None:
         if not self.enabled:
             return
+        # Captured event objects are reused by the next replay of the same
+        # graph. Resolve the previous step before that replay overwrites them.
+        self._drain_pending()
         self._current_segments = {}
         self._open_segments = {}
         if InfoComponent.STEP_GPU_TIME in self._components:
@@ -266,6 +269,8 @@ class DsparkInfoDumper:
 
         now = self._clock()
         step_cpu_ms = self._step_cpu_ms(now=now)
+        # Normally begin_step drained the previous record before graph replay.
+        # Keep this fallback for direct/test callers that only observe steps.
         self._drain_pending()
 
         graph_events = self._graph_segment_events.get(obs.verify_tokens_graph_key, {})
@@ -819,9 +824,7 @@ class DsparkStepObservers:
             tp_rank=tp_rank,
         )
         self._info_dumper = DsparkInfoDumper(
-            components=(
-                resolve_enabled_components() if components is None else components
-            ),
+            components=resolve_enabled_components() | (components or set()),
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
             attn_tp_rank=get_parallel().attn_tp_rank,

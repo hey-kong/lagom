@@ -1070,10 +1070,19 @@ def summarize_dspark_metrics(server_info: Optional[dict]) -> Optional[dict[str, 
         ]
         return sum(values) / len(values) if values else 0.0
 
-    total_verify_tokens = sum(float(record["num_verify_tokens"]) for record in records)
-    total_verify_requests = sum(float(record["bs"]) for record in records)
+    verify_token_records = [
+        record
+        for record in records
+        if record.get("num_verify_tokens", -1) >= 0 and record.get("bs", -1) > 0
+    ]
+    total_verify_tokens = sum(
+        float(record["num_verify_tokens"]) for record in verify_token_records
+    )
+    total_verify_requests = sum(float(record["bs"]) for record in verify_token_records)
     accepted_records = [
-        record for record in records if record.get("num_accepted_tokens", -1) >= 0
+        record
+        for record in records
+        if record.get("num_accepted_tokens", -1) >= 0 and record.get("bs", -1) > 0
     ]
     total_accepted_tokens = sum(
         float(record["num_accepted_tokens"]) for record in accepted_records
@@ -1085,7 +1094,11 @@ def summarize_dspark_metrics(server_info: Optional[dict]) -> Optional[dict[str, 
         "mean_target_verify_ms": mean("target_verify_gpu_ms"),
         "mean_indexer_topk_ms": mean("indexer_topk_gpu_ms"),
         "mean_topk_transfer_ms": mean("topk_transfer_gpu_ms"),
-        "mean_target_verify_tokens": mean("num_verify_tokens"),
+        "mean_target_verify_tokens": (
+            total_verify_tokens / len(verify_token_records)
+            if verify_token_records
+            else 0.0
+        ),
         "mean_target_verify_tokens_per_request": (
             total_verify_tokens / total_verify_requests
             if total_verify_requests > 0

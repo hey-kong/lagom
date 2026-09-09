@@ -403,6 +403,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
 
+    def prepare_target_cuda_graph_capture(self) -> None:
+        # Scheduler invokes this immediately before target graph capture, after
+        # target attention and HiSparse initialization have completed.
+        self._attach_hisparse_observer()
+
     def _maybe_build_draft_sampler(self):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
