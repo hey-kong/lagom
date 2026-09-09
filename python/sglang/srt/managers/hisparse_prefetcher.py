@@ -84,14 +84,12 @@ def create_hisparse_prefetcher(
     *,
     effective_top_k: int,
     device_buffer_size: int,
-    entry_token_span: int = 1,
 ) -> Optional[HiSparsePrefetcher]:
     resolved = validate_hisparse_prefetcher(
         name,
         config,
         effective_top_k=effective_top_k,
         device_buffer_size=device_buffer_size,
-        entry_token_span=entry_token_span,
     )
     if resolved is None:
         return None
@@ -105,7 +103,6 @@ def validate_hisparse_prefetcher(
     *,
     effective_top_k: int,
     device_buffer_size: int,
-    entry_token_span: int = 1,
 ):
     """Validate configuration without constructing an algorithm instance."""
     if name is None:
@@ -124,17 +121,14 @@ def validate_hisparse_prefetcher(
             f"Unknown {normalized} prefetcher_config field(s): "
             + ", ".join(sorted(unknown))
         )
-    if entry_token_span <= 0:
-        raise ValueError("entry_token_span must be positive")
-    size = _require_int(config, "size", effective_top_k * entry_token_span)
+    size = _require_int(config, "size", effective_top_k)
     if size <= 0:
         raise ValueError("prefetcher_config.size must be positive")
-    logical_entries = (size + entry_token_span - 1) // entry_token_span
+    logical_entries = size
     if logical_entries > device_buffer_size:
         raise ValueError(
-            f"prefetcher_config.size ({size} tokens, {logical_entries} logical "
-            f"entries) exceeds device buffer capacity ({device_buffer_size} "
-            "logical entries)"
+            f"prefetcher_config.size ({size} logical entries) exceeds device "
+            f"buffer capacity ({device_buffer_size} logical entries)"
         )
     algorithm_config = {}
     for key, default in (("alpha", 0.6), ("beta", 0.2), ("gamma", 0.25)):
