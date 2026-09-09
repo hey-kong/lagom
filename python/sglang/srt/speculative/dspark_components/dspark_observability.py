@@ -207,6 +207,12 @@ class DsparkInfoDumper:
             InfoSegment, list[tuple[torch.cuda.Event, torch.cuda.Event]]
         ] = {}
         self._open_segments: dict[InfoSegment, torch.cuda.Event] = {}
+        # Event nodes recorded while a CUDA graph is captured execute again on
+        # every replay. Keep them by verify graph size so a replay can publish
+        # the inner timings even though Python indexer code is not re-entered.
+        self._graph_segment_events: dict[
+            int, dict[InfoSegment, list[tuple[torch.cuda.Event, torch.cuda.Event]]]
+        ] = {}
 
     def begin_step(self) -> None:
         if not self.enabled:
@@ -230,11 +236,13 @@ class DsparkInfoDumper:
         if self.enabled and self._segment_enabled(segment):
             self._open_segment(segment)
 
-    def end_external_segment(self, name: Union[InfoSegment, str]) -> None:
+    def end_external_segment(
+        self, name: Union[InfoSegment, str], *, graph_key: Optional[int] = None
+    ) -> None:
         """Finish a segment started by :meth:`begin_external_segment`."""
         segment = InfoSegment(name)
         if self.enabled and self._segment_enabled(segment):
-            self._close_segment(segment)
+            self._close_segment(segment, graph_key=graph_key)
 
     @contextmanager
     def _active_segment(self, segment: InfoSegment) -> Iterator[None]:
@@ -253,6 +261,11 @@ class DsparkInfoDumper:
         now = self._clock()
         step_cpu_ms = self._step_cpu_ms(now=now)
         self._drain_pending()
+
+        graph_events = self._graph_segment_events.get(obs.verify_tokens_graph_key, {})
+        for segment, events in graph_events.items():
+            if segment not in self._current_segments:
+                self._current_segments[segment] = events
 
         future = (
             self._stage_reqs(obs) if InfoComponent.REQS in self._components else None
@@ -325,17 +338,26 @@ class DsparkInfoDumper:
         return False
 
     def _open_segment(self, segment: InfoSegment) -> None:
-        start = torch.cuda.Event(enable_timing=True)
+        # ``external=True`` keeps record nodes in captured CUDA graphs so the
+        # same event pair is refreshed on every graph replay.
+        start = torch.cuda.Event(enable_timing=True, external=True)
         start.record()
         self._open_segments[segment] = start
 
-    def _close_segment(self, segment: InfoSegment) -> None:
+    def _close_segment(
+        self, segment: InfoSegment, *, graph_key: Optional[int] = None
+    ) -> None:
         start = self._open_segments.pop(segment, None)
         if start is None:
             return
-        end = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True, external=True)
         end.record()
-        self._current_segments.setdefault(segment, []).append((start, end))
+        event_pair = (start, end)
+        if graph_key is not None and torch.cuda.is_current_stream_capturing():
+            by_segment = self._graph_segment_events.setdefault(int(graph_key), {})
+            by_segment.setdefault(segment, []).append(event_pair)
+        else:
+            self._current_segments.setdefault(segment, []).append(event_pair)
 
     def _stage_reqs(self, obs: DecodeStepObservation) -> Optional[FutureTensors]:
         tensors: dict[str, torch.Tensor] = {

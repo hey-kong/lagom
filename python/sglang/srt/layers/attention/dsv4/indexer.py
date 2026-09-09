@@ -845,7 +845,10 @@ class C4IndexerBackendMixin:
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
             if dspark_timer is not None:
-                dspark_timer.end_external_segment(InfoSegment.INDEXER_TOPK)
+                dspark_timer.end_external_segment(
+                    InfoSegment.INDEXER_TOPK,
+                    graph_key=int(forward_batch.input_ids.numel()),
+                )
             return
 
         indexer_capturer = get_global_indexer_capturer()
@@ -917,7 +920,10 @@ class C4IndexerBackendMixin:
                 raw_indices,
             )
         if dspark_timer is not None:
-            dspark_timer.end_external_segment(InfoSegment.INDEXER_TOPK)
+            dspark_timer.end_external_segment(
+                InfoSegment.INDEXER_TOPK,
+                graph_key=int(forward_batch.input_ids.numel()),
+            )
         prefetch_candidates = None
         if hisparse_decode and hisparse_coordinator.prefetcher is not None:
             assert hisparse_coordinator.indexer_prefetch_candidates_buffer is not None
@@ -1089,7 +1095,10 @@ class C4IndexerBackendMixin:
                         output_buffer=c4_sparse_page_indices,
                     )
                     if dspark_timer is not None:
-                        dspark_timer.end_external_segment(InfoSegment.TOPK_TRANSFER)
+                        dspark_timer.end_external_segment(
+                            InfoSegment.TOPK_TRANSFER,
+                            graph_key=int(forward_batch.input_ids.numel()),
+                        )
                     # Host misses for current verify C4 rows resolve through the
                     # transaction's scratch mapping rather than becoming -1.
                     core_metadata.c4_sparse_page_indices = (
