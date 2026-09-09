@@ -1536,13 +1536,14 @@ class HiSparseCoordinator:
             self._previous_prefetch_pending_entries = 0
         self._previous_prefetch_target_layer = None
 
-    def begin_decode_batch(self, num_real_reqs: int) -> None:
-        """Drain deferred Previous IO before publishing the next batch size.
+    def begin_forward_batch(self, num_real_reqs: int) -> None:
+        """Drain deferred Previous IO before publishing a new batch size.
 
         Post-graph copies read ``num_real_reqs`` asynchronously.  The scalar
         must therefore remain unchanged until the final copy has joined the
-        compute stream.  Doing this at the common decode entry also covers a
-        graph-to-eager fallback.
+        compute stream.  This must run for every forward mode because an
+        extend/prefill batch can be scheduled between decode batches and uses
+        the same scalar and copy-plan storage.
         """
         self.consume_previous_graph_prefetch()
         self.num_real_reqs.fill_(num_real_reqs)

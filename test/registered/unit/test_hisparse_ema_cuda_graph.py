@@ -102,7 +102,7 @@ def test_previous_graph_replay_joins_last_writer(monkeypatch):
     assert coordinator.prefetcher.stats.completed_h2d_entries == 12
 
 
-def test_decode_batch_waits_before_overwriting_shared_request_count():
+def test_forward_batch_waits_before_overwriting_shared_request_count():
     operations = []
     coordinator = object.__new__(HiSparseCoordinator)
     coordinator.consume_previous_graph_prefetch = lambda: operations.append("wait")
@@ -110,7 +110,7 @@ def test_decode_batch_waits_before_overwriting_shared_request_count():
         fill_=lambda value: operations.append(("fill", value))
     )
 
-    coordinator.begin_decode_batch(32)
+    coordinator.begin_forward_batch(32)
 
     assert operations == ["wait", ("fill", 32)]
 

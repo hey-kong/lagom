@@ -1774,13 +1774,13 @@ class ModelRunner:
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
 
-            if (
-                forward_batch.forward_mode.is_decode()
-                and self.hisparse_coordinator is not None
-            ):
-                forward_batch.hisparse_coordinator = self.hisparse_coordinator
-                self.hisparse_coordinator.wait_for_pending_backup()
-                self.hisparse_coordinator.begin_decode_batch(forward_batch.batch_size)
+            if self.hisparse_coordinator is not None:
+                if forward_batch.forward_mode.is_decode():
+                    forward_batch.hisparse_coordinator = self.hisparse_coordinator
+                    self.hisparse_coordinator.wait_for_pending_backup()
+                # Every forward path may update num_real_reqs below.  Join a
+                # deferred graph prefetch first, including decode -> prefill.
+                self.hisparse_coordinator.begin_forward_batch(forward_batch.batch_size)
 
             # Replay cuda graph if applicable
             if can_run_graph:
