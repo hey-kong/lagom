@@ -76,27 +76,25 @@ def test_previous_default_size():
     assert prefetcher.size == 37
 
 
-def test_dsv4_size_is_token_coverage():
+def test_dsv4_size_is_logical_entry_count():
     prefetcher = create_hisparse_prefetcher(
         "previous",
-        {"size": 2048},
+        {"size": 512},
         effective_top_k=512,
         device_buffer_size=6144,
-        entry_token_span=4,
     )
-    assert prefetcher.size == 2048
+    assert prefetcher.size == 512
     assert prefetcher.logical_entries == 512
 
 
-def test_token_coverage_rounds_up_to_a_logical_entry():
+def test_dsv4_size_does_not_require_token_coverage_conversion():
     prefetcher = create_hisparse_prefetcher(
         "previous",
         {"size": 513},
         effective_top_k=512,
         device_buffer_size=1024,
-        entry_token_span=4,
     )
-    assert prefetcher.logical_entries == 129
+    assert prefetcher.logical_entries == 513
 
 
 @pytest.mark.parametrize("value", [0, -1, 1.5, True, "4"])
@@ -123,10 +121,9 @@ def test_size_can_exceed_attention_top_k():
 def test_dsv4_size_can_exceed_attention_top_k():
     prefetcher = create_hisparse_prefetcher(
         "previous",
-        {"size": 4096},
+        {"size": 1024},
         effective_top_k=512,
         device_buffer_size=6144,
-        entry_token_span=4,
     )
     assert prefetcher.logical_entries == 1024
 
@@ -162,13 +159,12 @@ def test_unknown_algorithm_and_fields_are_rejected():
     assert supported_hisparse_prefetchers() == ("ema", "oasiskv", "previous")
 
 
-def test_oasiskv_token_coverage_and_selection():
+def test_oasiskv_logical_entry_size_and_selection():
     prefetcher = create_hisparse_prefetcher(
         "oasiskv",
-        {"size": 4096},
+        {"size": 1024},
         effective_top_k=512,
         device_buffer_size=4096,
-        entry_token_span=4,
     )
     assert isinstance(prefetcher, OasisKVPrefetcher)
     assert prefetcher.logical_entries == 1024
@@ -194,13 +190,13 @@ def test_rejects_invalid_or_too_short_previous():
         prefetcher.select(torch.tensor([[1, 2]]))
 
 
-def test_ema_defaults_and_c4_token_coverage():
+def test_ema_defaults_to_effective_top_k_entries():
     prefetcher = create_hisparse_prefetcher(
-        "ema", {}, effective_top_k=512, device_buffer_size=4096, entry_token_span=4
+        "ema", {}, effective_top_k=512, device_buffer_size=4096
     )
     assert isinstance(prefetcher, EMAPrefetcher)
     assert prefetcher.logical_entries == 512
-    assert prefetcher.size == 2048
+    assert prefetcher.size == 512
     assert (prefetcher.alpha, prefetcher.beta, prefetcher.gamma) == (0.6, 0.2, 0.25)
 
 

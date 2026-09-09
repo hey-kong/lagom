@@ -268,11 +268,6 @@ class HiSparseCoordinator:
         self.is_dsv4_hisparse = isinstance(
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
-        # Public Previous size is measured in original-token coverage.
-        # DSV4 C4 RESOLVE positions each address one compress_ratio-token entry.
-        self.prefetch_entry_token_span = (
-            self.compress_ratio if self.is_dsv4_hisparse else 1
-        )
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
             page_size = self.mem_pool_device.page_size
@@ -455,7 +450,6 @@ class HiSparseCoordinator:
             prefetcher_config or {},
             effective_top_k=self.top_k,
             device_buffer_size=self.device_buffer_size,
-            entry_token_span=self.prefetch_entry_token_span,
         )
         if envs.SGLANG_DISABLE_HISPARSE_PREFETCH.get():
             if self.prefetcher_name == "oasiskv":
@@ -491,7 +485,6 @@ class HiSparseCoordinator:
                 prefetcher_config or {},
                 effective_top_k=self.top_k,
                 device_buffer_size=self.device_buffer_size,
-                entry_token_span=self.prefetch_entry_token_span,
             )
             logger.info(
                 "HiSparse prefetch mode: %s",
@@ -644,14 +637,10 @@ class HiSparseCoordinator:
                     self.mem_pool_device.layer_num,
                 )
             logger.info(
-                "HiSparse %s prefetcher: %d-token coverage maps to %d "
-                "logical KV entries per request (entry span=%d tokens); Indexer "
-                "selection is Top-%d and attention remains Top-%d.",
+                "HiSparse %s prefetcher: Top-%d logical KV entries per request; "
+                "attention remains Top-%d.",
                 self.prefetcher_name,
                 self.prefetcher.size,
-                self.prefetcher.logical_entries,
-                self.prefetch_entry_token_span,
-                self.prefetcher.logical_entries,
                 self.top_k,
             )
 
